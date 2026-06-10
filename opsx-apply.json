@@ -1,0 +1,329 @@
+{
+  "changeName": "foundation-ops-and-ui",
+  "changeDir": "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui",
+  "schemaName": "spec-driven",
+  "contextFiles": {
+    "proposal": [
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\proposal.md"
+    ],
+    "specs": [
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\camera-system\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\command-history\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\property-binding\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\react-bindings\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\status-bar\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\transform-gizmo\\spec.md",
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\specs\\view-cube\\spec.md"
+    ],
+    "design": [
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\design.md"
+    ],
+    "tasks": [
+      "G:\\Dim+WebGPU\\openspec\\changes\\foundation-ops-and-ui\\tasks.md"
+    ]
+  },
+  "progress": {
+    "total": 59,
+    "complete": 0,
+    "remaining": 59
+  },
+  "tasks": [
+    {
+      "id": "1",
+      "description": "1.1 新建 `DimMain/src/history/ICommand.ts`，定义 `ICommand` 接口（`label` / `execute` / `undo` / 可选 `dispose`）",
+      "done": false
+    },
+    {
+      "id": "2",
+      "description": "1.2 新建 `DimMain/src/history/HistoryTypes.ts`，定义 `HistoryState` 与 `HistoryListener` 等类型",
+      "done": false
+    },
+    {
+      "id": "3",
+      "description": "1.3 新建 `DimMain/src/history/CommandHistoryManager.ts`，实现 `execute / undo / redo / clear / subscribe`，深度上限 50，丢弃时调用 `dispose`",
+      "done": false
+    },
+    {
+      "id": "4",
+      "description": "1.4 新建 `DimMain/src/history/commands/CreateCommand.ts`（创建建筑对象）",
+      "done": false
+    },
+    {
+      "id": "5",
+      "description": "1.5 新建 `DimMain/src/history/commands/DeleteCommand.ts`（删除对象，不立即 dispose；命令丢弃时才释放）",
+      "done": false
+    },
+    {
+      "id": "6",
+      "description": "1.6 新建 `DimMain/src/history/commands/TransformCommand.ts`（位置/旋转/缩放 before-after 快照还原）",
+      "done": false
+    },
+    {
+      "id": "7",
+      "description": "1.7 新建 `DimMain/src/history/commands/PropertyChangeCommand.ts`（按 `propertyPath` 修改属性，支持嵌套路径）",
+      "done": false
+    },
+    {
+      "id": "8",
+      "description": "1.8 新建 `DimMain/src/react/context/HistoryContext.tsx` + `useHistoryContext()`，订阅 `CommandHistoryManager` 状态变更",
+      "done": false
+    },
+    {
+      "id": "9",
+      "description": "1.9 在 Canvas 容器或 AppShell 注册全局 `keydown` 监听：`Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z`；input/textarea 聚焦时不拦截",
+      "done": false
+    },
+    {
+      "id": "10",
+      "description": "1.10 单元自测：写一个最小用例验证 `execute → undo → redo` 在直墙 `CreateCommand` 上工作正常（先用 console.log 验证即可）",
+      "done": false
+    },
+    {
+      "id": "11",
+      "description": "2.1 在 `DimMain/src/camera/OrbitControlsWrapper.ts` 新增 `transitionTo(target, lookAt, durationMs): Promise<void>` 方法",
+      "done": false
+    },
+    {
+      "id": "12",
+      "description": "2.2 实现 `easeInOutCubic` 缓动 + 每帧基于 `RenderLoop` 推进位置 `lerp` 与四元数 `slerp`",
+      "done": false
+    },
+    {
+      "id": "13",
+      "description": "2.3 实现过渡中断逻辑：再次调用 `transitionTo` 时取消前一个 Promise（reject 或携带 cancelled 标志）",
+      "done": false
+    },
+    {
+      "id": "14",
+      "description": "2.4 新增 `pushSuspend()` / `popSuspend()` 方法，支持嵌套的\"临时禁用→恢复\"调用（Gizmo 与 ViewCube 都会用到）",
+      "done": false
+    },
+    {
+      "id": "15",
+      "description": "3.1 检查 `DimMain/src/interaction/SelectionManager.ts`，若未公开 `subscribe(listener)` 则添加",
+      "done": false
+    },
+    {
+      "id": "16",
+      "description": "3.2 新建 `DimMain/src/react/context/SelectionContext.tsx` + `useSelectionContext()`，暴露 `{ selected, count, primary }`",
+      "done": false
+    },
+    {
+      "id": "17",
+      "description": "3.3 在 `WallDrawScene`（或 `BuildingProvider` 同层）包裹 `SelectionProvider`",
+      "done": false
+    },
+    {
+      "id": "18",
+      "description": "3.4 移除 `useSelection.ts` 中可能存在的轮询逻辑（若 SelectionManager 已主动 notify）",
+      "done": false
+    },
+    {
+      "id": "19",
+      "description": "4.1 新建 `DimMain/src/interaction/TransformGizmo.ts`，封装 `TransformControls`；构造参数：相机、Canvas、Scene、OrbitControlsWrapper、CommandHistoryManager、SelectionManager",
+      "done": false
+    },
+    {
+      "id": "20",
+      "description": "4.2 实现 `setMode('select' | 'move' | 'rotate' | 'scale')`，`select` 时 detach 并隐藏",
+      "done": false
+    },
+    {
+      "id": "21",
+      "description": "4.3 监听 `TransformControls` 的 `dragging-changed` 事件：开始拖拽 → `orbitControls.pushSuspend()` + 记录 before 快照；结束拖拽 → `orbitControls.popSuspend()` + 提交 `TransformCommand`",
+      "done": false
+    },
+    {
+      "id": "22",
+      "description": "4.4 监听 SelectionManager 选中变化：`count === 1 && mode !== 'select'` → attach；否则 detach",
+      "done": false
+    },
+    {
+      "id": "23",
+      "description": "4.5 新建 `DimMain/src/react/context/GizmoContext.tsx` + `useGizmoContext()`，暴露 `{ mode, setMode }`",
+      "done": false
+    },
+    {
+      "id": "24",
+      "description": "4.6 在 `WallDrawScene` 内创建 `TransformGizmo` 实例并提供 `GizmoProvider`",
+      "done": false
+    },
+    {
+      "id": "25",
+      "description": "4.7 修改 `TopToolbar.tsx`：从 `useGizmoContext` 读取 mode，激活按钮显示高亮态；点击按钮调用 `setMode`",
+      "done": false
+    },
+    {
+      "id": "26",
+      "description": "4.8 修改 `useDemoSetup.ts`：`tb-select / tb-move / tb-rotate / tb-scale` 的 `action` 从 `noop` 改为通过桥接调用 `setMode`",
+      "done": false
+    },
+    {
+      "id": "27",
+      "description": "4.9 注册快捷键 `Q / G / R / S`（input/textarea 聚焦时不响应）",
+      "done": false
+    },
+    {
+      "id": "28",
+      "description": "4.10 自测：选中一面墙 → 按 G → 拖拽 → 松开后 Ctrl+Z 可还原位置",
+      "done": false
+    },
+    {
+      "id": "29",
+      "description": "5.1 新建 `DimMain/src/panel/IPropertyProvider.ts`，定义接口 `canHandle(target) / build(target, ctx): PropertyGroup[]`",
+      "done": false
+    },
+    {
+      "id": "30",
+      "description": "5.2 新建 `DimMain/src/panel/PropertyBindingService.ts`，维护 Provider 列表 + 订阅 SelectionContext + 调用 `panelManager.setPropertyGroups()`",
+      "done": false
+    },
+    {
+      "id": "31",
+      "description": "5.3 新建 `DimMain/src/panel/providers/WallPropertyProvider.ts`（颜色 / 厚度 / 高度 / 标高 / 金属度 / 粗糙度 / 可见 / 锁定）",
+      "done": false
+    },
+    {
+      "id": "32",
+      "description": "5.4 新建 `DimMain/src/panel/providers/ColumnPropertyProvider.ts`",
+      "done": false
+    },
+    {
+      "id": "33",
+      "description": "5.5 新建 `DimMain/src/panel/providers/GenericMeshPropertyProvider.ts`（位置 / 旋转 / 缩放 / 颜色，兜底）",
+      "done": false
+    },
+    {
+      "id": "34",
+      "description": "5.6 控件 `onChange` 包装：构造 `PropertyChangeCommand`（携带 before/after）后 `historyManager.execute`，而非直接修改对象",
+      "done": false
+    },
+    {
+      "id": "35",
+      "description": "5.7 滑块特殊处理：拖动时仅 preview（直接改对象），松开时才 commit 提交命令；改造 `RightPropertyPanel.tsx` 的 `slider` 分支",
+      "done": false
+    },
+    {
+      "id": "36",
+      "description": "5.8 修改 `useDemoSetup.ts`：移除硬编码 `setPropertyGroups([...])`，改为初始化 `PropertyBindingService` 并注册三个 Provider",
+      "done": false
+    },
+    {
+      "id": "37",
+      "description": "5.9 实现多选时共有属性合并（同 key 取值；值不同显示 `—`），改 `RightPropertyPanel.tsx` 显示逻辑容忍 `undefined` 值",
+      "done": false
+    },
+    {
+      "id": "38",
+      "description": "5.10 自测：选墙 → 修改厚度 → 看到几何变化 → Ctrl+Z 恢复；旋转立方体演示对象选中后显示通用 Mesh 属性",
+      "done": false
+    },
+    {
+      "id": "39",
+      "description": "6.1 修改 `DimMain/src/core/RenderLoop.ts`，在内部维护最近 30 帧的 dt 滑动窗口，暴露 `getFPS(): number` 与 `addFrameListener(cb)`",
+      "done": false
+    },
+    {
+      "id": "40",
+      "description": "6.2 新建 `DimMain/src/react/components/layout/StatusBar.tsx`，聚合：鼠标坐标（自己监听 Canvas pointermove + 复用 `RaycastHelper` 投影 Y=0）/ 选中信息（`useSelectionContext`）/ FPS（订阅 RenderLoop）/ 对象总数（`useBuildingContext`）",
+      "done": false
+    },
+    {
+      "id": "41",
+      "description": "6.3 在 `AppShell.tsx` 中用 `<StatusBar />` 替换内联状态栏 div",
+      "done": false
+    },
+    {
+      "id": "42",
+      "description": "6.4 自测：鼠标在视口移动看到坐标实时刷新；选中墙看到名称；新建对象看到计数 +1，撤销后 -1；FPS 显示稳定整数",
+      "done": false
+    },
+    {
+      "id": "43",
+      "description": "7.1 新建 `DimMain/src/viewcube/ViewCubeRenderer.ts`：独立 `WebGLRenderer` + `PerspectiveCamera` + `Scene` + 一个 `BoxGeometry` mesh，每面贴 Canvas 2D 绘制的中文标签纹理",
+      "done": false
+    },
+    {
+      "id": "44",
+      "description": "7.2 实现 `syncRotation(mainCameraQuaternion: Quaternion)`：将立方体设为主相机旋转的反四元数（让立方体相对屏幕呈主视角）；仅当 dot product < 0.9999 时调用 render",
+      "done": false
+    },
+    {
+      "id": "45",
+      "description": "7.3 实现 `pick(ndcX, ndcY): ViewCubePickResult | null`：使用独立 Raycaster 命中 26 个区域（6 面 + 12 棱 + 8 角）；区域可用面法向量 + 八分卦象坐标计算",
+      "done": false
+    },
+    {
+      "id": "46",
+      "description": "7.4 新建 `DimMain/src/viewcube/ViewCubeViewMap.ts`：将每个命中区域映射为 `{ position: Vector3, lookAt: Vector3 }`（基于场景中心距离 d=10）",
+      "done": false
+    },
+    {
+      "id": "47",
+      "description": "7.5 新建 `DimMain/src/react/components/ViewCube.tsx`：创建 ViewCubeRenderer、绑定 absolute-positioned 128×128 canvas、每帧从 EngineContext 读相机四元数同步、处理 click 调用 `orbitControls.transitionTo(...)`",
+      "done": false
+    },
+    {
+      "id": "48",
+      "description": "7.6 在 `AppShell.tsx` 视口区域叠加 `<ViewCube />`（右上角 absolute，z-index > Canvas）",
+      "done": false
+    },
+    {
+      "id": "49",
+      "description": "7.7 自测：旋转视角看立方体随动；点击\"前\"面相机过渡到 +Z 朝向；点击顶角到等轴视角",
+      "done": false
+    },
+    {
+      "id": "50",
+      "description": "8.1 修改 `WallDrawTool.ts` 与 `useSelection.ts` 中的\"删除选中\"逻辑：从直接 `manager.remove` 改为提交 `DeleteCommand`",
+      "done": false
+    },
+    {
+      "id": "51",
+      "description": "8.2 修改 `WallDrawTool.ts` 中的\"绘制完成\"路径：从直接 `manager.add` 改为提交 `CreateCommand`",
+      "done": false
+    },
+    {
+      "id": "52",
+      "description": "8.3 在 `docs/ARCHITECTURE_V5.md`（新增）记录命令栈 / Gizmo / PropertyBinding / ViewCube 的架构图与数据流",
+      "done": false
+    },
+    {
+      "id": "53",
+      "description": "8.4 更新 `index.html` 或 README 中的快捷键说明（Q/G/R/S, Ctrl+Z/Y）",
+      "done": false
+    },
+    {
+      "id": "54",
+      "description": "8.5 端到端冒烟测试：从空场景开始 → 绘制 3 面墙 → 选中、移动、旋转、改厚度、撤销 5 次、重做 3 次 → 点击 ViewCube 切换 6 个方向视角 → 全程无报错、FPS ≥ 30",
+      "done": false
+    },
+    {
+      "id": "55",
+      "description": "9.1 运行 `pnpm tsc -b --force` 通过（ExitCode=0）",
+      "done": false
+    },
+    {
+      "id": "56",
+      "description": "9.2 运行 `pnpm vite build` 产物正常生成",
+      "done": false
+    },
+    {
+      "id": "57",
+      "description": "9.3 提示用户进行非编译直接部署预览",
+      "done": false
+    },
+    {
+      "id": "58",
+      "description": "9.4 收集端到端测试中发现的 bug 并在本 change 内逐一修复",
+      "done": false
+    },
+    {
+      "id": "59",
+      "description": "9.5 运行 `openspec validate foundation-ops-and-ui` 通过，可被归档",
+      "done": false
+    }
+  ],
+  "state": "ready",
+  "instruction": "Read context files, work through pending tasks, mark complete as you go.\nPause if you hit blockers or need clarification."
+}

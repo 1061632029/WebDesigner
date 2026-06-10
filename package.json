@@ -1,0 +1,15 @@
+{
+  "name": "dim-webgpu-workspace",
+  "private": true,
+  "version": "0.2.0",
+  "description": "Dim WebGPU Engine — 三维设计引擎平台 Monorepo",
+  "scripts": {
+    "dev:main": "pnpm --filter dim-webgpu-engine dev",
+    "dev:server": "pnpm --filter dim-server dev",
+    "dev": "pnpm run dev:main & pnpm run dev:server",
+    "build:shared": "pnpm --filter dim-shared build",
+    "build:main": "pnpm --filter dim-webgpu-engine build",
+    "build:server": "pnpm --filter dim-server build",
+    "build": "pnpm run build:shared && pnpm run build:main && pnpm run build:server"
+  }
+}
