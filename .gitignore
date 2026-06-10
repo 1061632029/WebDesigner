@@ -1,0 +1,81 @@
+# ==========================
+# 通用 Git 忽略模板 (全场景)
+# ==========================
+
+# 1. 系统自动文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 2. 编辑器 / IDE 配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.idea
+*.iml
+*.iws
+*.ipr
+
+# 3. 环境变量 / 私密配置
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.htpasswd
+config.ini
+config.yaml
+
+# 4. 依赖包 / 第三方库
+node_modules/
+vendor/
+bower_components/
+.pnp/
+.pnp.js
+
+# 5. 打包构建产物
+dist/
+build/
+out/
+output/
+target/
+*.min.js
+*.min.css
+
+# 6. 日志 / 临时文件
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.tmp
+*.temp
+*.cache
+
+# 7. 测试 / 覆盖率
+coverage/
+.nyc_output/
+*.test.js
+
+# 8. 数据库 / 本地数据
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+
+# 9. 图片 / 压缩包（可选）
+# *.zip
+# *.rar
+# *.png
+# *.jpg
+
+# 10. 其他无需上传的文件
+*.exe
+*.dll
+*.so
+*.dylib
