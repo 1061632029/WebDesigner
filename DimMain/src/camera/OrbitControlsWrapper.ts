@@ -50,6 +50,12 @@ interface TransitionState {
 }
 
 /**
+ * 相机交互状态。
+ * idle 表示没有视角操作；其余状态表示视角控制独占输入，外部拾取工具应暂停检测。
+ */
+export type CameraInteractionState = 'idle' | 'rotating' | 'zooming' | 'panning' | 'transitioning';
+
+/**
  * easeInOutCubic 缓动函数
  * 输入 t ∈ [0, 1]，输出经过 ease-in-out 曲线变换的 [0, 1]
  */
@@ -75,6 +81,9 @@ export class OrbitControlsWrapper {
   /** 被控制的相机引用 */
   private _camera: THREE.Camera;
 
+  /** OrbitControls 绑定的 DOM 元素引用，用于识别鼠标滚轮、按键对应的相机交互状态。 */
+  private _domElement: HTMLElement;
+
   /** 当前正在进行的过渡状态，null 表示无过渡 */
   private _transition: TransitionState | null = null;
 
@@ -84,6 +93,24 @@ export class OrbitControlsWrapper {
   /** 进入 suspend 前的 enabled 状态（用于退出时还原） */
   private _suspendOriginalEnabled: boolean = true;
 
+  /** 用户是否正在通过 OrbitControls 操作相机。 */
+  private _isUserInteracting: boolean = false;
+
+  /** 最近一次相机发生变化的时间戳，用于覆盖阻尼惯性阶段。 */
+  private _lastCameraChangeTime: number = 0;
+
+  /** 当前相机交互状态：旋转、缩放、平移会作为独立状态阻断外部检测。 */
+  private _cameraInteractionState: CameraInteractionState = 'idle';
+
+  /** 最近一次鼠标按键推断出的相机交互状态，用于 OrbitControls start 事件确认状态。 */
+  private _lastPointerCameraState: CameraInteractionState = 'idle';
+
+  /** 相机交互状态回到 idle 的延迟定时器，用于覆盖滚轮与阻尼惯性尾帧。 */
+  private _cameraInteractionIdleTimerId: ReturnType<typeof setTimeout> | null = null;
+
+  /** 相机交互结束后的冷却时间，期间外部拾取工具仍不应执行检测。 */
+  private static readonly CAMERA_INTERACTION_IDLE_DELAY_MS: number = 120;
+
   /**
    * 创建轨道控制器
    * @param camera - 要控制的相机实例
@@ -92,6 +119,7 @@ export class OrbitControlsWrapper {
    */
   constructor(camera: THREE.Camera, domElement: HTMLElement, target?: THREE.Vector3) {
     this._camera = camera;
+    this._domElement = domElement;
     this._controls = new OrbitControls(camera, domElement);
 
     /* 配置默认参数 */
@@ -104,12 +132,22 @@ export class OrbitControlsWrapper {
     this._controls.mouseButtons = {
       LEFT: THREE.MOUSE.ROTATE, // 左键旋转视角
       MIDDLE: null,             // 中键不绑定 OrbitControls 操作
-      RIGHT: THREE.MOUSE.PAN,   // 右键平移视角
+      // RIGHT:null THREE.MOUSE.PAN,   // 右键平移视角
+      RIGHT:null,   // 右键平移视角
     };
     /* 设置目标点 */
     if (target) {
       this._controls.target.copy(target);
     }
+
+    /* 监听 OrbitControls 状态变化：用于外部交互工具在相机变化期间暂停高成本 hover 拾取。 */
+    this._controls.addEventListener('start', this._onControlsStart);
+    this._controls.addEventListener('change', this._onControlsChange);
+    this._controls.addEventListener('end', this._onControlsEnd);
+    this._domElement.addEventListener('pointerdown', this._onPointerDown, { passive: true });
+    this._domElement.addEventListener('wheel', this._onWheel, { passive: true });
+    window.addEventListener('pointerup', this._onPointerUpOrCancel);
+    window.addEventListener('pointercancel', this._onPointerUpOrCancel);
   }
 
   /**
@@ -266,6 +304,51 @@ export class OrbitControlsWrapper {
   }
 
   /**
+   * 用户是否正在主动操作 OrbitControls。
+   * @returns 正在鼠标/触摸旋转、缩放或平移时返回 true
+   */
+  public get isUserInteracting(): boolean {
+    return this._isUserInteracting;
+  }
+
+  /**
+   * 获取当前相机交互状态。
+   * @returns 当前相机交互状态；过渡动画优先返回 transitioning
+   */
+  public getCameraInteractionState(): CameraInteractionState {
+    if (this._transition !== null) {
+      return 'transitioning';
+    }
+
+    return this._cameraInteractionState;
+  }
+
+  /**
+   * 判断相机控制是否处于独立交互状态。
+   * 关键流程：旋转、缩放、平移、ViewCube 过渡和阻尼冷却期间均返回 true，外部工具应停止所有拾取检测。
+   * @param cooldownMs - 最近一次相机变化后的检测禁用时间，单位毫秒
+   * @returns 相机交互独占期间返回 true
+   */
+  public isCameraInteractionActive(cooldownMs: number = OrbitControlsWrapper.CAMERA_INTERACTION_IDLE_DELAY_MS): boolean {
+    if (this._transition !== null || this._cameraInteractionState !== 'idle' || this._isUserInteracting) {
+      return true;
+    }
+
+    const elapsedMs: number = performance.now() - this._lastCameraChangeTime;
+    return elapsedMs >= 0 && elapsedMs < cooldownMs;
+  }
+
+  /**
+   * 判断相机是否仍处于变化阶段。
+   * 关键流程：同时覆盖用户交互、ViewCube 平滑过渡，以及 OrbitControls 阻尼导致的短暂惯性变化。
+   * @param cooldownMs - 最近一次 change 事件后的冷却时间，单位毫秒
+   * @returns 相机正在变化或刚刚变化完成时返回 true
+   */
+  public isCameraChanging(cooldownMs: number = 120): boolean {
+    return this.isCameraInteractionActive(cooldownMs);
+  }
+
+  /**
    * 更新控制器状态（每帧调用，当启用阻尼时必须调用）
    * 同时推进相机过渡动画（若有）
    */
@@ -289,6 +372,14 @@ export class OrbitControlsWrapper {
       this._transition = null;
       t.deferred.reject({ cancelled: true, reason: 'disposed' });
     }
+    this._controls.removeEventListener('start', this._onControlsStart);
+    this._controls.removeEventListener('change', this._onControlsChange);
+    this._controls.removeEventListener('end', this._onControlsEnd);
+    this._domElement.removeEventListener('pointerdown', this._onPointerDown);
+    this._domElement.removeEventListener('wheel', this._onWheel);
+    window.removeEventListener('pointerup', this._onPointerUpOrCancel);
+    window.removeEventListener('pointercancel', this._onPointerUpOrCancel);
+    this._cancelCameraInteractionIdleTimer();
     this._controls.dispose();
   }
 
@@ -322,7 +413,117 @@ export class OrbitControlsWrapper {
       /* 通知 Promise 完成 */
       const deferred: TransitionDeferred = state.deferred;
       this._transition = null;
+      this._lastCameraChangeTime = performance.now();
+      this._scheduleCameraInteractionIdle();
       deferred.resolve();
     }
   }
+
+  /** 根据鼠标按键配置推断当前相机交互类型。 */
+  private _resolveMouseButtonInteractionState(button: number): CameraInteractionState {
+    const mouseButtons: { LEFT?: unknown; MIDDLE?: unknown; RIGHT?: unknown } = this._controls.mouseButtons;
+    let action: unknown = null;
+
+    if (button === 0) {
+      action = mouseButtons.LEFT;
+    } else if (button === 1) {
+      action = mouseButtons.MIDDLE;
+    } else if (button === 2) {
+      action = mouseButtons.RIGHT;
+    }
+
+    if (action === THREE.MOUSE.ROTATE) {
+      return 'rotating';
+    }
+    if (action === THREE.MOUSE.DOLLY) {
+      return 'zooming';
+    }
+    if (action === THREE.MOUSE.PAN) {
+      return 'panning';
+    }
+
+    return 'idle';
+  }
+
+  /** 设置相机交互状态，并取消等待回到 idle 的旧定时器。 */
+  private _setCameraInteractionState(state: CameraInteractionState): void {
+    this._cancelCameraInteractionIdleTimer();
+    this._cameraInteractionState = state;
+    this._lastCameraChangeTime = performance.now();
+  }
+
+  /** 安排相机交互状态延迟回到 idle，避免阻尼或滚轮尾帧期间恢复拾取检测。 */
+  private _scheduleCameraInteractionIdle(): void {
+    this._cancelCameraInteractionIdleTimer();
+    this._cameraInteractionIdleTimerId = setTimeout((): void => {
+      this._cameraInteractionIdleTimerId = null;
+      if (!this._isUserInteracting && this._transition === null) {
+        this._cameraInteractionState = 'idle';
+        this._lastPointerCameraState = 'idle';
+      }
+    }, OrbitControlsWrapper.CAMERA_INTERACTION_IDLE_DELAY_MS);
+  }
+
+  /** 取消等待相机交互状态恢复 idle 的定时器。 */
+  private _cancelCameraInteractionIdleTimer(): void {
+    if (this._cameraInteractionIdleTimerId !== null) {
+      clearTimeout(this._cameraInteractionIdleTimerId);
+      this._cameraInteractionIdleTimerId = null;
+    }
+  }
+
+  /** 鼠标按下时根据 OrbitControls 按键配置记录旋转/平移/缩放状态。 */
+  private _onPointerDown = (event: PointerEvent): void => {
+    if (!this._controls.enabled) {
+      return;
+    }
+
+    const state: CameraInteractionState = this._resolveMouseButtonInteractionState(event.button);
+    this._lastPointerCameraState = state;
+    if (state !== 'idle') {
+      this._setCameraInteractionState(state);
+    }
+  };
+
+  /** 鼠标滚轮触发缩放时立即进入独立的相机缩放状态。 */
+  private _onWheel = (): void => {
+    if (!this._controls.enabled || !this._controls.enableZoom) {
+      return;
+    }
+
+    this._setCameraInteractionState('zooming');
+    this._scheduleCameraInteractionIdle();
+  };
+
+  /** 指针抬起或取消时结束主动鼠标状态，等待 OrbitControls end/change 冷却后回到 idle。 */
+  private _onPointerUpOrCancel = (): void => {
+    this._lastPointerCameraState = 'idle';
+    if (!this._isUserInteracting) {
+      this._scheduleCameraInteractionIdle();
+    }
+  };
+
+  /** OrbitControls 开始用户交互时记录状态。 */
+  private _onControlsStart = (): void => {
+    this._isUserInteracting = true;
+    this._lastCameraChangeTime = performance.now();
+    if (this._cameraInteractionState === 'idle') {
+      const state: CameraInteractionState = this._lastPointerCameraState !== 'idle'
+        ? this._lastPointerCameraState
+        : 'rotating';
+      this._setCameraInteractionState(state);
+    }
+  };
+
+  /** OrbitControls 相机发生变化时刷新时间戳，覆盖滚轮缩放和阻尼惯性。 */
+  private _onControlsChange = (): void => {
+    this._lastCameraChangeTime = performance.now();
+  };
+
+  /** OrbitControls 用户交互结束时保留最近变化时间，等待短冷却后再恢复高成本拾取。 */
+  private _onControlsEnd = (): void => {
+    this._isUserInteracting = false;
+    this._lastCameraChangeTime = performance.now();
+    this._scheduleCameraInteractionIdle();
+  };
 }

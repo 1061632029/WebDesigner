@@ -1,6 +1,7 @@
 /**
  * useGizmoShortcuts Hook
- * 注册全局键盘快捷键：Q（选择）/ G（移动）/ R（旋转）/ S（缩放）
+ * 注册全局键盘快捷键：Q（选择）
+ * G（移动）/ R（旋转）/ S（缩放）暂时禁用，避免误触后点选模型显示可拖动坐标轴
  * 当焦点在 input / textarea / select / contenteditable 元素上时不响应
  * 通过 GizmoBridge 调用 setMode，同时更新 PanelManager 的激活工具栏 ID
  */
@@ -14,12 +15,10 @@ import type { GizmoMode } from '../../interaction/TransformGizmo';
 
 /**
  * 快捷键到 Gizmo 模式的映射（小写键名）
+ * 仅保留 Q 返回选择模式；G/R/S 暂时禁用，防止误触显示 TransformControls 坐标轴。
  */
 const KEY_TO_GIZMO_MODE: Record<string, GizmoMode> = {
   q: 'select',
-  g: 'move',
-  r: 'rotate',
-  s: 'scale',
 };
 
 /**
@@ -63,7 +62,7 @@ export function useGizmoShortcuts(): void {
   useEffect((): (() => void) => {
     /**
      * 键盘按下事件处理
-     * 仅响应 Q / G / R / S 键（无修饰键）
+     * 仅响应 Q 键（无修饰键），G/R/S 变换快捷键暂时禁用。
      */
     const handleKeyDown = (event: KeyboardEvent): void => {
       /* 有修饰键时不响应（避免与 Ctrl+Z 等冲突） */

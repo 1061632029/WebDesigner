@@ -20,6 +20,7 @@ import type { BuildingContextValue } from './BuildingContext';
 import type { CommandHistoryManager } from '../../history/CommandHistoryManager';
 import type { SelectionManager } from '../../interaction/SelectionManager';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
+import type { DoorWindowPlacementDimensionRenderer } from '../../model/DoorWindowPlacementDimensionRenderer';
 
 /**
  * GizmoContext 值类型
@@ -106,6 +107,7 @@ export function GizmoProvider(props: GizmoProviderProps): React.ReactElement {
 
   const selectionManager: SelectionManager | null = buildingCtx.selectionManager;
   const objectManager: BuildingObjectManager | null = buildingCtx.objectManager;
+  const doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer | null = buildingCtx.doorWindowDimensionRenderer;
 
   /** 响应式 Gizmo 模式（驱动 TopToolbar 高亮） */
   const [mode, setModeState] = useState<GizmoMode>('select');
@@ -137,7 +139,7 @@ export function GizmoProvider(props: GizmoProviderProps): React.ReactElement {
    * 当 selectionManager 与 objectManager 就绪时创建 TransformGizmo
    */
   useEffect((): (() => void) => {
-    if (selectionManager === null || objectManager === null) {
+    if (selectionManager === null || objectManager === null || doorWindowDimensionRenderer === null) {
       return (): void => {};
     }
 
@@ -155,7 +157,8 @@ export function GizmoProvider(props: GizmoProviderProps): React.ReactElement {
       orbitControls,
       historyManager,
       selectionManager,
-      objectManager
+      objectManager,
+      doorWindowDimensionRenderer
     );
     gizmoRef.current = gizmo;
     /* 更新响应式 state，触发 Context 重渲染，让消费者（如 useSelection）感知 gizmo 就绪 */
@@ -214,7 +217,7 @@ export function GizmoProvider(props: GizmoProviderProps): React.ReactElement {
     return (): void => {
       clearInterval(intervalId);
     };
-  }, [engine, selectionManager, objectManager]);
+  }, [engine, historyManager, selectionManager, objectManager, doorWindowDimensionRenderer]);
 
   /**
    * 将 setMode 注入桥接 ref（供 useDemoSetup 调用）

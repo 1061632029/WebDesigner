@@ -25,6 +25,15 @@ interface DoorWindowDimensionSegment {
   distance: number;
 }
 
+/** 门窗距离标注可编辑方向。 */
+export type DoorWindowDimensionEditSide = 'left' | 'right';
+
+/** 门窗标注点击命中结果。 */
+export interface DoorWindowDimensionHitResult {
+  /** 命中的门窗标注侧。 */
+  side: DoorWindowDimensionEditSide;
+}
+
 /** 门窗距离标注上下文，描述已知墙体与门窗沿墙投影信息。 */
 export interface DoorWindowPlacementDimensionContext {
   /** 当前门窗 Mesh，收集同墙门窗时用于排除自身。 */
@@ -67,7 +76,12 @@ interface RenderedDoorWindowDimensionSegment {
   labelTexture: THREE.CanvasTexture;
   /** 当前显示文本 */
   labelText: string;
+  /** 当前是否为键盘可编辑标注段 */
+  active: boolean;
 }
+
+/** 门窗距离标注当前可编辑侧�?*/
+type DoorWindowDimensionActiveSide = DoorWindowDimensionEditSide | null;
 
 /** 门窗类别集合，用于收集同墙已有门窗。 */
 const DOOR_WINDOW_CATEGORIES: Set<string> = new Set<string>(['door', 'window']);
@@ -87,6 +101,9 @@ const EXTENSION_LINE_LENGTH: number = 0.16;
 /** 标注线颜色。 */
 const DIMENSION_LINE_COLOR: number = 0x8f8f8f;
 
+/** 当前可编辑标注线颜色。 */
+const ACTIVE_DIMENSION_LINE_COLOR: number = 0x2f8df6;
+
 /** 文字颜色。 */
 const LABEL_TEXT_COLOR: string = '#333333';
 
@@ -95,6 +112,12 @@ const LABEL_BORDER_COLOR: string = '#b8b8b8';
 
 /** 标签背景颜色。 */
 const LABEL_BACKGROUND_COLOR: string = 'rgba(255,255,255,0.94)';
+
+/** 当前可编辑标签背景颜色，用蓝底突出编辑状态。 */
+const ACTIVE_LABEL_BACKGROUND_COLOR: string = '#2f8df6';
+
+/** 当前可编辑标签文字颜色，保证蓝底下清晰可读。 */
+const ACTIVE_LABEL_TEXT_COLOR: string = '#ffffff';
 
 /** 标签画布宽度，单位像素。 */
 const LABEL_CANVAS_WIDTH: number = 240;
@@ -125,6 +148,9 @@ export class DoorWindowPlacementDimensionRenderer {
   /** 动态标注段缓存，最多包含左右两段。 */
   private readonly _renderedSegments: RenderedDoorWindowDimensionSegment[] = [];
 
+  /** 标注标签射线拾取器，用于点击进入尺寸编辑。 */
+  private readonly _labelRaycaster: THREE.Raycaster = new THREE.Raycaster();
+
   /**
    * 预创建门窗布置距离标注对象池。
    * @param scene - Three.js 场景
@@ -146,7 +172,9 @@ export class DoorWindowPlacementDimensionRenderer {
     previewMesh: THREE.Mesh,
     wallData: StraightWallData,
     snapResult: WallSnapResult,
-    scene: THREE.Scene
+    scene: THREE.Scene,
+    activeSide: DoorWindowDimensionActiveSide = null,
+    activeInputText: string | null = null
   ): void {
     /* 标注刷新流程：只使用 prepare 阶段已创建的对象池，动态过程不新建、不销毁 GPU 资源。 */
     const group: THREE.Group | null = this._group;
@@ -218,13 +246,17 @@ export class DoorWindowPlacementDimensionRenderer {
         renderedSegment.group.visible = false;
         continue;
       }
+      const active: boolean = DoorWindowPlacementDimensionRenderer.isSegmentActive(segmentIndex, activeSide);
+      const activeLabelText: string | null = active ? activeInputText : null;
       this.updateDimensionSegment(
         renderedSegment,
         segment,
         wallOrigin,
         wallDir,
         wallNormal,
-        offsetNormal
+        offsetNormal,
+        active,
+        activeLabelText
       );
     }
   }
@@ -238,7 +270,9 @@ export class DoorWindowPlacementDimensionRenderer {
   public updateForPlacedDoorWindow(
     mesh: THREE.Mesh,
     wallData: StraightWallData,
-    scene: THREE.Scene
+    scene: THREE.Scene,
+    activeSide: DoorWindowDimensionActiveSide = null,
+    activeInputText: string | null = null
   ): void {
     /* 已放置门窗标注流程：从墙体数据和 Mesh 当前世界包围盒还原沿墙投影区间，复用布置预览的最近边界计算逻辑。 */
     const context: DoorWindowPlacementDimensionContext | null = DoorWindowPlacementDimensionRenderer.createContextFromMesh(
@@ -250,7 +284,74 @@ export class DoorWindowPlacementDimensionRenderer {
       return;
     }
 
-    this.updateWithContext(context, scene);
+    this.updateWithContext(context, scene, activeSide, activeInputText);
+  }
+
+  /**
+   * 根据已放置门窗刷新已有距离标注，不创建新的动态标注对象。
+   * @param mesh - 当前已放置门窗 Mesh
+   * @param wallData - 当前门窗所属直墙数据
+   * @param scene - Three.js 场景
+   * @param activeSide - 当前键盘编辑的标注侧
+   * @param activeInputText - 当前键盘输入文本，单位为毫米
+   */
+  public updateExistingForPlacedDoorWindow(
+    mesh: THREE.Mesh,
+    wallData: StraightWallData,
+    scene: THREE.Scene,
+    activeSide: DoorWindowDimensionActiveSide = null,
+    activeInputText: string | null = null
+  ): void {
+    /* 编辑态刷新流程：仅复用已显示的标注对象池，避免点击标注后额外新增动态标注组。 */
+    const context: DoorWindowPlacementDimensionContext | null = DoorWindowPlacementDimensionRenderer.createContextFromMesh(
+      mesh,
+      wallData
+    );
+    if (context === null) {
+      this.hideExisting(scene);
+      return;
+    }
+
+    this.updateWithContextInternal(context, scene, activeSide, activeInputText, false);
+  }
+
+  /**
+   * 检测屏幕坐标是否命中门窗距离标注标签。
+   * @param clientX - 鼠标屏幕 X 坐标。
+   * @param clientY - 鼠标屏幕 Y 坐标。
+   * @param camera - 当前相机。
+   * @param domElement - 渲染画布元素。
+   * @returns 命中标注时返回标注侧，否则返回 null。
+   */
+  public hitTestLabel(
+    clientX: number,
+    clientY: number,
+    camera: THREE.Camera,
+    domElement: HTMLCanvasElement
+  ): DoorWindowDimensionHitResult | null {
+    const group: THREE.Group | null = this._group;
+    if (group === null || !group.visible) {
+      return null;
+    }
+
+    const rect: DOMRect = domElement.getBoundingClientRect();
+    const ndcX: number = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY: number = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this._labelRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+
+    for (let segmentIndex: number = 0; segmentIndex < this._renderedSegments.length; segmentIndex += 1) {
+      const renderedSegment: RenderedDoorWindowDimensionSegment | undefined = this._renderedSegments[segmentIndex];
+      if (renderedSegment === undefined || !renderedSegment.group.visible) {
+        continue;
+      }
+      const hits: THREE.Intersection[] = this._labelRaycaster.intersectObject(renderedSegment.label, false);
+      if (hits.length > 0) {
+        const side: DoorWindowDimensionEditSide = segmentIndex === 0 ? 'left' : 'right';
+        return { side: side };
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -260,9 +361,32 @@ export class DoorWindowPlacementDimensionRenderer {
    */
   public updateWithContext(
     context: DoorWindowPlacementDimensionContext,
-    scene: THREE.Scene
+    scene: THREE.Scene,
+    activeSide: DoorWindowDimensionActiveSide = null,
+    activeInputText: string | null = null
   ): void {
-    const group: THREE.Group = this.ensureGroup(scene);
+    this.updateWithContextInternal(context, scene, activeSide, activeInputText, true);
+  }
+
+  /**
+   * 使用完整上下文刷新门窗距离标注。
+   * @param context - 门窗距离标注上下文
+   * @param scene - Three.js 场景
+   * @param activeSide - 当前键盘编辑的标注侧
+   * @param activeInputText - 当前键盘输入文本，单位为毫米
+   * @param allowCreate - 是否允许创建新的动态标注对象池
+   */
+  private updateWithContextInternal(
+    context: DoorWindowPlacementDimensionContext,
+    scene: THREE.Scene,
+    activeSide: DoorWindowDimensionActiveSide,
+    activeInputText: string | null,
+    allowCreate: boolean
+  ): void {
+    const group: THREE.Group | null = allowCreate ? this.ensureGroup(scene) : this.getExistingGroup(scene);
+    if (group === null) {
+      return;
+    }
     group.name = `${DIMENSION_GROUP_NAME}-${context.targetMesh.uuid}`;
 
     const wallLength: number = DoorWindowPlacementDimensionRenderer.computeWallLength(context.wallData);
@@ -312,15 +436,44 @@ export class DoorWindowPlacementDimensionRenderer {
         renderedSegment.group.visible = false;
         continue;
       }
+      const active: boolean = DoorWindowPlacementDimensionRenderer.isSegmentActive(segmentIndex, activeSide);
+      const activeLabelText: string | null = active ? activeInputText : null;
       this.updateDimensionSegment(
         renderedSegment,
         segment,
         context.wallOrigin,
         context.wallDir,
         context.wallNormal,
-        offsetNormal
+        offsetNormal,
+        active,
+        activeLabelText
       );
     }
+  }
+
+  /**
+   * 获取当前场景中已存在的标注组。
+   * @param scene - Three.js 场景
+   * @returns 已挂载到当前场景的标注组；不存在时返回 null
+   */
+  private getExistingGroup(scene: THREE.Scene): THREE.Group | null {
+    if (this._group === null || this._group.parent !== scene || this._renderedSegments.length < 2) {
+      return null;
+    }
+
+    return this._group;
+  }
+
+  /**
+   * 仅隐藏当前场景中已存在的标注对象，不创建新对象。
+   * @param scene - Three.js 场景
+   */
+  private hideExisting(scene: THREE.Scene): void {
+    if (this.getExistingGroup(scene) === null) {
+      return;
+    }
+
+    this.hide();
   }
 
   /**
@@ -436,6 +589,7 @@ export class DoorWindowPlacementDimensionRenderer {
       labelCanvas: labelResources.canvas,
       labelTexture: labelResources.texture,
       labelText: '',
+      active: false,
     };
   }
 
@@ -447,6 +601,7 @@ export class DoorWindowPlacementDimensionRenderer {
    * @param wallDir - 墙方向单位向量
    * @param wallNormal - 墙法线单位向量
    * @param offsetNormal - 标注整体偏移向量
+   * @param active - 当前标注段是否处于可编辑状态
    */
   private updateDimensionSegment(
     renderedSegment: RenderedDoorWindowDimensionSegment,
@@ -454,7 +609,9 @@ export class DoorWindowPlacementDimensionRenderer {
     wallOrigin: THREE.Vector3,
     wallDir: THREE.Vector3,
     wallNormal: THREE.Vector3,
-    offsetNormal: THREE.Vector3
+    offsetNormal: THREE.Vector3,
+    active: boolean,
+    activeInputText: string | null
   ): void {
     const startPoint: THREE.Vector3 = DoorWindowPlacementDimensionRenderer.createDimensionPoint(
       wallOrigin,
@@ -484,15 +641,61 @@ export class DoorWindowPlacementDimensionRenderer {
       endExtensionB,
     ]);
 
-    const labelText: string = String(Math.round(segment.distance * 1000));
-    if (renderedSegment.labelText !== labelText) {
-      DoorWindowPlacementDimensionRenderer.drawLabelCanvas(renderedSegment.labelCanvas, labelText);
+    /* 标签编辑流程：处于编辑态且存在键盘输入时，优先显示用户输入值；未输入时保持显示实时计算距离。 */
+    const labelText: string = activeInputText !== null && activeInputText !== ''
+      ? activeInputText
+      : String(Math.round(segment.distance * 1000));
+    if (renderedSegment.labelText !== labelText || renderedSegment.active !== active) {
+      DoorWindowPlacementDimensionRenderer.drawLabelCanvas(renderedSegment.labelCanvas, labelText, active);
       renderedSegment.labelTexture.needsUpdate = true;
       renderedSegment.labelText = labelText;
+      renderedSegment.active = active;
     }
+    DoorWindowPlacementDimensionRenderer.updateLineColor(renderedSegment.dimensionLine, active);
+    DoorWindowPlacementDimensionRenderer.updateLineColor(renderedSegment.extensionLine, active);
     renderedSegment.label.position.copy(centerPoint);
     renderedSegment.label.position.y = DIMENSION_Y + 0.02;
     renderedSegment.group.visible = true;
+  }
+
+  /**
+   * 判断指定标注段是否为当前可编辑侧。
+   * @param segmentIndex - 标注段索引，0 表示左侧，1 表示右侧
+   * @param activeSide - 当前键盘编辑侧
+   * @returns 当前段处于编辑状态时返回 true
+   */
+  private static isSegmentActive(segmentIndex: number, activeSide: DoorWindowDimensionActiveSide): boolean {
+    if (activeSide === null) {
+      return false;
+    }
+    if (segmentIndex === 0) {
+      return activeSide === 'left';
+    }
+    if (segmentIndex === 1) {
+      return activeSide === 'right';
+    }
+    return false;
+  }
+
+  /**
+   * 根据编辑状态更新标注线颜色。
+   * @param lineObject - 尺寸线或界线对象
+   * @param active - 当前线段是否处于编辑状态
+   */
+  private static updateLineColor(lineObject: THREE.Line | THREE.LineSegments, active: boolean): void {
+    const material: THREE.Material | THREE.Material[] = lineObject.material;
+    if (Array.isArray(material)) {
+      for (let materialIndex: number = 0; materialIndex < material.length; materialIndex += 1) {
+        const item: THREE.Material | undefined = material[materialIndex];
+        if (item instanceof THREE.LineBasicMaterial) {
+          item.color.setHex(active ? ACTIVE_DIMENSION_LINE_COLOR : DIMENSION_LINE_COLOR);
+        }
+      }
+      return;
+    }
+    if (material instanceof THREE.LineBasicMaterial) {
+      material.color.setHex(active ? ACTIVE_DIMENSION_LINE_COLOR : DIMENSION_LINE_COLOR);
+    }
   }
 
   /**
@@ -817,7 +1020,7 @@ export class DoorWindowPlacementDimensionRenderer {
     const canvas: HTMLCanvasElement = document.createElement('canvas');
     canvas.width = LABEL_CANVAS_WIDTH;
     canvas.height = LABEL_CANVAS_HEIGHT;
-    DoorWindowPlacementDimensionRenderer.drawLabelCanvas(canvas, text);
+    DoorWindowPlacementDimensionRenderer.drawLabelCanvas(canvas, text, false);
 
     const texture: THREE.CanvasTexture = new THREE.CanvasTexture(canvas);
     texture.needsUpdate = true;
@@ -841,22 +1044,23 @@ export class DoorWindowPlacementDimensionRenderer {
    * 重绘文字标签画布。
    * @param canvas - 标签画布
    * @param text - 标签文本
+   * @param active - 当前标签是否处于可编辑状态
    */
-  private static drawLabelCanvas(canvas: HTMLCanvasElement, text: string): void {
+  private static drawLabelCanvas(canvas: HTMLCanvasElement, text: string, active: boolean): void {
     const context: CanvasRenderingContext2D | null = canvas.getContext('2d');
     if (context === null) {
       return;
     }
 
     context.clearRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = LABEL_BACKGROUND_COLOR;
-    context.strokeStyle = LABEL_BORDER_COLOR;
-    context.lineWidth = 2;
-    /* 标签重绘流程：先绘制更大的白底圆角框，再使用加粗大字号文本居中显示距离。 */
+    context.fillStyle = active ? ACTIVE_LABEL_BACKGROUND_COLOR : LABEL_BACKGROUND_COLOR;
+    context.strokeStyle = active ? ACTIVE_LABEL_BACKGROUND_COLOR : LABEL_BORDER_COLOR;
+    context.lineWidth = active ? 4 : 2;
+    /* 标签重绘流程：编辑态绘制蓝底白字，非编辑态保持白底深色文字，便于观察当前可修改标注。 */
     DoorWindowPlacementDimensionRenderer.drawRoundRect(context, 12, 14, 216, 68, 10);
     context.fill();
     context.stroke();
-    context.fillStyle = LABEL_TEXT_COLOR;
+    context.fillStyle = active ? ACTIVE_LABEL_TEXT_COLOR : LABEL_TEXT_COLOR;
     context.font = `900 ${LABEL_FONT_SIZE}px Arial, Microsoft YaHei, sans-serif`;
     context.textAlign = 'center';
     context.textBaseline = 'middle';

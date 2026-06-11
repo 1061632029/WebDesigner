@@ -73,8 +73,8 @@ export class TransformGizmo {
   private readonly _objectManager: BuildingObjectManager;
   private readonly _scene: THREE.Scene;
 
-  /** Gizmo 移动门窗时的沿墙距离标注渲染器。 */
-  private readonly _doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer = new DoorWindowPlacementDimensionRenderer();
+  /** Gizmo 移动门窗时的沿墙距离标注渲染器（与选择编辑共用同一对象池）。 */
+  private readonly _doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer;
 
   /**
    * @param scene - Three.js 场景
@@ -82,19 +82,22 @@ export class TransformGizmo {
    * @param historyManager - 命令历史管理器
    * @param selectionManager - 选中管理器
    * @param objectManager - 建筑对象管理器
+   * @param doorWindowDimensionRenderer - 共享门窗标注渲染器，用于复用已有动态标注对象
    */
   public constructor(
     scene: THREE.Scene,
     orbitControls: OrbitControlsWrapper,
     historyManager: CommandHistoryManager,
     selectionManager: SelectionManager,
-    objectManager: BuildingObjectManager
+    objectManager: BuildingObjectManager,
+    doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer
   ) {
     this._scene = scene;
     this._orbitControls = orbitControls;
     this._historyManager = historyManager;
     this._selectionManager = selectionManager;
     this._objectManager = objectManager;
+    this._doorWindowDimensionRenderer = doorWindowDimensionRenderer;
   }
 
   /* ========== 公开属性 ========== */
@@ -269,6 +272,15 @@ export class TransformGizmo {
    */
   private readonly _onObjectChange = (): void => {
     if (this._attachedTarget === null) {
+      this._clearDoorWindowDimension();
+      return;
+    }
+
+    /*
+     * 标注编辑会通过代码直接更新 Mesh 位姿，并可能触发 TransformControls 的 objectChange。
+     * 此时不属于 Gizmo 拖拽流程，必须隐藏 Gizmo 自己的动态标注，避免额外创建一套门窗标注。
+     */
+    if (this._beforeSnapshot === null) {
       this._clearDoorWindowDimension();
       return;
     }

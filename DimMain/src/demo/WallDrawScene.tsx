@@ -311,10 +311,12 @@ function ViewModeOpacityController(): null {
     if (viewMode === '2d') {
       /* 2D 模式：墙体使用深灰不透明临时样式，门窗白色平面符号叠加在线框上方，提升识别和选中效率。 */
       objectManager.setCategoryVisualStyle('wall', 0x4a4a4a, 1.0);
+      objectManager.setWallJointNodesVisible(true);
       objectManager.setCategoryVisible('ceiling', false);
     } else {
       /* 3D 模式：恢复墙体真实材质，天花板恢复可见和原透明度。 */
       objectManager.restoreCategoryVisualStyle('wall');
+      objectManager.setWallJointNodesVisible(false);
       objectManager.setCategoryVisible('ceiling', true);
       objectManager.setCategoryOpacity('ceiling', 1.0);
     }
@@ -462,7 +464,11 @@ function StlPlaceHandler(): null {
         buildingCtx.drawTool.deactivate();
       }
 
+      /* 进入模型布置模式：统一交互状态会禁用 SelectionTool，从源头停止 hover 预选中射线检测。 */
+      buildingCtx.setInteractionMode('stl-place');
+
       tool.activate(model).catch((err: Error): void => {
+        buildingCtx.setInteractionMode('select');
         console.error('STL 布置激活失败:', err.message);
       });
     };
@@ -470,16 +476,27 @@ function StlPlaceHandler(): null {
     /* 注册取消回调 */
     bridge.deactivatePlaceRef.current = (): void => {
       tool.deactivate();
+      buildingCtx.setInteractionMode('select');
     };
+
+    /**
+     * STL 布置工具状态同步回调。
+     * activate/deactivate、右键取消、Esc 取消都会触发，确保交互模式不会卡在 stl-place。
+     */
+    tool.onStateChange((): void => {
+      buildingCtx.setInteractionMode(tool.isActive ? 'stl-place' : 'select');
+    });
 
     return (): void => {
       /* 清理 */
       bridge.activatePlaceRef.current = null;
       bridge.deactivatePlaceRef.current = null;
+      tool.onStateChange((): void => {});
+      buildingCtx.setInteractionMode('select');
       tool.dispose();
       toolRef.current = null;
     };
-  }, [engine, bridge, buildingCtx.objectManager, buildingCtx.drawTool]);
+  }, [engine, bridge, buildingCtx.objectManager, buildingCtx.drawTool, buildingCtx.setInteractionMode]);
 
   /**
    * 视图模式变化时同步到 StlPlaceTool

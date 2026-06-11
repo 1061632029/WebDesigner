@@ -13,6 +13,16 @@ export interface WallCenterLine {
   end: Point2D;
 }
 
+/** 弧墙中心线转换结果。 */
+export interface ArcWallCenterLine {
+  /** 弧墙中心线起点。 */
+  start: Point2D;
+  /** 弧墙中心线终点。 */
+  end: Point2D;
+  /** 转换后中心线对应的 bulge 因子。 */
+  bulge: number;
+}
+
 /** 矩形墙顺时针内侧边集合。 */
 export interface ClockwiseRectInnerEdges {
   /** 第一条顺时针内侧边起点。 */
@@ -89,6 +99,139 @@ export class WallPlacementLineConverter {
         x: innerEnd.x + normX * halfThickness,
         z: innerEnd.z + normZ * halfThickness,
       },
+    };
+  }
+
+  /**
+   * 将连续绘制的折线内侧边转换为指定边的墙中心线。
+   * 关键流程：把当前边与相邻边一起按折线内侧偏移到墙中心线，并在转角处求相邻中心线交点，保证连续绘制时墙角不再按单段平移错开。
+   * @param previousPoint - 当前边前一条内侧边的起点；没有上一条边时传入 null
+   * @param currentStart - 当前内侧边起点
+   * @param currentEnd - 当前内侧边终点
+   * @param nextPoint - 当前边后一条内侧边的终点；没有下一条边时传入 null
+   * @param thickness - 墙体厚度
+   * @returns 当前边对应的墙中心线
+   */
+  public static convertConnectedInnerLineToCenterLine(
+    previousPoint: Point2D | null,
+    currentStart: Point2D,
+    currentEnd: Point2D,
+    nextPoint: Point2D | null,
+    thickness: number
+  ): WallCenterLine {
+    const currentLine: OffsetLineSegment = WallPlacementLineConverter.createOffsetLineSegment(
+      currentStart,
+      currentEnd,
+      thickness,
+      1
+    );
+    const fallbackLine: WallCenterLine = WallPlacementLineConverter.convertInnerLineToCenterLine(
+      currentStart,
+      currentEnd,
+      thickness
+    );
+
+    let centerStart: Point2D = fallbackLine.start;
+    let centerEnd: Point2D = fallbackLine.end;
+
+    if (previousPoint !== null) {
+      /* 起点存在上一条连续边时，使用上一条中心线与当前中心线交点作为真实墙角。 */
+      const previousLine: OffsetLineSegment = WallPlacementLineConverter.createOffsetLineSegment(
+        previousPoint,
+        currentStart,
+        thickness,
+        1
+      );
+      centerStart = WallPlacementLineConverter.intersectOffsetLines(previousLine, currentLine);
+    }
+
+    if (nextPoint !== null) {
+      /* 终点存在下一条连续边时，使用当前中心线与下一条中心线交点作为真实墙角。 */
+      const nextLine: OffsetLineSegment = WallPlacementLineConverter.createOffsetLineSegment(
+        currentEnd,
+        nextPoint,
+        thickness,
+        1
+      );
+      centerEnd = WallPlacementLineConverter.intersectOffsetLines(currentLine, nextLine);
+    }
+
+    return {
+      start: centerStart,
+      end: centerEnd,
+    };
+  }
+
+  /**
+   * 将弧墙内侧布置弧线转换为墙中心弧线。
+   * 关键流程：根据内侧弧的圆心、半径与方向，把半径向墙外侧增加半墙厚，再按同一圆心角换算中心弧端点与 bulge。
+   * @param innerStart - 弧墙内侧线起点
+   * @param innerEnd - 弧墙内侧线终点
+   * @param innerBulge - 内侧弧 bulge 因子
+   * @param thickness - 墙体厚度
+   * @returns 转换后的弧墙中心线；退化为直线时按直墙转换
+   */
+  public static convertInnerArcToCenterArc(
+    innerStart: Point2D,
+    innerEnd: Point2D,
+    innerBulge: number,
+    thickness: number
+  ): ArcWallCenterLine {
+    if (Math.abs(innerBulge) <= WallPlacementLineConverter.EPSILON) {
+      /* bulge 近似 0 时按直墙内侧线处理，避免半径计算除零。 */
+      const straightCenterLine: WallCenterLine = WallPlacementLineConverter.convertInnerLineToCenterLine(
+        innerStart,
+        innerEnd,
+        thickness
+      );
+      return {
+        start: straightCenterLine.start,
+        end: straightCenterLine.end,
+        bulge: innerBulge,
+      };
+    }
+
+    const chordDx: number = innerEnd.x - innerStart.x;
+    const chordDz: number = innerEnd.z - innerStart.z;
+    const chordLength: number = Math.sqrt(chordDx * chordDx + chordDz * chordDz);
+    if (chordLength <= WallPlacementLineConverter.EPSILON) {
+      /* 弦长过短时无法稳定计算圆弧，保留原始数据交由上层校验。 */
+      return {
+        start: { x: innerStart.x, z: innerStart.z },
+        end: { x: innerEnd.x, z: innerEnd.z },
+        bulge: innerBulge,
+      };
+    }
+
+    const halfChord: number = chordLength / 2;
+    const signedSagitta: number = (innerBulge * chordLength) / 2;
+    const radius: number = (halfChord * halfChord + signedSagitta * signedSagitta) / (2 * Math.abs(signedSagitta));
+    const centerOffset: number = (halfChord * halfChord - signedSagitta * signedSagitta) / (2 * signedSagitta);
+    const midX: number = (innerStart.x + innerEnd.x) / 2;
+    const midZ: number = (innerStart.z + innerEnd.z) / 2;
+    const leftNormalX: number = -chordDz / chordLength;
+    const leftNormalZ: number = chordDx / chordLength;
+    const centerX: number = midX + leftNormalX * centerOffset;
+    const centerZ: number = midZ + leftNormalZ * centerOffset;
+    const startVectorX: number = innerStart.x - centerX;
+    const startVectorZ: number = innerStart.z - centerZ;
+    const endVectorX: number = innerEnd.x - centerX;
+    const endVectorZ: number = innerEnd.z - centerZ;
+    const centerRadius: number = radius + thickness / 2;
+    const radiusScale: number = centerRadius / radius;
+    const centerStart: Point2D = {
+      x: centerX + startVectorX * radiusScale,
+      z: centerZ + startVectorZ * radiusScale,
+    };
+    const centerEnd: Point2D = {
+      x: centerX + endVectorX * radiusScale,
+      z: centerZ + endVectorZ * radiusScale,
+    };
+
+    return {
+      start: centerStart,
+      end: centerEnd,
+      bulge: innerBulge,
     };
   }
 

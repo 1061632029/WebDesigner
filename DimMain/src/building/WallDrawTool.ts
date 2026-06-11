@@ -11,7 +11,7 @@ import { WallGeometryBuilder } from './WallGeometryBuilder';
 import { BeamGeometryBuilder } from './BeamGeometryBuilder';
 import { BuildingObjectManager } from './BuildingObjectManager';
 import { RaycastHelper } from '../interaction/RaycastHelper';
-import { RectDimensionRenderer } from './RectDimensionRenderer';
+import { RectDimensionRenderer, type RectPreviewEditAxis } from './RectDimensionRenderer';
 import { PlanarPlacementSnapService } from './PlanarPlacementSnapService';
 import { PlanarPlacementGuideRenderer } from './PlanarPlacementGuideRenderer';
 import { WallPlacementLineConverter } from './WallPlacementLineConverter';
@@ -20,6 +20,8 @@ import type { PlanarPlacementSnapResult } from './PlanarPlacementSnapTypes';
 import type { SceneManager } from '../scene/SceneManager';
 import type { CommandHistoryManager } from '../history/CommandHistoryManager';
 import { StraightWallCreateCommand } from '../history/commands/StraightWallCreateCommand';
+import { ConnectedStraightWallCreateCommand } from '../history/commands/ConnectedStraightWallCreateCommand';
+import type { PreviousStraightWallEndpointUpdate } from '../history/commands/ConnectedStraightWallCreateCommand';
 import { RectWallCreateCommand } from '../history/commands/RectWallCreateCommand';
 import { BeamCreateCommand } from '../history/commands/BeamCreateCommand';
 
@@ -95,8 +97,23 @@ export class WallDrawTool {
   /** 连续绘制模式（直墙模式下终点变为下一段起点） */
   private _continuous: boolean = true;
 
+  /** 连续直墙上一段内侧起点，用于在下一段创建时计算中心线交点。 */
+  private _previousStraightInnerStart: Point2D | null = null;
+
+  /** 连续直墙上一段创建出的墙体 ID，用于在下一段创建时回写衔接端点。 */
+  private _previousStraightWallId: string | null = null;
+
   /** 矩形墙尺寸标注渲染器（仅保留绘制过程中的预览标注） */
   private _rectDimRenderer: RectDimensionRenderer;
+
+  /** 矩形墙预览当前可编辑尺寸轴，默认编辑水平尺寸。 */
+  private _rectPreviewEditAxis: RectPreviewEditAxis = 'horizontal';
+
+  /** 矩形墙预览尺寸键盘输入缓冲，单位为毫米。 */
+  private _rectPreviewDimensionInput: string = '';
+
+  /** 矩形墙预览是否刚由键盘尺寸驱动，用于鼠标移动时恢复鼠标驱动。 */
+  private _rectPreviewKeyboardSized: boolean = false;
 
   /** 平面线式布置统一捕获服务 */
   private _planarSnapService: PlanarPlacementSnapService;
@@ -174,6 +191,10 @@ export class WallDrawTool {
     this._getCameraFn = getCameraFn;
     this._domElement = domElement;
 
+    if (mode === 'rect-wall') {
+      this._resetRectPreviewDimensionEdit(true);
+    }
+
     /* 绑定事件（使用箭头函数保持 this 引用） */
     domElement.addEventListener('click', this._handleClick);
     domElement.addEventListener('mousemove', this._handleMouseMove);
@@ -211,6 +232,9 @@ export class WallDrawTool {
     this._startPoint = null;
     this._endPoint = null;
     this._bulge = 0;
+    this._previousStraightInnerStart = null;
+    this._previousStraightWallId = null;
+    this._resetRectPreviewDimensionEdit(true);
     this._getCameraFn = null;
     this._domElement = null;
 
@@ -282,6 +306,10 @@ export class WallDrawTool {
       this._bulge = this._computeBulgeFromPoint(point);
     } else {
       /* picking-end 阶段：使用吸附后的坐标更新终点 */
+      if (this._mode === 'rect-wall') {
+        /* 鼠标移动恢复实时拖拽驱动：清空键盘输入缓冲，后续尺寸重新按鼠标位置计算。 */
+        this._resetRectPreviewDimensionEdit(false);
+      }
       this._endPoint = point;
     }
 
@@ -305,6 +333,10 @@ export class WallDrawTool {
    * 键盘按键
    */
   private _handleKeyDown = (event: KeyboardEvent): void => {
+    if (this._handleRectPreviewDimensionKeyDown(event)) {
+      return;
+    }
+
     if (event.key === 'Escape') {
       /* 未放置任何布置点时，Esc 直接退出当前墙/梁编辑环境，避免停留在空编辑状态。 */
       if (this._state === 'picking-start' && this._startPoint === null) {
@@ -329,16 +361,24 @@ export class WallDrawTool {
     } else if (this._state === 'picking-end') {
       /* 确定终点，创建墙体 */
       this._endPoint = point;
-      this._createStraightWallByHistory(this._startPoint!, this._endPoint);
+      const createdWallId: string = this._createStraightWallByHistory(
+        this._previousStraightInnerStart,
+        this._startPoint!,
+        this._endPoint
+      );
       this._clearPreview();
 
       /* 连续模式：终点变为下一段起点 */
       if (this._continuous) {
+        this._previousStraightInnerStart = this._startPoint;
+        this._previousStraightWallId = createdWallId;
         this._startPoint = point;
         this._clearStartMarker();
         this._showStartMarker(point);
         /* 保持 picking-end 状态 */
       } else {
+        this._previousStraightInnerStart = null;
+        this._previousStraightWallId = null;
         this._startPoint = null;
         this._endPoint = null;
         this._state = 'picking-start';
@@ -428,20 +468,36 @@ export class WallDrawTool {
       this._showStartMarker(point);
       this._notify();
     } else if (this._state === 'picking-end') {
-      this._endPoint = point;
-
-      /* 创建矩形墙（四面直墙）并纳入历史栈 */
-      this._rectDimRenderer.clearPreview();
-      this._createRectWallByHistory(this._startPoint!, this._endPoint);
-
-      this._clearPreview();
-      this._clearStartMarker();
-      this._startPoint = null;
-      this._endPoint = null;
-      // this._state = 'picking-start';
-      // this._notify();
-      this.deactivate();
+      /* 允许用户输入尺寸后不按 Enter/Tab 直接点击确认，确认前先尝试应用当前输入。 */
+      this._applyRectPreviewDimensionInput();
+      /* 确认流程：键盘尺寸驱动后直接点击时保留已编辑预览端点；鼠标移动后则使用最新鼠标点。 */
+      const confirmedEndPoint: Point2D = this._rectPreviewKeyboardSized && this._endPoint !== null ? this._endPoint : point;
+      this._endPoint = confirmedEndPoint;
+      this._confirmRectWallPreview();
     }
+  }
+
+  /**
+   * 按当前矩形墙预览完成墙体布置。
+   * 关键流程：先应用尚未提交的尺寸输入，再使用当前预览端点创建矩形墙，最后清理预览和编辑状态。
+   */
+  private _confirmRectWallPreview(): void {
+    if (this._startPoint === null || this._endPoint === null) {
+      return;
+    }
+
+    this._applyRectPreviewDimensionInput();
+
+    /* 创建矩形墙（四面直墙）并纳入历史栈，确保 Enter 与鼠标点击确认使用同一套收尾流程。 */
+    this._rectDimRenderer.clearPreview();
+    this._createRectWallByHistory(this._startPoint, this._endPoint);
+    this._resetRectPreviewDimensionEdit(true);
+
+    this._clearPreview();
+    this._clearStartMarker();
+    this._startPoint = null;
+    this._endPoint = null;
+    this.deactivate();
   }
 
   /* ========== 预览管理 ========== */
@@ -492,8 +548,150 @@ export class WallDrawTool {
 
     /* 矩形墙模式：同步更新预览标注（面积 + 长宽） */
     if (this._mode === 'rect-wall') {
-      this._rectDimRenderer.updatePreview(this._startPoint, this._endPoint);
+      this._rectDimRenderer.updatePreview(
+        this._startPoint,
+        this._endPoint,
+        this._rectPreviewEditAxis,
+        this._getRectPreviewDimensionInputText()
+      );
     }
+  }
+
+  /**
+   * 处理矩形墙预览尺寸键盘编辑。
+   * 关键流程：数字键只更新当前轴输入文本；Enter/Tab 应用输入尺寸并重绘预览，Tab 额外切换编辑轴。
+   * @param event - 键盘事件
+   * @returns true 表示事件已被矩形墙尺寸编辑消费
+   */
+  private _handleRectPreviewDimensionKeyDown(event: KeyboardEvent): boolean {
+    if (!this._canEditRectPreviewDimension()) {
+      return false;
+    }
+
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      this._applyRectPreviewDimensionInput();
+      this._toggleRectPreviewEditAxis();
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      this._confirmRectWallPreview();
+      return true;
+    }
+
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      if (this._rectPreviewDimensionInput.length > 0) {
+        this._rectPreviewDimensionInput = this._rectPreviewDimensionInput.slice(0, -1);
+        this._updatePreview();
+        this._notify();
+      }
+      return true;
+    }
+
+    if (event.key === 'Delete') {
+      event.preventDefault();
+      if (this._rectPreviewDimensionInput.length > 0) {
+        this._rectPreviewDimensionInput = '';
+        this._updatePreview();
+        this._notify();
+      }
+      return true;
+    }
+
+    if (/^[0-9]$/.test(event.key)) {
+      event.preventDefault();
+      this._rectPreviewDimensionInput = `${this._rectPreviewDimensionInput}${event.key}`;
+      this._rectPreviewKeyboardSized = true;
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 判断当前是否允许编辑矩形墙预览尺寸。
+   * @returns true 表示当前处于矩形墙第二点布置阶段，且预览端点有效
+   */
+  private _canEditRectPreviewDimension(): boolean {
+    return this._mode === 'rect-wall'
+      && this._state === 'picking-end'
+      && this._startPoint !== null
+      && this._endPoint !== null;
+  }
+
+  /**
+   * 应用当前输入缓冲到矩形墙预览端点。
+   * 关键流程：输入值按毫米解析，并保持当前拖拽方向的正负号，只替换当前编辑轴长度。
+   * @returns true 表示已成功应用输入尺寸
+   */
+  private _applyRectPreviewDimensionInput(): boolean {
+    if (this._startPoint === null || this._endPoint === null || this._rectPreviewDimensionInput.length === 0) {
+      return false;
+    }
+
+    const dimensionMillimeters: number = Number.parseFloat(this._rectPreviewDimensionInput);
+    if (!Number.isFinite(dimensionMillimeters)) {
+      return false;
+    }
+
+    const dimensionMeters: number = dimensionMillimeters / 1000;
+    if (dimensionMeters < 0.1) {
+      return false;
+    }
+
+    const horizontalDirection: number = this._endPoint.x >= this._startPoint.x ? 1 : -1;
+    const verticalDirection: number = this._endPoint.z >= this._startPoint.z ? 1 : -1;
+    const nextEndPoint: Point2D = { x: this._endPoint.x, z: this._endPoint.z };
+
+    if (this._rectPreviewEditAxis === 'horizontal') {
+      nextEndPoint.x = this._startPoint.x + horizontalDirection * dimensionMeters;
+    } else {
+      nextEndPoint.z = this._startPoint.z + verticalDirection * dimensionMeters;
+    }
+
+    this._endPoint = nextEndPoint;
+    this._rectPreviewDimensionInput = '';
+    this._rectPreviewKeyboardSized = true;
+    return true;
+  }
+
+  /**
+   * 切换矩形墙预览尺寸编辑轴。
+   */
+  private _toggleRectPreviewEditAxis(): void {
+    this._rectPreviewEditAxis = this._rectPreviewEditAxis === 'horizontal' ? 'vertical' : 'horizontal';
+    this._rectPreviewDimensionInput = '';
+  }
+
+  /**
+   * 重置矩形墙预览尺寸编辑状态。
+   * @param resetAxis - true 时一并恢复默认水平编辑轴；false 时仅清空输入和键盘驱动标记
+   */
+  private _resetRectPreviewDimensionEdit(resetAxis: boolean): void {
+    if (resetAxis) {
+      this._rectPreviewEditAxis = 'horizontal';
+    }
+    this._rectPreviewDimensionInput = '';
+    this._rectPreviewKeyboardSized = false;
+  }
+
+  /**
+   * 获取当前编辑轴输入显示文本。
+   * @returns 有输入时返回毫米文本；无输入时返回 null 以显示真实尺寸
+   */
+  private _getRectPreviewDimensionInputText(): string | null {
+    if (this._rectPreviewDimensionInput.length === 0) {
+      return null;
+    }
+
+    return this._rectPreviewDimensionInput;
   }
 
   /**
@@ -623,11 +821,15 @@ export class WallDrawTool {
     );
     this._planarGuideRenderer.update(result.guideLines.length > 0 ? result.guideLines : (result.guideLine === null ? [] : [result.guideLine]));
 
-    if (result.snapped) {
-      /* 捕获成功：显示绿色吸附标记，点捕获/线捕获/正交终点均使用同一视觉反馈。 */
+    if (result.showSnapPoint) {
+      /* 捕获点显示规则：点捕获和两线交点显示标记；单线捕获仅约束落点，不显示捕获点。 */
       this._showSnapMarker(result.position);
       this._isSnapped = true;
       console.log(`[WallDrawTool] 平面捕获(${result.type}): (${result.position.x.toFixed(3)}, ${result.position.z.toFixed(3)})`);
+    } else if (result.snapped) {
+      /* 单条捕获线：隐藏捕获点，但保留投影后的布置坐标和捕获线显示。 */
+      this._clearSnapMarker();
+      this._isSnapped = true;
     } else {
       /* 未捕获：清除吸附标记和辅助虚线。 */
       this._clearSnapMarker();
@@ -746,14 +948,18 @@ export class WallDrawTool {
   /**
    * 创建直墙并按需写入历史栈
    * 关键流程：先构造稳定数据快照，再交给命令历史管理器执行；无历史管理器时回退为直接添加对象。
-   * @param start - 直墙起点
-   * @param end - 直墙终点
+   * @param previousStart - 上一段连续直墙内侧起点；首段传入 null
+   * @param start - 当前直墙内侧线起点
+   * @param end - 当前直墙内侧线终点
+   * @returns 创建出的直墙 ID
    */
-  private _createStraightWallByHistory(start: Point2D, end: Point2D): void {
-    /* 墙体布置关键流程：用户绘制线视为墙内侧线，创建数据前转换为系统中心线。 */
-    const centerLine: WallCenterLine = WallPlacementLineConverter.convertInnerLineToCenterLine(
+  private _createStraightWallByHistory(previousStart: Point2D | null, start: Point2D, end: Point2D): string {
+    /* 墙体布置关键流程：用户绘制线视为墙内侧线；连续绘制时用相邻内侧边的偏移线交点修正中心线墙角。 */
+    const centerLine: WallCenterLine = WallPlacementLineConverter.convertConnectedInnerLineToCenterLine(
+      previousStart,
       start,
       end,
+      null,
       this._thickness
     );
     const wallData: StraightWallData = this._objectManager.createStraightWallData(
@@ -762,14 +968,86 @@ export class WallDrawTool {
       this._thickness,
       this._height
     );
+    const previousWallUpdate: PreviousStraightWallEndpointUpdate | null = this._createPreviousStraightWallEndpointUpdate(
+      previousStart,
+      start,
+      end
+    );
 
     if (this._historyManager !== null) {
-      this._historyManager.execute(new StraightWallCreateCommand(this._objectManager, wallData));
-      return;
+      if (previousWallUpdate !== null) {
+        this._historyManager.execute(new ConnectedStraightWallCreateCommand(this._objectManager, wallData, previousWallUpdate));
+      } else {
+        this._historyManager.execute(new StraightWallCreateCommand(this._objectManager, wallData));
+      }
+      return wallData.id;
+    }
+
+    if (previousWallUpdate !== null) {
+      this._objectManager.updateObject(
+        previousWallUpdate.wallId,
+        { end: { x: previousWallUpdate.nextEnd.x, z: previousWallUpdate.nextEnd.z } } as Partial<StraightWallData>
+      );
     }
 
     /* 未注入历史管理器的兼容路径：保持旧版直接创建行为。 */
     this._objectManager.addObject(wallData);
+    return wallData.id;
+  }
+
+  /**
+   * 创建上一段连续直墙端点修正参数。
+   * 关键流程：第二段及以后确定时，根据上一条与当前条内侧布置线重新计算上一段中心线终点。
+   * @param previousStart - 上一段内侧线起点；首段传入 null
+   * @param start - 当前段内侧线起点，也是上一段内侧线终点
+   * @param end - 当前段内侧线终点
+   * @returns 上一段墙体端点修正参数；没有可修正墙体时返回 null
+   */
+  private _createPreviousStraightWallEndpointUpdate(
+    previousStart: Point2D | null,
+    start: Point2D,
+    end: Point2D
+  ): PreviousStraightWallEndpointUpdate | null {
+    if (previousStart === null || this._previousStraightWallId === null) {
+      /* 首段或历史已断开时，不修正上一段墙体。 */
+      return null;
+    }
+
+    const previousWall: StraightWallData | null = this._findStraightWallById(this._previousStraightWallId);
+    if (previousWall === null) {
+      /* 撤销、删除等操作导致上一段不存在时，跳过衔接修正以保持绘制流程可继续。 */
+      return null;
+    }
+
+    const previousConnectedLine: WallCenterLine = WallPlacementLineConverter.convertConnectedInnerLineToCenterLine(
+      null,
+      previousStart,
+      start,
+      end,
+      this._thickness
+    );
+
+    return {
+      wallId: previousWall.id,
+      previousEnd: { x: previousWall.end.x, z: previousWall.end.z },
+      nextEnd: previousConnectedLine.end,
+    };
+  }
+
+  /**
+   * 按 ID 查找直墙数据。
+   * @param wallId - 直墙 ID
+   * @returns 找到的直墙数据；不存在或类型不匹配时返回 null
+   */
+  private _findStraightWallById(wallId: string): StraightWallData | null {
+    const allObjects: BuildingObject[] = this._objectManager.getAll();
+    for (const object of allObjects) {
+      if (object.id === wallId && object.category === 'wall' && object.subType === 'straight') {
+        return object as StraightWallData;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -835,6 +1113,9 @@ export class WallDrawTool {
     this._startPoint = null;
     this._endPoint = null;
     this._bulge = 0;
+    this._previousStraightInnerStart = null;
+    this._previousStraightWallId = null;
+    this._resetRectPreviewDimensionEdit(true);
     this._state = 'picking-start';
     this._notify();
   }

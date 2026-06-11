@@ -128,6 +128,12 @@ export function useDemoSetup(): void {
       order: 99,
       panelId: null,
       action: (): void => {
+        /* 截图前向用户确认是否保存当前场景图片，取消时中断后续下载流程。 */
+        const shouldSaveScreenshot: boolean = window.confirm('是否保存当前场景图片');
+        if (!shouldSaveScreenshot) {
+          return;
+        }
+
         /* 直接从 DOM 获取 canvas 元素，无需 EngineContext */
         const canvas: HTMLCanvasElement | null = document.querySelector('canvas');
         if (canvas === null) {
@@ -282,7 +288,13 @@ export function useDemoSetup(): void {
       order: 9,
       disabled: false,
       action: (): void => {
-        /* 顶部工具栏即时操作：委托 Canvas 内部命令处理器创建可撤销清空命令。 */
+        /* 清空场景属于不可忽略的批量操作，执行前先确认；取消时中断后续清空流程。 */
+        const shouldClearScene: boolean = window.confirm('是否清空当前场景内所有模型？');
+        if (!shouldClearScene) {
+          return;
+        }
+
+        /* 用户确认后，委托 Canvas 内部命令处理器创建可撤销清空命令。 */
         triggerClearScene();
       },
     });

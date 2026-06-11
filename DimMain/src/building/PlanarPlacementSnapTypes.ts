@@ -14,6 +14,7 @@ export type PlanarPlacementSnapType =
   | 'circle-center'
   | 'extension-line'
   | 'endpoint-normal-line'
+  | 'line-intersection'
   | 'orthogonal';
 
 /** 平面布置点捕获目标 */
@@ -50,6 +51,8 @@ export interface PlanarPlacementGuideLine {
 export interface PlanarPlacementSnapResult {
   /** 是否发生捕获 */
   snapped: boolean;
+  /** 是否显示捕获点标记；单条线捕获仅约束落点但不显示捕获点 */
+  showSnapPoint: boolean;
   /** 捕获类型 */
   type: PlanarPlacementSnapType;
   /** 捕获后的点；未捕获时为原始点 */

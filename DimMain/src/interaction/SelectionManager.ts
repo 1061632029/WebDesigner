@@ -10,9 +10,10 @@ import type { CommandHistoryManager } from '../history/CommandHistoryManager';
 import { DeleteCommand } from '../history/commands/DeleteCommand';
 import { StlDeleteCommand } from '../history/commands/StlDeleteCommand';
 import { StlDeleteWithOpeningCommand } from '../history/commands/StlDeleteWithOpeningCommand';
+import { SlabCascadeDeleteCommand } from '../history/commands/SlabCascadeDeleteCommand';
 import { BoundingBoxHelper } from './BoundingBoxHelper';
 import type { ViewMode } from '../react/context/ViewModeContext';
-import type { WallData, StraightWallData, WallOpening } from '../building/BuildingTypes';
+import type { BuildingObject, CeilingData, WallData, StraightWallData, WallOpening } from '../building/BuildingTypes';
 
 /** 选中状态变更回调 */
 export type SelectionChangeCallback = (selectedIds: ReadonlySet<string>) => void;
@@ -111,6 +112,17 @@ export class SelectionManager {
   }
 
   /**
+   * 重新应用当前建筑对象选中高亮。
+   *
+   * 适用场景：建筑对象 Mesh 被重建后，选中集合中的 ID 未变化，但新 Mesh 尚未应用高亮。
+   */
+  public refreshSelectionHighlight(): void {
+    this._selectedIds.forEach((id: string): void => {
+      this._applyHighlight(id, true);
+    });
+  }
+
+  /**
    * 追加多个对象到当前选择
    * @param ids - 对象 ID 数组
    */
@@ -165,6 +177,66 @@ export class SelectionManager {
     }
 
     return idsToDelete;
+  }
+
+  /**
+   * 删除所有选中的建筑对象，楼板使用房间级联删除命令。
+   * @param historyManager - 命令历史管理器
+   * @param scene - Three.js 场景，级联删除楼板时用于同步移除门窗 STL
+   * @returns 被请求删除的对象 ID 数组
+   */
+  public deleteSelectedWithCascade(historyManager: CommandHistoryManager, scene: THREE.Scene): Array<string> {
+    const idsToDelete: Array<string> = Array.from(this._selectedIds);
+    if (idsToDelete.length === 0) {
+      return [];
+    }
+
+    const selectedSlabIds: Set<string> = this._collectSelectedSlabIds(idsToDelete);
+
+    /* 先清空选择集合，避免删除楼板后高亮逻辑访问已被级联删除的 Mesh。 */
+    this._selectedIds.clear();
+    this._notify();
+
+    /* 楼板删除会级联移除相关墙、门窗、天花板；后续普通删除需跳过这些已被覆盖的对象。 */
+    selectedSlabIds.forEach((slabId: string): void => {
+      try {
+        const cascadeCommand: SlabCascadeDeleteCommand = new SlabCascadeDeleteCommand(this._objectManager, scene, slabId);
+        historyManager.execute(cascadeCommand);
+      } catch (err: unknown) {
+        console.warn(`[SelectionManager] 级联删除楼板 ${slabId} 失败:`, err);
+      }
+    });
+
+    for (const id of idsToDelete) {
+      if (selectedSlabIds.has(id) || this._isCoveredBySelectedSlab(id, selectedSlabIds)) {
+        continue;
+      }
+
+      try {
+        const deleteCommand: DeleteCommand = new DeleteCommand(this._objectManager, id);
+        historyManager.execute(deleteCommand);
+      } catch (err: unknown) {
+        console.warn(`[SelectionManager] 删除对象 ${id} 失败:`, err);
+      }
+    }
+
+    return idsToDelete;
+  }
+
+  /**
+   * 判断当前选择中是否包含楼板。
+   * @returns 包含楼板时返回 true
+   */
+  public hasSelectedSlab(): boolean {
+    const idsToCheck: Array<string> = Array.from(this._selectedIds);
+    for (const id of idsToCheck) {
+      const object: BuildingObject | undefined = this._objectManager.getById(id);
+      if (object !== undefined && object.category === 'slab') {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -311,6 +383,77 @@ export class SelectionManager {
    */
   public refreshSelectedStl(): void {
     this._notifyStlListeners();
+  }
+
+  /**
+   * 重新应用当前 STL 模型的选中视觉状态。
+   *
+   * 用途：STL 模型在不切换选中对象的情况下发生位移、旋转或缩放后，
+   * 需要重新计算 2D 包围盒位置，并保持选中高亮显示。
+   *
+   * @param viewMode - 当前视图模式，2D 模式下会刷新平面投影包围盒
+   */
+  public refreshSelectedStlHighlight(viewMode: ViewMode = '3d'): void {
+    if (this._selectedStlMesh === null) {
+      return;
+    }
+
+    /* 刷新流程：复用 STL 高亮逻辑，重新按当前 Mesh 矩阵计算选中包围盒。 */
+    this._applyStlHighlight(this._selectedStlMesh, true, viewMode);
+  }
+
+  /**
+   * 收集当前选中集合中的楼板 ID。
+   * @param ids - 当前选择 ID 快照
+   * @returns 楼板 ID 集合
+   */
+  private _collectSelectedSlabIds(ids: Array<string>): Set<string> {
+    const slabIds: Set<string> = new Set<string>();
+    for (const id of ids) {
+      const object: BuildingObject | undefined = this._objectManager.getById(id);
+      if (object !== undefined && object.category === 'slab') {
+        slabIds.add(id);
+      }
+    }
+
+    return slabIds;
+  }
+
+  /**
+   * 判断普通选中对象是否已经被选中楼板的级联删除覆盖。
+   * @param id - 待判断对象 ID
+   * @param selectedSlabIds - 已执行级联删除的楼板 ID 集合
+   * @returns 已由楼板级联删除覆盖时返回 true
+   */
+  private _isCoveredBySelectedSlab(id: string, selectedSlabIds: Set<string>): boolean {
+    if (selectedSlabIds.size === 0) {
+      return false;
+    }
+
+    const object: BuildingObject | undefined = this._objectManager.getById(id);
+    if (object === undefined) {
+      return true;
+    }
+
+    if (object.category === 'wall') {
+      const wallData: WallData = object as WallData;
+      return wallData.subType === 'straight' && selectedSlabIds.has((wallData as StraightWallData).slabId ?? '');
+    }
+
+    if (object.category === 'ceiling') {
+      const ceilingData: CeilingData = object as CeilingData;
+      return ceilingData.wallIds.some((wallId: string): boolean => {
+        const wallObject: BuildingObject | undefined = this._objectManager.getById(wallId);
+        if (wallObject === undefined || wallObject.category !== 'wall') {
+          return false;
+        }
+
+        const wallData: WallData = wallObject as WallData;
+        return wallData.subType === 'straight' && selectedSlabIds.has((wallData as StraightWallData).slabId ?? '');
+      });
+    }
+
+    return false;
   }
 
   /**

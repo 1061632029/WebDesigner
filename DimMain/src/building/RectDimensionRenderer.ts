@@ -3,7 +3,7 @@
  * 负责在 2D 模式下为矩形墙绘制过程和完成后渲染尺寸标注
  *
  * 标注样式：
- * - 预览阶段：蓝色输入框样式，数值以毫米显示，贴近户型绘制过程中的尺寸输入提示
+ * - 预览阶段：灰色尺寸线 + 白底圆角文字标签，保持和门窗距离动态标注一致
  * - 永久阶段：工程制图风格，纯文字 + 尺寸线
  *
  * 标注分两类：
@@ -22,11 +22,17 @@ import type { SceneManager } from '../scene/SceneManager';
 
 /* ========== 样式常量 ========== */
 
-/** 尺寸线颜色（深灰，CAD 风格） */
-const DIM_LINE_COLOR: number = 0x555555;
+/** 尺寸线颜色（灰色，匹配门窗距离动态标注） */
+const DIM_LINE_COLOR: number = 0x8f8f8f;
+
+/** 当前可编辑尺寸线颜色（蓝色，仅用于提示当前输入轴） */
+const ACTIVE_DIM_LINE_COLOR: number = 0x2f8df6;
 
 /** 标注界线（端部竖线）高度（米） */
 const TICK_HEIGHT: number = 0.12;
+
+/** 预览尺寸线所在高度，匹配门窗距离动态标注层级 */
+const PREVIEW_DIMENSION_Y: number = 0.13;
 
 /** 标注偏移量（米）：尺寸线距离墙体外边缘的距离 */
 const DIM_OFFSET: number = 0.5;
@@ -43,13 +49,13 @@ const TEXT_SPRITE_H: number = 0.48;
 const AREA_SPRITE_W: number = 2.0;
 const AREA_SPRITE_H: number = 0.6;
 
-/** 预览输入框 Canvas 尺寸 */
-const PREVIEW_INPUT_CANVAS_W: number = 300;
-const PREVIEW_INPUT_CANVAS_H: number = 96;
+/** 预览距离标签 Canvas 尺寸，匹配门窗动态距离标注的白底标签比例 */
+const PREVIEW_LABEL_CANVAS_W: number = 240;
+const PREVIEW_LABEL_CANVAS_H: number = 96;
 
-/** 预览输入框 Sprite 世界尺寸（米） */
-const PREVIEW_INPUT_SPRITE_W: number = 1.55;
-const PREVIEW_INPUT_SPRITE_H: number = 0.5;
+/** 预览距离标签 Sprite 世界尺寸（米），匹配门窗距离动态标注 */
+const PREVIEW_LABEL_SPRITE_W: number = 0.72;
+const PREVIEW_LABEL_SPRITE_H: number = 0.288;
 
 /** 预览面积 Canvas 尺寸 */
 const PREVIEW_AREA_CANVAS_W: number = 260;
@@ -59,17 +65,36 @@ const PREVIEW_AREA_CANVAS_H: number = 82;
 const PREVIEW_AREA_SPRITE_W: number = 1.9;
 const PREVIEW_AREA_SPRITE_H: number = 0.6;
 
-/** 预览标注距离矩形内边缘的偏移量，单位：米 */
+/** 预览尺寸线距离矩形内边缘的偏移量，单位：米 */
 const PREVIEW_INNER_LABEL_OFFSET: number = 0.34;
 
-/** 预览标注颜色：蓝色边框与选中背景 */
+/** 预览标注颜色：当前编辑项提示色 */
 const PREVIEW_BLUE: string = '#2f8df6';
 
-/** 预览标注颜色：输入框背景 */
-const PREVIEW_PANEL_BG: string = 'rgba(255, 255, 255, 0.96)';
+/** 预览标注颜色：当前编辑标签蓝底背景，用于突出可修改状态 */
+const PREVIEW_ACTIVE_PANEL_BG: string = PREVIEW_BLUE;
 
-/** 预览标注颜色：单位文字 */
-const PREVIEW_UNIT_COLOR: string = '#9aa0a6';
+/** 预览标注颜色：白底标签背景，匹配门窗距离动态标注 */
+const PREVIEW_PANEL_BG: string = 'rgba(255,255,255,0.94)';
+
+/** 预览标注颜色：默认边框 */
+const PREVIEW_LABEL_BORDER_COLOR: string = '#b8b8b8';
+
+/** 预览标注颜色：默认文字 */
+const PREVIEW_LABEL_TEXT_COLOR: string = '#333333';
+
+/** 预览标注颜色：当前编辑标签文字，保证蓝底下清晰可读 */
+const PREVIEW_ACTIVE_LABEL_TEXT_COLOR: string = '#ffffff';
+
+/** 预览标签文字字号，匹配门窗距离动态标注 */
+const PREVIEW_LABEL_FONT_SIZE: number = 44;
+
+/** 预览标注渲染层级，匹配门窗距离动态标注 */
+const PREVIEW_TICK_RENDER_ORDER: number = 11002;
+const PREVIEW_LABEL_RENDER_ORDER: number = 11003;
+
+/** 矩形墙预览当前编辑轴 */
+export type RectPreviewEditAxis = 'horizontal' | 'vertical';
 
 /* ========== 辅助函数 ========== */
 
@@ -106,73 +131,45 @@ function drawRoundRectPath(
 }
 
 /**
- * 创建矩形墙布置预览输入框 Sprite
- * 关键流程：绘制白色输入框、蓝色边框和被选中的数值区域，单位使用灰色文字显示。
+ * 创建矩形墙布置预览距离标签 Sprite
+ * 关键流程：绘制门窗动态距离标注同款白底圆角标签，并在当前编辑轴上使用蓝色边框提示。
  * @param valueText - 数值文本，单位为毫米
  * @param x - 世界坐标 X
  * @param z - 世界坐标 Z
- * @param rotation - SpriteMaterial 屏幕旋转角度，垂直标注传入 90 度
+ * @param active - 是否为当前正在编辑的尺寸轴
  * @returns THREE.Sprite
  */
-function createPreviewInputSprite(
+function createPreviewDistanceLabelSprite(
   valueText: string,
   x: number,
   z: number,
-  rotation: number = 0
+  active: boolean = false
 ): THREE.Sprite {
   const canvas: HTMLCanvasElement = document.createElement('canvas');
-  canvas.width = PREVIEW_INPUT_CANVAS_W;
-  canvas.height = PREVIEW_INPUT_CANVAS_H;
+  canvas.width = PREVIEW_LABEL_CANVAS_W;
+  canvas.height = PREVIEW_LABEL_CANVAS_H;
 
   const ctx: CanvasRenderingContext2D = canvas.getContext('2d') as CanvasRenderingContext2D;
-  ctx.clearRect(0, 0, PREVIEW_INPUT_CANVAS_W, PREVIEW_INPUT_CANVAS_H);
+  ctx.clearRect(0, 0, PREVIEW_LABEL_CANVAS_W, PREVIEW_LABEL_CANVAS_H);
 
-  const panelX: number = 18;
-  const panelY: number = 12;
-  const panelW: number = PREVIEW_INPUT_CANVAS_W - panelX * 2;
-  const panelH: number = PREVIEW_INPUT_CANVAS_H - panelY * 2;
+  const panelX: number = 12;
+  const panelY: number = 14;
+  const panelW: number = PREVIEW_LABEL_CANVAS_W - panelX * 2;
+  const panelH: number = PREVIEW_LABEL_CANVAS_H - panelY * 2;
 
-  /* 绘制输入框外观：白底、蓝色边框、轻微阴影，匹配截图中的尺寸输入提示。 */
-  ctx.shadowColor = 'rgba(36, 120, 220, 0.28)';
-  ctx.shadowBlur = 8;
-  ctx.shadowOffsetX = 0;
-  ctx.shadowOffsetY = 2;
-  drawRoundRectPath(ctx, panelX, panelY, panelW, panelH, 6);
-  ctx.fillStyle = PREVIEW_PANEL_BG;
+  /* 标签绘制流程：当前编辑标签使用蓝底白字，非编辑标签保持白底灰框。 */
+  drawRoundRectPath(ctx, panelX, panelY, panelW, panelH, 10);
+  ctx.fillStyle = active ? PREVIEW_ACTIVE_PANEL_BG : PREVIEW_PANEL_BG;
   ctx.fill();
-  ctx.shadowColor = 'rgba(0, 0, 0, 0)';
-  ctx.lineWidth = 4;
-  ctx.strokeStyle = PREVIEW_BLUE;
+  ctx.lineWidth = active ? 4 : 2;
+  ctx.strokeStyle = active ? PREVIEW_BLUE : PREVIEW_LABEL_BORDER_COLOR;
   ctx.stroke();
-
-  ctx.font = 'bold 38px Arial, sans-serif';
-  const valueMetrics: TextMetrics = ctx.measureText(valueText);
-  const valueW: number = Math.ceil(valueMetrics.width) + 20;
-  const valueH: number = 48;
-  const unitText: string = 'mm';
-  ctx.font = '30px Arial, sans-serif';
-  const unitMetrics: TextMetrics = ctx.measureText(unitText);
-  const unitW: number = Math.ceil(unitMetrics.width);
-  const gapW: number = 16;
-  const contentW: number = valueW + gapW + unitW;
-  const startX: number = (PREVIEW_INPUT_CANVAS_W - contentW) / 2;
-  const valueY: number = (PREVIEW_INPUT_CANVAS_H - valueH) / 2;
-
-  /* 绘制蓝色选中区域：表示当前尺寸可输入调整。 */
-  drawRoundRectPath(ctx, startX, valueY, valueW, valueH, 3);
-  ctx.fillStyle = PREVIEW_BLUE;
-  ctx.fill();
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = 'bold 38px Arial, sans-serif';
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(valueText, startX + valueW / 2, PREVIEW_INPUT_CANVAS_H / 2 + 1);
-
-  ctx.textAlign = 'left';
-  ctx.font = '30px Arial, sans-serif';
-  ctx.fillStyle = PREVIEW_UNIT_COLOR;
-  ctx.fillText(unitText, startX + valueW + gapW, PREVIEW_INPUT_CANVAS_H / 2 + 2);
+  ctx.font = `900 ${PREVIEW_LABEL_FONT_SIZE}px Arial, Microsoft YaHei, sans-serif`;
+  ctx.fillStyle = active ? PREVIEW_ACTIVE_LABEL_TEXT_COLOR : PREVIEW_LABEL_TEXT_COLOR;
+  ctx.fillText(valueText, PREVIEW_LABEL_CANVAS_W / 2, PREVIEW_LABEL_CANVAS_H / 2);
 
   const texture: THREE.CanvasTexture = new THREE.CanvasTexture(canvas);
   texture.needsUpdate = true;
@@ -182,12 +179,10 @@ function createPreviewInputSprite(
     depthTest: false,
     depthWrite: false,
   });
-  material.rotation = rotation;
-
   const sprite: THREE.Sprite = new THREE.Sprite(material);
-  sprite.scale.set(PREVIEW_INPUT_SPRITE_W, PREVIEW_INPUT_SPRITE_H, 1.0);
-  sprite.position.set(x, 0.09, z);
-  sprite.renderOrder = 1003;
+  sprite.scale.set(PREVIEW_LABEL_SPRITE_W, PREVIEW_LABEL_SPRITE_H, 1.0);
+  sprite.position.set(x, PREVIEW_DIMENSION_Y, z);
+  sprite.renderOrder = PREVIEW_LABEL_RENDER_ORDER;
 
   return sprite;
 }
@@ -312,6 +307,7 @@ function createTextSprite(
  * @param x2 - 右端 X
  * @param z - Z 坐标（尺寸线所在行）
  * @param color - 线颜色
+ * @param previewStyle - 是否使用门窗动态距离标注样式
  * @param zTickStart - 标注界线起始 Z（默认 z - halfTick）
  * @param zTickEnd - 标注界线终止 Z（默认 z + halfTick）
  * @returns THREE.LineSegments
@@ -321,19 +317,21 @@ function createHorizontalDimLine(
   x2: number,
   z: number,
   color: number = DIM_LINE_COLOR,
+  previewStyle: boolean = false,
   zTickStart?: number,
   zTickEnd?: number
 ): THREE.LineSegments {
   const halfTick: number = TICK_HEIGHT / 2;
+  const yLevel: number = previewStyle ? PREVIEW_DIMENSION_Y : 0.02;
   /* 标注界线范围：未指定时使用默认短竖线 */
   const tickZ1: number = zTickStart ?? (z - halfTick);
   const tickZ2: number = zTickEnd ?? (z + halfTick);
 
   /* 顶点：左竖线起 → 左竖线终，水平线左 → 水平线右，右竖线起 → 右竖线终 */
   const positions: Float32Array = new Float32Array([
-    x1, 0.02, tickZ1,  x1, 0.02, tickZ2,  /* 左端标注界线 */
-    x1, 0.02, z,       x2, 0.02, z,        /* 水平尺寸线 */
-    x2, 0.02, tickZ1,  x2, 0.02, tickZ2,  /* 右端标注界线 */
+    x1, yLevel, tickZ1,  x1, yLevel, tickZ2,  /* 左端标注界线 */
+    x1, yLevel, z,       x2, yLevel, z,        /* 水平尺寸线 */
+    x2, yLevel, tickZ1,  x2, yLevel, tickZ2,  /* 右端标注界线 */
   ]);
 
   const geometry: THREE.BufferGeometry = new THREE.BufferGeometry();
@@ -342,10 +340,13 @@ function createHorizontalDimLine(
   const material: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
     color: color,
     depthTest: false,
+    depthWrite: false,
+    transparent: previewStyle,
+    opacity: previewStyle ? 0.95 : 1,
   });
 
   const lines: THREE.LineSegments = new THREE.LineSegments(geometry, material);
-  lines.renderOrder = 998;
+  lines.renderOrder = previewStyle ? PREVIEW_TICK_RENDER_ORDER : 998;
 
   return lines;
 }
@@ -363,6 +364,7 @@ function createHorizontalDimLine(
  * @param z2 - 下端 Z（较大值）
  * @param x - X 坐标（尺寸线所在列）
  * @param color - 线颜色
+ * @param previewStyle - 是否使用门窗动态距离标注样式
  * @param xTickStart - 标注界线起始 X（默认 x - halfTick）
  * @param xTickEnd - 标注界线终止 X（默认 x + halfTick）
  * @returns THREE.LineSegments
@@ -372,19 +374,21 @@ function createVerticalDimLine(
   z2: number,
   x: number,
   color: number = DIM_LINE_COLOR,
+  previewStyle: boolean = false,
   xTickStart?: number,
   xTickEnd?: number
 ): THREE.LineSegments {
   const halfTick: number = TICK_HEIGHT / 2;
+  const yLevel: number = previewStyle ? PREVIEW_DIMENSION_Y : 0.02;
   /* 标注界线范围：未指定时使用默认短横线 */
   const tickX1: number = xTickStart ?? (x - halfTick);
   const tickX2: number = xTickEnd ?? (x + halfTick);
 
   /* 顶点：上端横线起 → 上端横线终，垂直线上 → 垂直线下，下端横线起 → 下端横线终 */
   const positions: Float32Array = new Float32Array([
-    tickX1, 0.02, z1,  tickX2, 0.02, z1,  /* 上端标注界线 */
-    x, 0.02, z1,       x, 0.02, z2,        /* 垂直尺寸线 */
-    tickX1, 0.02, z2,  tickX2, 0.02, z2,  /* 下端标注界线 */
+    tickX1, yLevel, z1,  tickX2, yLevel, z1,  /* 上端标注界线 */
+    x, yLevel, z1,       x, yLevel, z2,        /* 垂直尺寸线 */
+    tickX1, yLevel, z2,  tickX2, yLevel, z2,  /* 下端标注界线 */
   ]);
 
   const geometry: THREE.BufferGeometry = new THREE.BufferGeometry();
@@ -393,10 +397,13 @@ function createVerticalDimLine(
   const material: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
     color: color,
     depthTest: false,
+    depthWrite: false,
+    transparent: previewStyle,
+    opacity: previewStyle ? 0.95 : 1,
   });
 
   const lines: THREE.LineSegments = new THREE.LineSegments(geometry, material);
-  lines.renderOrder = 998;
+  lines.renderOrder = previewStyle ? PREVIEW_TICK_RENDER_ORDER : 998;
 
   return lines;
 }
@@ -457,10 +464,8 @@ export class RectDimensionRenderer {
   /** 场景管理器 */
   private _sceneManager: SceneManager;
 
-  /** 预览标注列表（面积 + 长 + 宽） */
+  /** 预览标注列表（长 + 宽） */
   private _previewAnnotations: DimAnnotation[] = [];
-  /** 预览输入框标注列表（无尺寸线，绘制过程中使用） */
-  private _previewInputSprites: THREE.Sprite[] = [];
   /** 预览面积 Sprite（单独管理，无尺寸线） */
   private _previewAreaSprite: THREE.Sprite | null = null;
 
@@ -480,8 +485,15 @@ export class RectDimensionRenderer {
    *
    * @param corner1 - 矩形对角点 1（起点）
    * @param corner2 - 矩形对角点 2（当前鼠标位置）
+   * @param activeAxis - 当前正在编辑的预览尺寸轴
+   * @param activeInputText - 当前编辑轴的键盘输入文本；为空时显示真实尺寸
    */
-  public updatePreview(corner1: Point2D, corner2: Point2D): void {
+  public updatePreview(
+    corner1: Point2D,
+    corner2: Point2D,
+    activeAxis: RectPreviewEditAxis = 'horizontal',
+    activeInputText: string | null = null
+  ): void {
     this.clearPreview();
 
     const minX: number = Math.min(corner1.x, corner2.x);
@@ -505,19 +517,43 @@ export class RectDimensionRenderer {
     this._sceneManager.add(areaSprite);
     this._previewAreaSprite = areaSprite;
 
-    /* 长度输入框：沿矩形上边内侧居中显示，数值使用毫米整数。 */
+    /* 水平尺寸标注：沿矩形上边内侧绘制尺寸线，并在中点显示毫米数。 */
     const widthMillimeters: number = Math.round(width * 1000);
     const widthLabelZ: number = minZ + Math.min(PREVIEW_INNER_LABEL_OFFSET, depth * 0.35);
-    const widthSprite: THREE.Sprite = createPreviewInputSprite(`${widthMillimeters}`, centerX, widthLabelZ);
+    const widthActive: boolean = activeAxis === 'horizontal';
+    const widthLines: THREE.LineSegments = createHorizontalDimLine(
+      minX,
+      maxX,
+      widthLabelZ,
+      widthActive ? ACTIVE_DIM_LINE_COLOR : DIM_LINE_COLOR,
+      true,
+      minZ,
+      widthLabelZ
+    );
+    const widthText: string = widthActive && activeInputText !== null ? activeInputText : `${widthMillimeters}`;
+    const widthSprite: THREE.Sprite = createPreviewDistanceLabelSprite(widthText, centerX, widthLabelZ, widthActive);
+    this._sceneManager.add(widthLines);
     this._sceneManager.add(widthSprite);
-    this._previewInputSprites.push(widthSprite);
+    this._previewAnnotations.push({ sprite: widthSprite, lines: widthLines });
 
-    /* 宽度输入框：沿矩形左边内侧居中显示，并旋转为竖向标注。 */
+    /* 垂直尺寸标注：沿矩形左边内侧绘制尺寸线，并在中点显示毫米数。 */
     const depthMillimeters: number = Math.round(depth * 1000);
     const depthLabelX: number = minX + Math.min(PREVIEW_INNER_LABEL_OFFSET, width * 0.35);
-    const depthSprite: THREE.Sprite = createPreviewInputSprite(`${depthMillimeters}`, depthLabelX, centerZ, Math.PI / 2);
+    const depthActive: boolean = activeAxis === 'vertical';
+    const depthLines: THREE.LineSegments = createVerticalDimLine(
+      minZ,
+      maxZ,
+      depthLabelX,
+      depthActive ? ACTIVE_DIM_LINE_COLOR : DIM_LINE_COLOR,
+      true,
+      minX,
+      depthLabelX
+    );
+    const depthText: string = depthActive && activeInputText !== null ? activeInputText : `${depthMillimeters}`;
+    const depthSprite: THREE.Sprite = createPreviewDistanceLabelSprite(depthText, depthLabelX, centerZ, depthActive);
+    this._sceneManager.add(depthLines);
     this._sceneManager.add(depthSprite);
-    this._previewInputSprites.push(depthSprite);
+    this._previewAnnotations.push({ sprite: depthSprite, lines: depthLines });
   }
 
   /**
@@ -541,13 +577,6 @@ export class RectDimensionRenderer {
       disposeLines(ann.lines);
     }
     this._previewAnnotations = [];
-
-    /* 清除预览输入框 Sprite：该类标注没有尺寸线，仅释放文字纹理与材质。 */
-    for (const sprite of this._previewInputSprites) {
-      scene.remove(sprite);
-      disposeSprite(sprite);
-    }
-    this._previewInputSprites = [];
   }
 
   /**
@@ -602,6 +631,7 @@ export class RectDimensionRenderer {
     const widthLines: THREE.LineSegments = createHorizontalDimLine(
       minX+TICK_HEIGHT, maxX-TICK_HEIGHT, dimZ,
       DIM_LINE_COLOR,
+      false,
       dimZ, /* zTickStart：尺寸线位置 */
       minZ  /* zTickEnd：楼板上边缘 */
     );
@@ -622,6 +652,7 @@ export class RectDimensionRenderer {
     const depthLines: THREE.LineSegments = createVerticalDimLine(
       minZ+TICK_HEIGHT, maxZ-TICK_HEIGHT, dimX,
       DIM_LINE_COLOR,
+      false,
       maxX, /* xTickStart：楼板右边缘 */
       dimX  /* xTickEnd：尺寸线位置 */
     );

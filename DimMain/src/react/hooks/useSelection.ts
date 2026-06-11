@@ -19,13 +19,16 @@ import { SelectionTool } from '../../interaction/SelectionTool';
 import type { SelectionManager } from '../../interaction/SelectionManager';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
 import type { Engine } from '../../core/Engine';
-import type { BuildingContextValue } from '../context/BuildingContext';
-import type { WallDrawTool } from '../../building/WallDrawTool';
+import type { BuildingContextValue, InteractionMode } from '../context/BuildingContext';
 import type { SelectionContextValue } from '../context/SelectionContext';
 import type { CommandHistoryManager } from '../../history/CommandHistoryManager';
 import type { ViewMode } from '../context/ViewModeContext';
 import type { GizmoContextValue } from '../context/GizmoContext';
 import type { TransformGizmo } from '../../interaction/TransformGizmo';
+import type { DoorWindowPlacementDimensionRenderer } from '../../model/DoorWindowPlacementDimensionRenderer';
+import type { StlPlacementDimensionRenderer } from '../../model/StlPlacementDimensionRenderer';
+import type { OrbitControlsWrapper } from '../../camera/OrbitControlsWrapper';
+import type * as THREE from 'three/webgpu';
 import type { Object3D } from 'three';
 
 /**
@@ -53,11 +56,12 @@ export function useSelection(): UseSelectionResult {
   const historyManager: CommandHistoryManager = useHistoryManager();
 
   const objectManager: BuildingObjectManager | null = ctx.objectManager;
-  const drawTool: WallDrawTool | null = ctx.drawTool;
   /** V5：SelectionManager 从 BuildingContext 读取，不再 Hook 内创建 */
   const selectionManager: SelectionManager | null = ctx.selectionManager;
-  /** 通过 toolVersion 让 useEffect 感知 drawTool.mode 的变更 */
-  const toolVersion: number = ctx.toolVersion;
+  const doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer | null = ctx.doorWindowDimensionRenderer;
+  const stlPlacementDimensionRenderer: StlPlacementDimensionRenderer | null = ctx.stlPlacementDimensionRenderer;
+  /** 统一交互模式：选择工具仅在 select 模式下启用。 */
+  const interactionMode: InteractionMode = ctx.interactionMode;
 
   /** V6：监听视图模式，视图切换时相机实例会变更，需重新绑定 SelectionTool */
   const { viewMode }: { viewMode: ViewMode } = useViewMode();
@@ -78,7 +82,12 @@ export function useSelection(): UseSelectionResult {
    * 若 gizmo 尚未初始化，启动轮询等待 init() 完成后再注入
    */
   useEffect((): (() => void) => {
-    if (objectManager === null || selectionManager === null) {
+    if (
+      objectManager === null ||
+      selectionManager === null ||
+      doorWindowDimensionRenderer === null ||
+      stlPlacementDimensionRenderer === null
+    ) {
       return (): void => {};
     }
 
@@ -87,12 +96,18 @@ export function useSelection(): UseSelectionResult {
       selectionManager,
       objectManager,
       engine.sceneManager,
-      historyManager
+      historyManager,
+      doorWindowDimensionRenderer,
+      stlPlacementDimensionRenderer
     );
     selectionToolRef.current = selTool;
 
     /* 注入建筑对象管理器（用于 2D 模式下拖拽时收集包围盒吸附目标：墙体 Mesh） */
     selTool.setBuildingManager(objectManager);
+
+    /* 注入轨道控制器：相机缩放/旋转期间暂停黄色预选轮廓拾取，避免滚轮缩放卡顿。 */
+    const orbitControls: OrbitControlsWrapper | null = engine.cameraManager.getOrbitControls();
+    selTool.setOrbitControls(orbitControls);
 
     /* 暴露到 window 方便调试 */
     if (typeof window !== 'undefined') {
@@ -137,15 +152,16 @@ export function useSelection(): UseSelectionResult {
         clearInterval(gizmoHelperIntervalId);
       }
       selTool.setGizmoHelper(null);
+      selTool.setOrbitControls(null);
       selTool.dispose();
       selectionToolRef.current = null;
     };
-  }, [objectManager, selectionManager, historyManager, engine.sceneManager, gizmo]);
+  }, [objectManager, selectionManager, doorWindowDimensionRenderer, stlPlacementDimensionRenderer, historyManager, engine.sceneManager, engine.cameraManager, gizmo]);
 
   /**
-   * 根据绘制模式自动启用/禁用选择工具
-   * - drawTool.mode === 'none' 且 renderer 就绪 → 启用选择
-   * - 其他 → 禁用选择（避免与绘制冲突）
+   * 根据统一交互模式自动启用/禁用选择工具
+   * - interactionMode === 'select' 且 renderer 就绪 → 启用选择
+   * - 其他 → 禁用选择（避免与绘制、模型布置等独占交互冲突）
    *
    * V5 优化：依然保留 setInterval 轮询（WebGPU renderer 异步初始化）；
    * 当 ctx.objectManager 与 selectionManager 已 ready 时此 effect 才会运行
@@ -153,11 +169,9 @@ export function useSelection(): UseSelectionResult {
   useEffect((): (() => void) => {
     const selTool: SelectionTool | null = selectionToolRef.current;
 
-    if (selTool === null || drawTool === null || selectionManager === null) {
+    if (selTool === null || selectionManager === null) {
       return (): void => {};
     }
-
-    const currentMode: string = drawTool.mode;
 
     /** 延迟刷新相机的定时器 ID（用于清理） */
     let cameraRefreshTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -172,13 +186,15 @@ export function useSelection(): UseSelectionResult {
         return false;
       }
 
-      if (currentMode === 'none') {
+      if (interactionMode === 'select') {
         /* 视图切换后相机实例已变更，需先 disable 再重新 enable 以绑定新相机 */
         if (selTool.enabled) {
           selTool.disable();
         }
-        const camera = engine.cameraManager.getActiveCamera();
+        const camera: THREE.Camera = engine.cameraManager.getActiveCamera();
         const domElement: HTMLCanvasElement = engine.renderer.domElement;
+        const orbitControls: OrbitControlsWrapper | null = engine.cameraManager.getOrbitControls();
+        selTool.setOrbitControls(orbitControls);
         selTool.enable(camera, domElement);
         console.log('[useSelection] 选择工具已启用，绑定到 Canvas（相机已刷新）');
 
@@ -190,16 +206,16 @@ export function useSelection(): UseSelectionResult {
          */
         cameraRefreshTimerId = setTimeout((): void => {
           if (selTool.enabled && engine.renderer !== null) {
-            const latestCamera = engine.cameraManager.getActiveCamera();
+            const latestCamera: THREE.Camera = engine.cameraManager.getActiveCamera();
             selTool.updateCamera(latestCamera);
             console.log('[useSelection] 相机引用已延迟刷新（视图模式切换后）');
           }
         }, 0);
       } else {
-        /* 进入绘制模式：禁用选择并清空已选 */
+        /* 进入其他独占交互模式：禁用选择并清空已选，停止 hover 预选中射线检测。 */
         if (selTool.enabled) {
           selTool.disable();
-          console.log('[useSelection] 选择工具已禁用（进入绘制模式）');
+          console.log(`[useSelection] 选择工具已禁用（进入 ${interactionMode} 模式）`);
         }
         selectionManager.clearSelection();
       }
@@ -232,7 +248,7 @@ export function useSelection(): UseSelectionResult {
         clearTimeout(cameraRefreshTimerId);
       }
     };
-  }, [drawTool, engine, toolVersion, selectionManager, viewMode]);
+  }, [engine, interactionMode, selectionManager, viewMode]);
 
   /**
    * 视图模式变化时同步到 SelectionTool
@@ -262,10 +278,10 @@ export function useSelection(): UseSelectionResult {
 
     /* 删除 STL 模型（门窗类型同时还原墙体洞口） */
     if (selectionManager.selectedStlMesh !== null) {
-      const scene = engine.sceneManager.getScene();
+      const scene: THREE.Scene = engine.sceneManager.getScene();
       selectionManager.deleteSelectedStl(scene, historyManager, objectManager);
     }
-  }, [selectionManager, historyManager, engine.sceneManager]);
+  }, [selectionManager, historyManager, engine.sceneManager, objectManager]);
 
   /**
    * 清空选择

@@ -17,6 +17,7 @@ import { PanelContext } from '../context/PanelContext';
 import type { PanelContextValue } from '../context/PanelContext';
 import type { CommandHistoryManager } from '../../history/CommandHistoryManager';
 import { PropertyChangeCommand } from '../../history/commands/PropertyChangeCommand';
+import { WallThicknessChangeCommand } from '../../history/commands/WallThicknessChangeCommand';
 import { StlResizeCommand } from '../../history/commands/StlResizeCommand';
 import type { ScaleSnapshot } from '../../history/commands/StlResizeCommand';
 import { StlMoveCommand } from '../../history/commands/StlMoveCommand';
@@ -71,23 +72,38 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
       if (wallData.subType === 'straight' || wallData.subType === 'arc') {
         const wallItems: Array<NumberPropertyItem> = [];
 
-        /* 墙厚 */
+        /* 墙厚：面板使用毫米输入展示，内部仍以米保存；直墙修改时会按布置方向右侧缩进并重算衔接几何。 */
         const thicknessItem: NumberPropertyItem = {
           id: 'thickness',
           type: 'number',
           label: '墙厚',
-          unit: 'm',
-          min: 0.05,
-          max: 2,
-          step: 0.01,
-          value: wallData.thickness,
+          unit: 'mm',
+          min: 50,
+          max: 2000,
+          step: 10,
+          value: Math.round(wallData.thickness * 1000),
           onChange: (value: number): void => {
-            /* 包装为 PropertyChangeCommand 推入历史栈，支持撤销/重做 */
+            const thicknessInMeters: number = value / 1000;
+            if (wallData.subType === 'straight') {
+              /* 直墙墙厚变更会影响布置线和衔接位置，使用专用命令保证撤销/重做同步几何。 */
+              const cmd: WallThicknessChangeCommand = new WallThicknessChangeCommand(
+                objectManager,
+                obj.id,
+                wallData.thickness,
+                thicknessInMeters,
+                `修改墙厚 ${wallData.name}`
+              );
+              historyManager.execute(cmd);
+              refreshProperties();
+              return;
+            }
+
+            /* 弧墙暂不参与直墙衔接缩进，仅更新墙厚并重建自身几何。 */
             const cmd: PropertyChangeCommand<BuildingObject> = new PropertyChangeCommand<BuildingObject>({
               target: obj,
               propertyPath: 'thickness',
               before: wallData.thickness,
-              after: value,
+              after: thicknessInMeters,
               label: `修改墙厚 ${wallData.name}`,
               onApply: (_target: BuildingObject, _path: string, newValue: unknown): void => {
                 objectManager.updateObject(obj.id, { thickness: newValue as number });

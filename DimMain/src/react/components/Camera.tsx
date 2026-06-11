@@ -76,14 +76,6 @@ export function PerspectiveCamera(props: PerspectiveCameraProps): React.ReactEle
       engine.cameraManager.updateAspect(size.x, size.y);
     }
 
-    /* 启用轨道控制器 */
-    if (enableOrbitControls && engine.renderer) {
-      engine.cameraManager.enableOrbitControls(
-        engine.renderer.domElement,
-        new THREE.Vector3(lookAt[0], lookAt[1], lookAt[2])
-      );
-    }
-
     return (): void => {
       /* 组件卸载时禁用控制器 */
       engine.cameraManager.disableOrbitControls();
@@ -93,16 +85,17 @@ export function PerspectiveCamera(props: PerspectiveCameraProps): React.ReactEle
   /* 响应位置属性变更 */
   useEffect((): void => {
     engine.cameraManager.setPosition(position[0], position[1], position[2]);
-  }, [engine, position]);
+  }, [engine, position[0], position[1], position[2]]);
 
   /* 响应 lookAt 属性变更 */
   useEffect((): void => {
     engine.cameraManager.setLookAt(lookAt[0], lookAt[1], lookAt[2]);
-  }, [engine, lookAt]);
+  }, [engine, lookAt[0], lookAt[1], lookAt[2]]);
 
   /* 响应 OrbitControls 启用/禁用变更 */
   useEffect((): void => {
     if (enableOrbitControls && engine.renderer) {
+      /* 相机创建或配置变化后统一在此处启用控制器，避免同一轮挂载重复创建 OrbitControlsWrapper。 */
       engine.cameraManager.enableOrbitControls(
         engine.renderer.domElement,
         new THREE.Vector3(lookAt[0], lookAt[1], lookAt[2])
@@ -110,7 +103,7 @@ export function PerspectiveCamera(props: PerspectiveCameraProps): React.ReactEle
     } else {
       engine.cameraManager.disableOrbitControls();
     }
-  }, [engine, enableOrbitControls]);
+  }, [engine, enableOrbitControls, lookAt[0], lookAt[1], lookAt[2], fov, near, far]);
 
   return null;
 }
@@ -175,19 +168,6 @@ export function OrthographicCamera(props: OrthographicCameraProps): React.ReactE
       engine.cameraManager.updateAspect(size.x, size.y);
     }
 
-    /* 启用轨道控制器（仅平移+缩放） */
-    if (enableOrbitControls && engine.renderer) {
-      engine.cameraManager.enableOrbitControls(
-        engine.renderer.domElement,
-        new THREE.Vector3(lookAt[0], lookAt[1], lookAt[2])
-      );
-      /* 禁用旋转，锁定为俯视视角 */
-      const orbitControls = engine.cameraManager.getOrbitControls();
-      if (orbitControls !== null) {
-        orbitControls.setRotateEnabled(false);
-      }
-    }
-
     return (): void => {
       /* 组件卸载时禁用控制器 */
       engine.cameraManager.disableOrbitControls();
@@ -197,6 +177,7 @@ export function OrthographicCamera(props: OrthographicCameraProps): React.ReactE
   /* 响应 OrbitControls 启用/禁用变更 */
   useEffect((): void => {
     if (enableOrbitControls && engine.renderer) {
+      /* 正交相机控制器统一在此处创建，避免初始化 effect 与配置 effect 重复重建。 */
       engine.cameraManager.enableOrbitControls(
         engine.renderer.domElement,
         new THREE.Vector3(lookAt[0], lookAt[1], lookAt[2])
@@ -209,7 +190,7 @@ export function OrthographicCamera(props: OrthographicCameraProps): React.ReactE
     } else {
       engine.cameraManager.disableOrbitControls();
     }
-  }, [engine, enableOrbitControls]);
+  }, [engine, enableOrbitControls, lookAt[0], lookAt[1], lookAt[2], viewHeight, near, far]);
 
   return null;
 }

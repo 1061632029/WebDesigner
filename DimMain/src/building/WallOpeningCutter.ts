@@ -33,34 +33,42 @@ export class WallOpeningCutter {
     placedMesh: THREE.Mesh,
     wallData: StraightWallData
   ): WallOpening {
-    /* 计算门窗 Mesh 的世界坐标包围盒（旋转对齐后） */
-    const bbox: THREE.Box3 = new THREE.Box3().setFromObject(placedMesh);
+    /* 洞口尺寸计算流程：使用 Mesh 自身局部包围盒角点转换到世界坐标，避免非正交墙体上世界 AABB 膨胀导致宽度错误。 */
+    placedMesh.updateMatrixWorld(true);
+    placedMesh.geometry.computeBoundingBox();
+    const localBox: THREE.Box3 | null = placedMesh.geometry.boundingBox;
+    if (localBox === null) {
+      return {
+        centerT: snapResult.t,
+        width: 0,
+        height: 0,
+        bottomElevation: 0,
+      };
+    }
 
-    /* 将包围盒底面 4 个角点投影到墙方向，取最大跨度作为洞口宽度
-     * 对于已对齐的门窗（+Z 朝向墙面法线），包围盒 X 方向即为沿墙方向
-     * 但为通用性，使用向量投影计算
-     */
-    const corners: THREE.Vector3[] = [
-      new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.min.z),
-      new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.min.z),
-      new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.max.z),
-      new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.max.z),
-    ];
+    const corners: THREE.Vector3[] = WallOpeningCutter._createWorldBoxCorners(localBox, placedMesh.matrixWorld);
 
     let minProj: number = Infinity;
     let maxProj: number = -Infinity;
-    for (const corner of corners) {
+    let minY: number = Infinity;
+    let maxY: number = -Infinity;
+
+    /* 将真实 OBB 角点投影到墙方向，取跨度作为洞口宽度；同时统计世界 Y 范围作为洞口高度。 */
+    for (let index: number = 0; index < corners.length; index++) {
+      const corner: THREE.Vector3 = corners[index]!;
       const proj: number = corner.dot(snapResult.wallDir);
       if (proj < minProj) minProj = proj;
       if (proj > maxProj) maxProj = proj;
+      if (corner.y < minY) minY = corner.y;
+      if (corner.y > maxY) maxY = corner.y;
     }
     const openingWidth: number = maxProj - minProj;
 
-    /* 洞口高度 = 包围盒 Y 方向高度 */
-    const openingHeight: number = bbox.max.y - bbox.min.y;
+    /* 洞口高度 = Mesh 本体真实世界 Y 范围，避免子级辅助符号影响开洞高度。 */
+    const openingHeight: number = maxY - minY;
 
     /* 洞口底部标高（相对于墙体底部，最小为 0） */
-    const bottomElevation: number = Math.max(0, bbox.min.y - wallData.elevation);
+    const bottomElevation: number = Math.max(0, minY - wallData.elevation);
 
     return {
       centerT: snapResult.t,
@@ -68,6 +76,34 @@ export class WallOpeningCutter {
       height: openingHeight,
       bottomElevation: bottomElevation,
     };
+  }
+
+  /**
+   * 将局部包围盒 8 个角点转换为世界坐标角点。
+   *
+   * @param localBox - Mesh 几何体局部坐标包围盒
+   * @param matrixWorld - Mesh 当前世界矩阵
+   * @returns 世界坐标下的 OBB 角点数组
+   */
+  private static _createWorldBoxCorners(localBox: THREE.Box3, matrixWorld: THREE.Matrix4): THREE.Vector3[] {
+    const corners: THREE.Vector3[] = [
+      new THREE.Vector3(localBox.min.x, localBox.min.y, localBox.min.z),
+      new THREE.Vector3(localBox.min.x, localBox.min.y, localBox.max.z),
+      new THREE.Vector3(localBox.min.x, localBox.max.y, localBox.min.z),
+      new THREE.Vector3(localBox.min.x, localBox.max.y, localBox.max.z),
+      new THREE.Vector3(localBox.max.x, localBox.min.y, localBox.min.z),
+      new THREE.Vector3(localBox.max.x, localBox.min.y, localBox.max.z),
+      new THREE.Vector3(localBox.max.x, localBox.max.y, localBox.min.z),
+      new THREE.Vector3(localBox.max.x, localBox.max.y, localBox.max.z),
+    ];
+
+    /* 角点坐标转换流程：仅转换 Mesh 本体局部包围盒，不纳入 2D 图标等子对象，确保洞口尺寸稳定。 */
+    for (let index: number = 0; index < corners.length; index++) {
+      const corner: THREE.Vector3 = corners[index]!;
+      corner.applyMatrix4(matrixWorld);
+    }
+
+    return corners;
   }
 
   /**

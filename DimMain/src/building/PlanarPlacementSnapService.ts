@@ -19,15 +19,17 @@ import type {
   PlanarPlacementSnapResult,
 } from './PlanarPlacementSnapTypes';
 
-/** 捕获辅助线候选项，携带类型优先级和距离用于有限显示排序 */
-interface PlanarPlacementGuideLineCandidate {
+/** 捕获线命中候选项，携带投影点和显示虚线用于计算单线落点或双线交点 */
+interface PlanarPlacementLineSnapCandidate {
   /** 来源线捕获目标 */
   target: PlanarPlacementLineTarget;
-  /** 辅助虚线 */
+  /** 鼠标点投影到捕获线后的点 */
+  projectedPoint: Point2D;
+  /** 当前捕获线显示虚线 */
   guideLine: PlanarPlacementGuideLine;
   /** 捕获线类型显示优先级，数值越大越优先 */
   priority: number;
-  /** 鼠标点到候选捕获线垂足的距离，优先级相同时距离越近越优先 */
+  /** 鼠标点到捕获线垂足的距离 */
   distance: number;
 }
 
@@ -39,9 +41,6 @@ const GUIDE_HALF_LENGTH: number = 12;
 
 /** 正交约束辅助虚线半长，单位：米；长于普通捕获虚线便于观察方向约束 */
 const ORTHOGONAL_GUIDE_HALF_LENGTH: number = 24;
-
-/** 最大捕获辅助线显示数量 */
-const MAX_GUIDE_LINE_DISPLAY_COUNT: number = 2;
 
 /** 端点法向捕获线显示优先级 */
 const ENDPOINT_NORMAL_LINE_PRIORITY: number = 300;
@@ -102,6 +101,7 @@ export class PlanarPlacementSnapService {
 
     return {
       snapped: false,
+      showSnapPoint: false,
       type: 'none',
       position: rawPoint,
       objectId: null,
@@ -300,6 +300,7 @@ export class PlanarPlacementSnapService {
 
     return {
       snapped: true,
+      showSnapPoint: true,
       type: nearestTarget.type,
       position: nearestTarget.position,
       objectId: nearestTarget.objectId,
@@ -317,10 +318,9 @@ export class PlanarPlacementSnapService {
    */
   private _snapToLineTargets(rawPoint: Point2D, threshold: number, guideHalfLength: number): PlanarPlacementSnapResult | null {
     const targets: PlanarPlacementLineTarget[] = this._collectLineTargets();
-    let nearestTarget: PlanarPlacementLineTarget | null = null;
-    let nearestPoint: Point2D | null = null;
-    let nearestDistance: number = Number.POSITIVE_INFINITY;
+    const candidates: PlanarPlacementLineSnapCandidate[] = [];
 
+    /* 线捕获关键流程：先收集阈值内所有有效捕获线，单线返回投影点，双线返回交点。 */
     for (const target of targets) {
       const projectedPoint: Point2D | null = this._projectToInfiniteLine(rawPoint, target.start, target.end);
       if (projectedPoint === null) {
@@ -330,39 +330,111 @@ export class PlanarPlacementSnapService {
         continue;
       }
       const distance: number = this._distance(rawPoint, projectedPoint);
-      if (distance <= threshold && distance < nearestDistance) {
-        nearestDistance = distance;
-        nearestTarget = target;
-        nearestPoint = projectedPoint;
+      if (distance > threshold) {
+        continue;
       }
+
+      const guideLine: PlanarPlacementGuideLine | null = this._buildPrimaryLineGuideLine(
+        target,
+        projectedPoint,
+        guideHalfLength
+      );
+      if (guideLine === null) {
+        continue;
+      }
+
+      candidates.push({
+        target: target,
+        projectedPoint: projectedPoint,
+        guideLine: guideLine,
+        priority: this._getLineTargetDisplayPriority(target),
+        distance: distance,
+      });
     }
 
-    if (nearestTarget === null || nearestPoint === null) {
+    if (candidates.length === 0) {
       return null;
     }
 
-    const primaryGuideLine: PlanarPlacementGuideLine | null = this._buildPrimaryLineGuideLine(
-      nearestTarget,
-      nearestPoint,
-      guideHalfLength
+    candidates.sort((a: PlanarPlacementLineSnapCandidate, b: PlanarPlacementLineSnapCandidate): number => {
+      if (a.distance !== b.distance) {
+        return a.distance - b.distance;
+      }
+      return b.priority - a.priority;
+    });
+
+    const nearestCandidate: PlanarPlacementLineSnapCandidate = candidates[0]!;
+    const intersectionCandidate: PlanarPlacementLineSnapCandidate | null = this._findLineIntersectionCandidate(
+      nearestCandidate,
+      candidates
     );
-    const guideLines: PlanarPlacementGuideLine[] = this._buildPrioritizedLineGuideLines(
-      targets,
-      nearestTarget,
-      primaryGuideLine,
-      rawPoint,
-      threshold,
-      guideHalfLength
-    );
+    if (intersectionCandidate !== null) {
+      const intersectionPoint: Point2D | null = this._computeInfiniteLineIntersection(
+        nearestCandidate.target.start,
+        nearestCandidate.target.end,
+        intersectionCandidate.target.start,
+        intersectionCandidate.target.end
+      );
+      if (intersectionPoint !== null) {
+        const intersectionGuideLines: PlanarPlacementGuideLine[] = [nearestCandidate.guideLine, intersectionCandidate.guideLine];
+        return {
+          snapped: true,
+          showSnapPoint: true,
+          type: 'line-intersection',
+          position: intersectionPoint,
+          objectId: nearestCandidate.target.objectId,
+          guideLine: nearestCandidate.guideLine,
+          guideLines: intersectionGuideLines,
+        };
+      }
+    }
+
+    const singleGuideLines: PlanarPlacementGuideLine[] = [nearestCandidate.guideLine];
 
     return {
       snapped: true,
-      type: nearestTarget.type,
-      position: nearestPoint,
-      objectId: nearestTarget.objectId,
-      guideLine: primaryGuideLine,
-      guideLines: guideLines,
+      showSnapPoint: false,
+      type: nearestCandidate.target.type,
+      position: nearestCandidate.projectedPoint,
+      objectId: nearestCandidate.target.objectId,
+      guideLine: nearestCandidate.guideLine,
+      guideLines: singleGuideLines,
     };
+  }
+
+  /**
+   * 查找可与最近捕获线形成交点的第二条捕获线。
+   * 关键流程：排除同方向/反方向捕获线，只保留非平行捕获线用于生成可见捕获点。
+   * @param nearestCandidate - 最近捕获线候选
+   * @param candidates - 当前阈值内全部捕获线候选
+   * @returns 可形成交点的第二条捕获线；不存在时返回 null
+   */
+  private _findLineIntersectionCandidate(
+    nearestCandidate: PlanarPlacementLineSnapCandidate,
+    candidates: PlanarPlacementLineSnapCandidate[]
+  ): PlanarPlacementLineSnapCandidate | null {
+    for (let index: number = 1; index < candidates.length; index++) {
+      const candidate: PlanarPlacementLineSnapCandidate | undefined = candidates[index];
+      if (candidate === undefined) {
+        continue;
+      }
+
+      if (this._hasSimilarGuideLine([nearestCandidate.target], candidate.target)) {
+        continue;
+      }
+
+      const intersectionPoint: Point2D | null = this._computeInfiniteLineIntersection(
+        nearestCandidate.target.start,
+        nearestCandidate.target.end,
+        candidate.target.start,
+        candidate.target.end
+      );
+      if (intersectionPoint !== null) {
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -380,126 +452,6 @@ export class PlanarPlacementSnapService {
   ): PlanarPlacementGuideLine | null {
     const guideCenter: Point2D = target.type === 'endpoint-normal-line' ? target.start : snappedPoint;
     return this._buildExtensionGuideLine(target.start, target.end, guideCenter, guideHalfLength);
-  }
-
-  /**
-   * 构建按优先级排序的线捕获辅助虚线集合
-   * 关键流程：第一条永远放入当前捕获点对应的主预览线；其余候选按捕获线类型优先级排序，并限制总显示数量。
-   * @param targets - 所有线捕获目标
-   * @param nearestTarget - 当前计算捕获点使用的最近线目标
-   * @param primaryGuideLine - 当前捕获点对应的主预览线
-   * @param rawPoint - 原始鼠标点
-   * @param threshold - 捕获阈值
-   * @param guideHalfLength - 辅助虚线半长
-   * @returns 第一条为主预览线的辅助虚线集合
-   */
-  private _buildPrioritizedLineGuideLines(
-    targets: PlanarPlacementLineTarget[],
-    nearestTarget: PlanarPlacementLineTarget,
-    primaryGuideLine: PlanarPlacementGuideLine | null,
-    rawPoint: Point2D,
-    threshold: number,
-    guideHalfLength: number
-  ): PlanarPlacementGuideLine[] {
-    if (primaryGuideLine === null) {
-      return [];
-    }
-
-    const guideLines: PlanarPlacementGuideLine[] = [primaryGuideLine];
-    const remainingCount: number = MAX_GUIDE_LINE_DISPLAY_COUNT - guideLines.length;
-    if (remainingCount <= 0) {
-      return guideLines;
-    }
-
-    const uniqueTargets: PlanarPlacementLineTarget[] = [nearestTarget];
-    const additionalCandidates: PlanarPlacementGuideLineCandidate[] = this._buildAdditionalLineGuideLineCandidates(
-      targets,
-      uniqueTargets,
-      nearestTarget,
-      rawPoint,
-      threshold,
-      guideHalfLength
-    );
-    additionalCandidates.sort((a: PlanarPlacementGuideLineCandidate, b: PlanarPlacementGuideLineCandidate): number => {
-      if (a.priority !== b.priority) {
-        return b.priority - a.priority;
-      }
-      return a.distance - b.distance;
-    });
-
-    for (let index: number = 0; index < additionalCandidates.length && index < remainingCount; index++) {
-      const candidate: PlanarPlacementGuideLineCandidate | undefined = additionalCandidates[index];
-      if (candidate === undefined) {
-        continue;
-      }
-      guideLines.push(candidate.guideLine);
-    }
-    return guideLines;
-  }
-
-  /**
-   * 构建附加捕获辅助虚线候选集合
-   * 关键流程：主捕获线已提前占位，附加线按类型优先级进入候选集合；同方向端点法向线只保留生成捕获点的捕获线。
-   * @param targets - 所有线捕获目标
-   * @param uniqueTargets - 已占用的线目标集合，首项为主捕获目标
-   * @param nearestTarget - 当前计算捕获点使用的最近线目标
-   * @param rawPoint - 原始鼠标点
-   * @param threshold - 捕获阈值
-   * @param guideHalfLength - 辅助虚线半长
-   * @returns 不包含主预览线的附加辅助虚线候选集合
-   */
-  private _buildAdditionalLineGuideLineCandidates(
-    targets: PlanarPlacementLineTarget[],
-    uniqueTargets: PlanarPlacementLineTarget[],
-    nearestTarget: PlanarPlacementLineTarget,
-    rawPoint: Point2D,
-    threshold: number,
-    guideHalfLength: number
-  ): PlanarPlacementGuideLineCandidate[] {
-    const candidates: PlanarPlacementGuideLineCandidate[] = [];
-
-    for (const target of targets) {
-      if (target === nearestTarget) {
-        continue;
-      }
-
-      const projectedPoint: Point2D | null = this._projectToInfiniteLine(rawPoint, target.start, target.end);
-      if (projectedPoint === null) {
-        continue;
-      }
-      if (this._shouldIgnoreLineTargetAtConnection(target, projectedPoint, threshold)) {
-        continue;
-      }
-
-      const distance: number = this._distance(rawPoint, projectedPoint);
-      if (distance > threshold) {
-        continue;
-      }
-
-      if (this._hasSimilarGuideLine(uniqueTargets, target)) {
-        continue;
-      }
-
-      const guideLine: PlanarPlacementGuideLine | null = this._buildExtensionGuideLine(
-        target.start,
-        target.end,
-        target.start,
-        guideHalfLength
-      );
-      if (guideLine === null) {
-        continue;
-      }
-
-      uniqueTargets.push(target);
-      candidates.push({
-        target: target,
-        guideLine: guideLine,
-        priority: this._getLineTargetDisplayPriority(target),
-        distance: distance,
-      });
-    }
-
-    return candidates;
   }
 
   /**
@@ -700,6 +652,7 @@ export class PlanarPlacementSnapService {
 
     return {
       snapped: true,
+      showSnapPoint: true,
       type: 'orthogonal',
       position: snappedPoint,
       objectId: null,
@@ -727,6 +680,38 @@ export class PlanarPlacementSnapService {
     return {
       x: lineStart.x + dx * t,
       z: lineStart.z + dz * t,
+    };
+  }
+
+  /**
+   * 计算两条 XZ 平面无限直线的交点
+   * @param lineAStart - 第一条直线起点
+   * @param lineAEnd - 第一条直线终点
+   * @param lineBStart - 第二条直线起点
+   * @param lineBEnd - 第二条直线终点
+   * @returns 两条直线交点；平行或线段退化时返回 null
+   */
+  private _computeInfiniteLineIntersection(
+    lineAStart: Point2D,
+    lineAEnd: Point2D,
+    lineBStart: Point2D,
+    lineBEnd: Point2D
+  ): Point2D | null {
+    const ax: number = lineAEnd.x - lineAStart.x;
+    const az: number = lineAEnd.z - lineAStart.z;
+    const bx: number = lineBEnd.x - lineBStart.x;
+    const bz: number = lineBEnd.z - lineBStart.z;
+    const determinant: number = ax * bz - az * bx;
+    if (Math.abs(determinant) < MIN_LINE_LENGTH * MIN_LINE_LENGTH) {
+      return null;
+    }
+
+    const offsetX: number = lineBStart.x - lineAStart.x;
+    const offsetZ: number = lineBStart.z - lineAStart.z;
+    const lineAParameter: number = (offsetX * bz - offsetZ * bx) / determinant;
+    return {
+      x: lineAStart.x + ax * lineAParameter,
+      z: lineAStart.z + az * lineAParameter,
     };
   }
 

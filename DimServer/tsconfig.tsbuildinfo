@@ -1,0 +1,1 @@
+{"root":["./src/index.ts","./src/config/serverconfig.ts","./src/routes/cadroutes.ts","./src/routes/convertroutes.ts","./src/routes/parametricroutes.ts","./src/routes/storageroutes.ts","./src/routes/taskroutes.ts","./src/storage/istorageprovider.ts"],"version":"5.6.3"}

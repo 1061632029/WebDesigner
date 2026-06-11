@@ -24,7 +24,6 @@ import { WallOpeningCutter } from '../building/WallOpeningCutter';
 import { StlAdaptiveThicknessHelper } from './StlAdaptiveThicknessHelper';
 import type { WallSnapResult } from '../building/WallSnapHelper';
 import type { BuildingObjectManager } from '../building/BuildingObjectManager';
-import type { SelectionManager } from '../interaction/SelectionManager';
 import type { StraightWallData, WallData, WallOpening } from '../building/BuildingTypes';
 import { BoundingBoxHelper } from '../interaction/BoundingBoxHelper';
 import type { ViewMode } from '../react/context/ViewModeContext';
@@ -33,9 +32,16 @@ import { DoorWindowCollisionDetector } from './DoorWindowCollisionDetector';
 import type { DoorWindowCollisionResult } from './DoorWindowCollisionDetector';
 import { DoorWindowPlacementDimensionRenderer } from './DoorWindowPlacementDimensionRenderer';
 import { DoorOpeningDirectionHelper } from './DoorOpeningDirectionHelper';
+import { StlPlacementDimensionRenderer } from './StlPlacementDimensionRenderer';
 
 /** 门窗类别集合，用于判断是否启用墙体吸附模式 */
 const DOOR_WINDOW_CATEGORIES: Set<string> = new Set<string>(['door', 'window']);
+
+/** 门窗布置动态距离标注可编辑的目标侧。 */
+type DoorWindowDimensionEditSide = 'left' | 'right';
+
+/** 数字输入距离单位换算：界面输入毫米，内部计算使用米。 */
+const MILLIMETER_TO_METER: number = 0.001;
 
 /**
  * STL 点式布置工具类
@@ -57,8 +63,8 @@ export class StlPlaceTool {
    */
   private _snapGuideLines: StlSnapGuideLines | null = null;
   
-/** 选择管理器引用（激活时禁用选择工具，避免事件冲突） */
-  private _selectionManager: SelectionManager | null = null;
+  /** 是否处于 STL 模型布置阶段；布置阶段不调用 attachOutline 绘制预选中/预览线框。 */
+  private _isStlPlacementInProgress: boolean = false;
 
   /** STLLoader 实例（复用） */
   private _stlLoader: STLLoader = new STLLoader();
@@ -133,10 +139,22 @@ export class StlPlaceTool {
   private _doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer = new DoorWindowPlacementDimensionRenderer();
 
   /**
+   * 普通 STL 布置距离标注渲染器。
+   * 仅在 category='model' 的常规模型布置阶段显示，退出、放置完成或预览不可见时隐藏。
+   */
+  private _stlPlacementDimensionRenderer: StlPlacementDimensionRenderer = new StlPlacementDimensionRenderer();
+
+  /**
    * 当前视图模式
    * 2D 模式下布置预览时显示平面投影包围盒
    */
   private _viewMode: ViewMode = '3d';
+
+  /** 门窗布置时当前正在编辑的动态距离侧，默认左侧。 */
+  private _doorWindowDimensionEditSide: DoorWindowDimensionEditSide = 'left';
+
+  /** 门窗布置时键盘输入的距离文本，单位为毫米。 */
+  private _doorWindowDimensionInputText: string = '';
 
   // OPENING_PREVIEW_THRESHOLD 已随 _showOpeningPreview 方法一同停用
   // private static readonly OPENING_PREVIEW_THRESHOLD: number = 0.02;
@@ -181,15 +199,6 @@ export class StlPlaceTool {
     this._buildingManager = manager;
   }
 
-  
-  /**
-   * 注入选择管理器（激活时需要禁用选择工具）
-   * @param manager - 选择管理器
-   */
-  public setSelectionManager(manager: SelectionManager): void {
-    this._selectionManager = manager;
-  }
-
   /**
    * 更新当前视图模式
    * 2D 模式下布置预览时显示平面投影包围盒
@@ -197,16 +206,8 @@ export class StlPlaceTool {
    */
   public setViewMode(mode: ViewMode): void {
     this._viewMode = mode;
-    /* 若当前有预览 Mesh，立即更新包围盒显示状态 */
-    if (this._previewMesh !== null && this._previewMesh.visible) {
-      const scene: THREE.Scene = this._engine.sceneManager.getScene();
-      if (mode === '2d' && !this._isDoorWindowModel()) {
-        this._previewMesh.updateMatrixWorld(true);
-        BoundingBoxHelper.attachOutline(this._previewMesh, scene);
-      } else {
-        BoundingBoxHelper.detach(this._previewMesh, scene);
-      }
-    }
+    /* 视图切换时统一同步布置预览线框，布置阶段会自动清理且不调用 attachOutline。 */
+    this._syncPlacementOutline();
   }
 
   /**
@@ -219,15 +220,8 @@ export class StlPlaceTool {
     if (this._activeModel !== null) {
       this.deactivate();
     }
-
-    /* 激活时禁用选择工具（避免事件冲突导致选择失效） */
-    if (this._selectionManager !== null) {
-      const selTool = (this._selectionManager as unknown as { _selTool: { enabled: boolean; disable: () => void } })._selTool;
-      if (selTool && selTool.enabled) {
-        selTool.disable();
-      }
-    }
     this._activeModel = model;
+    this._isStlPlacementInProgress = true;
 
     /* 加载或使用缓存的 BufferGeometry */
     const geometry: THREE.BufferGeometry = await this._loadGeometry(model.url);
@@ -300,10 +294,15 @@ export class StlPlaceTool {
     /* 普通模型（category='model'）：创建包围盒吸附虚线提示 */
     if (model.category === 'model') {
       this._snapGuideLines = new StlSnapGuideLines(scene);
+      /* 普通 STL 距离标注初始化流程：提前创建四方向标注对象池，鼠标移动时只更新位置和文本。 */
+      this._stlPlacementDimensionRenderer.prepare(scene);
     }
 
     /* 注册事件监听 */
     this._bindEvents();
+
+    /* 门窗动态距离编辑状态初始化：每次进入布置时默认编辑左侧尺寸。 */
+    this._resetDoorWindowDimensionEdit();
 
     /* 通知状态变更 */
     if (this._onStateChange !== null) {
@@ -316,8 +315,14 @@ export class StlPlaceTool {
    * 移除预览 Mesh，注销事件监听，恢复墙体洞口预览
    */
   public deactivate(): void {
-    /* ESC 或右键退出布置模式时仅隐藏门窗临时距离标注，不销毁 WebGPU 资源，避免退出瞬间卡死。 */
-    this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+    const scene: THREE.Scene = this._engine.sceneManager.getScene();
+
+    /* 退出布置生命周期：后续刷新逻辑不再视为布置阶段。 */
+    this._isStlPlacementInProgress = false;
+
+    /* ESC 或右键退出布置模式时仅隐藏临时距离标注，不销毁 WebGPU 资源，避免退出瞬间卡死。 */
+    this._doorWindowDimensionRenderer.clear(scene);
+    this._stlPlacementDimensionRenderer.clear(scene);
 
     /* 恢复墙体洞口预览（若有） */
     this._clearOpeningPreview();
@@ -325,8 +330,8 @@ export class StlPlaceTool {
     /* 移除预览 Mesh（先清理包围盒，再从场景移除 Mesh） */
     if (this._previewMesh !== null) {
       /* 清理 2D 模式下可能残留的包围盒 Group */
-      BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
-      this._engine.sceneManager.getScene().remove(this._previewMesh);
+      BoundingBoxHelper.detach(this._previewMesh, scene);
+      scene.remove(this._previewMesh);
       this._previewMesh.geometry.dispose();
       const material = this._previewMesh.material;
       if (material instanceof THREE.Material) {
@@ -348,13 +353,7 @@ export class StlPlaceTool {
 
     this._activeModel = null;
     this._currentSnapResult = null;
- /* 停用后重新启用选择工具 */
-    if (this._selectionManager !== null) {
-      const selTool = (this._selectionManager as unknown as { _selTool: { enabled: boolean; enable: (camera: THREE.Camera, domElement: HTMLCanvasElement) => void } })._selTool;
-      if (selTool && !selTool.enabled && this._engine.renderer !== null) {
-        selTool.enable(this._engine.cameraManager.getActiveCamera(), this._engine.renderer.domElement);
-      }
-    }
+    this._resetDoorWindowDimensionEdit();
 
     /* 重置普通模型的累积旋转角度，下次激活时从 0 开始 */
     this._previewRotationY = 0;
@@ -449,6 +448,38 @@ export class StlPlaceTool {
   }
 
   /**
+   * 判断当前是否允许显示 STL 布置预览包围盒。
+   * 关键规则：处于布置阶段时不调用 attachOutline，避免模型布置过程出现预选中线框。
+   * @returns 允许显示布置预览线框时返回 true，否则返回 false
+   */
+  private _canShowPlacementOutline(): boolean {
+    return (
+      this._viewMode === '2d' &&
+      !this._isDoorWindowModel() &&
+      !this._isStlPlacementInProgress
+    );
+  }
+
+  /**
+   * 同步 STL 布置预览线框显示状态。
+   * 布置阶段、门窗模型、非 2D 模式或预览不可见时仅清理线框，不调用 attachOutline。
+   */
+  private _syncPlacementOutline(): void {
+    if (this._previewMesh === null) {
+      return;
+    }
+
+    const scene: THREE.Scene = this._engine.sceneManager.getScene();
+    if (this._canShowPlacementOutline() && this._previewMesh.visible) {
+      this._previewMesh.updateMatrixWorld(true);
+      BoundingBoxHelper.attachOutline(this._previewMesh, scene);
+      return;
+    }
+
+    BoundingBoxHelper.detach(this._previewMesh, scene);
+  }
+
+  /**
    * 绑定鼠标和键盘事件
    */
   private _bindEvents(): void {
@@ -476,10 +507,13 @@ export class StlPlaceTool {
       this.deactivate();
     };
 
-    /* 键盘事件：Esc 取消布置；空格键普通模型旋转，门预览切换内开/外开并刷新 2D 图标。 */
+    /* 键盘事件：Esc 取消布置；门窗支持数字编辑动态距离；空格键普通模型旋转，门预览切换内开/外开并刷新 2D 图标。 */
     this._onKeyDown = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         this.deactivate();
+        return;
+      }
+      if (this._handleDoorWindowDimensionKeyDown(e, canvas)) {
         return;
       }
       if (e.key === ' ' && this._activeModel !== null && this._activeModel.category === 'door') {
@@ -499,6 +533,8 @@ export class StlPlaceTool {
         /* 立即更新预览 Mesh 旋转 */
         if (this._previewMesh !== null) {
           this._previewMesh.rotation.set(0, this._previewRotationY, 0);
+          /* 空格旋转会改变预览包围盒，需立即刷新普通 STL 四方向距离标注。 */
+          this._refreshStlPlacementDimensions();
         }
       }
     };
@@ -569,47 +605,11 @@ export class StlPlaceTool {
 
     /* 门窗类型：优先尝试墙中线吸附 */
     if (this._isDoorWindowModel() && this._buildingManager !== null) {
+      /* 鼠标移动重置流程：用户移动鼠标时放弃键盘尺寸编辑结果，重新按鼠标吸附点刷新预览。 */
+      this._resetDoorWindowDimensionEdit();
       const snapResult: WallSnapResult | null = this._tryWallSnap(this._raycaster.ray);
       if (snapResult !== null) {
-        /* 吸附成功：将预览 Mesh 移动到吸附点并旋转对齐墙面法线 */
-        this._currentSnapResult = snapResult;
-        /* 窗户类型：在吸附点基础上加窗台高度偏移（_activeModel 在此分支必然非 null） */
-        const sillHeight: number = this._activeModel !== null ? (this._activeModel.sillHeight ?? 0) : 0;
-        this._previewMesh.position.set(
-          snapResult.snapPoint.x,
-          snapResult.snapPoint.y + sillHeight,
-          snapResult.snapPoint.z
-        );
-        this._alignPreviewToWall(this._previewMesh, snapResult);
-        this._syncPreviewDoorWindowThicknessWithWall(snapResult);
-        this._previewMesh.visible = true;
-
-        /* 门窗预览已使用 2D 平面符号表达，不再显示模型本体包围盒。 */
-        BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
-
-        /* 门窗吸附预览距离标注：显示门窗包围盒沿墙方向到最近门窗边界或墙端边界的距离。 */
-        const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(snapResult.wallId);
-        if (wallObj !== undefined && wallObj.category === 'wall' && (wallObj as WallData).subType === 'straight') {
-          const wallData: StraightWallData = wallObj as StraightWallData;
-          this._doorWindowDimensionRenderer.update(
-            this._previewMesh,
-            wallData,
-            snapResult,
-            this._engine.sceneManager.getScene()
-          );
-        } else {
-          this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
-        }
-
-        /* 吸附到新墙体时：恢复旧墙体透明度，将新墙体设为半透明 */
-        if (this._transparentWallId !== snapResult.wallId) {
-          if (this._transparentWallId !== null) {
-            this._buildingManager.restoreWallOpacity(this._transparentWallId);
-          }
-          this._buildingManager.setWallTransparent(snapResult.wallId);
-          this._transparentWallId = snapResult.wallId;
-        }
-
+        this._applyDoorWindowSnapPreview(snapResult);
         return;
       }
     }
@@ -622,6 +622,7 @@ export class StlPlaceTool {
     this._currentSnapResult = null;
     this._previewSymbolWallThickness = null;
     this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+    this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
 
     /* 门窗未吸附墙体时不允许退化到地面预览。
      * 预期结果：用户只有靠近墙体并成功吸附时才能看到门窗预览，点击空白地面不会放置门窗。
@@ -674,25 +675,33 @@ export class StlPlaceTool {
             this._previewMesh.updateMatrixWorld(true);
             this._snapGuideLines.update(snapResult, this._previewMesh);
           }
+
+          /* 普通 STL 距离标注：显示预览包围盒四条边界到最近目标包围平面的水平/垂直距离。 */
+          this._previewMesh.updateMatrixWorld(true);
+          this._stlPlacementDimensionRenderer.update(
+            this._previewMesh,
+            targetMeshes,
+            this._engine.sceneManager.getScene()
+          );
         } else {
           /* 无目标可吸附：隐藏虚线 */
           if (this._snapGuideLines !== null) {
             this._snapGuideLines.hide();
           }
+          this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
         }
       }
 
-      /* 2D 模式下：更新包围盒（位置已变更，需重新计算） */
-      if (this._viewMode === '2d' && !this._isDoorWindowModel()) {
-        this._previewMesh.updateMatrixWorld(true);
-        BoundingBoxHelper.attachOutline(this._previewMesh, this._engine.sceneManager.getScene());
-      }
+      /* 2D 模式下统一同步包围盒；布置阶段不调用 attachOutline。 */
+      this._syncPlacementOutline();
     } else {
       this._previewMesh.visible = false;
       /* 预览不可见时移除包围盒 */
       BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
       /* 预览不可见时清理门窗临时距离标注 */
       this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+      /* 预览不可见时清理普通 STL 临时距离标注 */
+      this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
       /* 预览不可见时隐藏吸附虚线 */
       if (this._snapGuideLines !== null) {
         this._snapGuideLines.hide();
@@ -732,6 +741,361 @@ export class StlPlaceTool {
     }
 
     return targets;
+  }
+
+  /**
+   * 刷新普通 STL 布置距离标注。
+   * 用于空格旋转等不触发鼠标移动的位置更新场景，确保包围盒变化后标注立即同步。
+   */
+  private _refreshStlPlacementDimensions(): void {
+    if (
+      this._previewMesh === null ||
+      this._activeModel === null ||
+      this._activeModel.category !== 'model' ||
+      !this._previewMesh.visible
+    ) {
+      this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
+      return;
+    }
+
+    const targetMeshes: Array<THREE.Mesh> = this._collectBBoxSnapTargets();
+    if (targetMeshes.length === 0) {
+      this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
+      return;
+    }
+
+    this._previewMesh.updateMatrixWorld(true);
+    this._stlPlacementDimensionRenderer.update(
+      this._previewMesh,
+      targetMeshes,
+      this._engine.sceneManager.getScene()
+    );
+  }
+
+  /**
+   * 重置门窗布置动态距离编辑状态。
+   * 触发条件：进入布置、退出布置、鼠标移动重新吸附时调用。
+   * 预期结果：默认回到左侧尺寸编辑，清空上一次键盘输入缓存。
+   */
+  private _resetDoorWindowDimensionEdit(): void {
+    this._doorWindowDimensionEditSide = 'left';
+    this._doorWindowDimensionInputText = '';
+  }
+
+  /**
+   * 处理门窗布置时的动态距离键盘编辑。
+   * @param e - 键盘事件
+   * @param canvas - 渲染画布，传递给最终放置流程
+   * @returns 已处理门窗尺寸快捷键时返回 true，否则返回 false
+   */
+  private _handleDoorWindowDimensionKeyDown(e: KeyboardEvent, canvas: HTMLCanvasElement): boolean {
+    if (!this._isDoorWindowModel()) {
+      return false;
+    }
+
+    if (e.key === 'Enter') {
+      /* Enter 完成布置流程：仅在门窗预览有效时提交，避免空位置误放置。 */
+      e.preventDefault();
+      this._handlePlace(canvas);
+      return true;
+    }
+
+    if (e.key === 'Tab') {
+      /* Tab 切换编辑侧：左侧与右侧尺寸逻辑完全一致，仅改变距离约束的参考边界。 */
+      e.preventDefault();
+      this._doorWindowDimensionEditSide = this._doorWindowDimensionEditSide === 'left' ? 'right' : 'left';
+      this._doorWindowDimensionInputText = '';
+      if (this._currentSnapResult !== null) {
+        /* 编辑态刷新流程：仅切换可编辑侧时位置不变，但需要立即重绘蓝底标签提示。 */
+        this._applyDoorWindowSnapPreview(this._currentSnapResult);
+      }
+      return true;
+    }
+
+    if (this._previewMesh === null || !this._previewMesh.visible || this._currentSnapResult === null) {
+      return false;
+    }
+
+    if (e.key === 'Backspace') {
+      e.preventDefault();
+      if (this._doorWindowDimensionInputText.length > 0) {
+        this._doorWindowDimensionInputText = this._doorWindowDimensionInputText.slice(0, -1);
+        this._applyDoorWindowDimensionInput();
+      }
+      return true;
+    }
+
+    if (e.key === 'Delete') {
+      e.preventDefault();
+      this._doorWindowDimensionInputText = '';
+      return true;
+    }
+
+    if (/^[0-9]$/.test(e.key) || e.key === '.') {
+      e.preventDefault();
+      if (e.key === '.' && this._doorWindowDimensionInputText.includes('.')) {
+        return true;
+      }
+      this._doorWindowDimensionInputText += e.key;
+      this._applyDoorWindowDimensionInput();
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 根据当前键盘输入距离调整门窗预览位置。
+   * 输入单位为毫米，内部转换为米，并按当前编辑侧重新计算吸附点。
+   */
+  private _applyDoorWindowDimensionInput(): void {
+    if (this._doorWindowDimensionInputText === '' || this._doorWindowDimensionInputText === '.') {
+      return;
+    }
+
+    const inputMillimeter: number = Number(this._doorWindowDimensionInputText);
+    if (!Number.isFinite(inputMillimeter) || inputMillimeter < 0) {
+      return;
+    }
+
+    const targetDistance: number = inputMillimeter * MILLIMETER_TO_METER;
+    this._applyDoorWindowDistanceConstraint(this._doorWindowDimensionEditSide, targetDistance);
+  }
+
+  /**
+   * 按指定侧距离约束重新计算门窗在墙上的吸附位置。
+   * @param side - 当前编辑的标注侧
+   * @param distance - 目标距离，单位米
+   */
+  private _applyDoorWindowDistanceConstraint(side: DoorWindowDimensionEditSide, distance: number): void {
+    if (this._previewMesh === null || this._currentSnapResult === null || this._buildingManager === null) {
+      return;
+    }
+
+    const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(this._currentSnapResult.wallId);
+    if (wallObj === undefined || wallObj.category !== 'wall' || (wallObj as WallData).subType !== 'straight') {
+      return;
+    }
+
+    const wallData: StraightWallData = wallObj as StraightWallData;
+    const wallOrigin: THREE.Vector3 = new THREE.Vector3(wallData.start.x, 0, wallData.start.z);
+    const wallDir: THREE.Vector3 = this._currentSnapResult.wallDir.clone().setY(0);
+    if (wallDir.lengthSq() <= 0.000001) {
+      return;
+    }
+    wallDir.normalize();
+
+    const wallLength: number = this._computeStraightWallLength(wallData);
+    if (wallLength <= 0.001) {
+      return;
+    }
+
+    this._previewMesh.updateMatrixWorld(true);
+    const currentRange: { min: number; max: number } = this._computeMeshWallRange(this._previewMesh, wallOrigin, wallDir);
+    currentRange.min = Math.max(0, Math.min(wallLength, currentRange.min));
+    currentRange.max = Math.max(0, Math.min(wallLength, currentRange.max));
+    const targetWidth: number = Math.max(0.001, currentRange.max - currentRange.min);
+    const boundary: { left: number; right: number } = this._computeDoorWindowNearestBoundaries(
+      this._previewMesh,
+      wallData.id,
+      wallOrigin,
+      wallDir,
+      currentRange
+    );
+
+    let nextMin: number = currentRange.min;
+    let nextMax: number = currentRange.max;
+    if (side === 'left') {
+      /* 左侧编辑逻辑：以左侧最近边界为参考，目标距离决定门窗左边界位置。 */
+      nextMin = boundary.left + distance;
+      nextMax = nextMin + targetWidth;
+      if (nextMax > boundary.right) {
+        nextMax = boundary.right;
+        nextMin = nextMax - targetWidth;
+      }
+    } else {
+      /* 右侧编辑逻辑：以右侧最近边界为参考，目标距离决定门窗右边界位置。 */
+      nextMax = boundary.right - distance;
+      nextMin = nextMax - targetWidth;
+      if (nextMin < boundary.left) {
+        nextMin = boundary.left;
+        nextMax = nextMin + targetWidth;
+      }
+    }
+
+    nextMin = Math.max(0, Math.min(wallLength - targetWidth, nextMin));
+    nextMax = nextMin + targetWidth;
+    const centerProjection: number = (nextMin + nextMax) * 0.5;
+    const nextSnapPoint: THREE.Vector3 = wallOrigin.clone().add(wallDir.clone().multiplyScalar(centerProjection));
+    const nextSnapResult: WallSnapResult = {
+      wallId: this._currentSnapResult.wallId,
+      snapPoint: nextSnapPoint,
+      wallNormal: this._currentSnapResult.wallNormal.clone(),
+      wallDir: this._currentSnapResult.wallDir.clone(),
+      t: Math.max(0, Math.min(1, centerProjection / wallLength)),
+      distance: this._currentSnapResult.distance,
+    };
+
+    this._applyDoorWindowSnapPreview(nextSnapResult);
+  }
+
+  /**
+   * 应用门窗吸附预览位置、朝向、厚度和距离标注刷新。
+   * @param snapResult - 当前墙体吸附结果
+   */
+  private _applyDoorWindowSnapPreview(snapResult: WallSnapResult): void {
+    if (this._previewMesh === null || this._buildingManager === null) {
+      return;
+    }
+
+    this._currentSnapResult = snapResult;
+    const sillHeight: number = this._activeModel !== null ? (this._activeModel.sillHeight ?? 0) : 0;
+    this._previewMesh.position.set(
+      snapResult.snapPoint.x,
+      snapResult.snapPoint.y + sillHeight,
+      snapResult.snapPoint.z
+    );
+    this._alignPreviewToWall(this._previewMesh, snapResult);
+    this._syncPreviewDoorWindowThicknessWithWall(snapResult);
+    this._previewMesh.visible = true;
+
+    /* 门窗预览已使用 2D 平面符号表达，不再显示模型本体包围盒。 */
+    BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
+
+    const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(snapResult.wallId);
+    if (wallObj !== undefined && wallObj.category === 'wall' && (wallObj as WallData).subType === 'straight') {
+      const wallData: StraightWallData = wallObj as StraightWallData;
+      this._doorWindowDimensionRenderer.update(
+        this._previewMesh,
+        wallData,
+        snapResult,
+        this._engine.sceneManager.getScene(),
+        this._doorWindowDimensionEditSide
+      );
+    } else {
+      this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+    }
+
+    /* 吸附到新墙体时：恢复旧墙体透明度，将新墙体设为半透明。 */
+    if (this._transparentWallId !== snapResult.wallId) {
+      if (this._transparentWallId !== null) {
+        this._buildingManager.restoreWallOpacity(this._transparentWallId);
+      }
+      this._buildingManager.setWallTransparent(snapResult.wallId);
+      this._transparentWallId = snapResult.wallId;
+    }
+  }
+
+  /**
+   * 计算直墙长度。
+   * @param wallData - 直墙数据
+   * @returns 墙体长度，单位米
+   */
+  private _computeStraightWallLength(wallData: StraightWallData): number {
+    const deltaX: number = wallData.end.x - wallData.start.x;
+    const deltaZ: number = wallData.end.z - wallData.start.z;
+    return Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
+  }
+
+  /**
+   * 计算 Mesh 世界包围盒在墙方向上的投影区间。
+   * @param mesh - 目标 Mesh
+   * @param wallOrigin - 墙起点世界坐标
+   * @param wallDir - 墙方向单位向量
+   * @returns 沿墙投影最小值与最大值
+   */
+  private _computeMeshWallRange(
+    mesh: THREE.Mesh,
+    wallOrigin: THREE.Vector3,
+    wallDir: THREE.Vector3
+  ): { min: number; max: number } {
+    const box: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
+    const corners: THREE.Vector3[] = [
+      new THREE.Vector3(box.min.x, box.min.y, box.min.z),
+      new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+      new THREE.Vector3(box.min.x, box.max.y, box.min.z),
+      new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+      new THREE.Vector3(box.max.x, box.min.y, box.min.z),
+      new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+      new THREE.Vector3(box.max.x, box.max.y, box.min.z),
+      new THREE.Vector3(box.max.x, box.max.y, box.max.z),
+    ];
+
+    let minProjection: number = Number.POSITIVE_INFINITY;
+    let maxProjection: number = Number.NEGATIVE_INFINITY;
+    for (let cornerIndex: number = 0; cornerIndex < corners.length; cornerIndex += 1) {
+      const corner: THREE.Vector3 | undefined = corners[cornerIndex];
+      if (corner === undefined) {
+        continue;
+      }
+      const projection: number = corner.clone().sub(wallOrigin).dot(wallDir);
+      minProjection = Math.min(minProjection, projection);
+      maxProjection = Math.max(maxProjection, projection);
+    }
+
+    return {
+      min: minProjection,
+      max: maxProjection,
+    };
+  }
+
+  /**
+   * 计算当前门窗左右两侧最近参考边界。
+   * @param previewMesh - 当前预览 Mesh
+   * @param wallId - 当前墙体 ID
+   * @param wallOrigin - 墙体起点世界坐标
+   * @param wallDir - 墙方向单位向量
+   * @param currentRange - 当前门窗沿墙投影区间
+   * @returns 左右最近边界投影值
+   */
+  private _computeDoorWindowNearestBoundaries(
+    previewMesh: THREE.Mesh,
+    wallId: string,
+    wallOrigin: THREE.Vector3,
+    wallDir: THREE.Vector3,
+    currentRange: { min: number; max: number }
+  ): { left: number; right: number } {
+    let leftBoundary: number = 0;
+    let rightBoundary: number = Number.POSITIVE_INFINITY;
+
+    const scene: THREE.Scene = this._engine.sceneManager.getScene();
+    scene.traverse((object: THREE.Object3D): void => {
+      if (!(object instanceof THREE.Mesh)) {
+        return;
+      }
+      if (!object.visible || object.uuid === previewMesh.uuid || object.userData['isPlacementPreview'] === true) {
+        return;
+      }
+      const category: string | undefined = object.userData['category'] as string | undefined;
+      const objectWallId: string | undefined = object.userData['wallId'] as string | undefined;
+      if (category === undefined || !DOOR_WINDOW_CATEGORIES.has(category) || objectWallId !== wallId) {
+        return;
+      }
+
+      object.updateMatrixWorld(true);
+      const objectRange: { min: number; max: number } = this._computeMeshWallRange(object, wallOrigin, wallDir);
+      if (objectRange.max <= currentRange.min + 0.001 && objectRange.max > leftBoundary) {
+        leftBoundary = objectRange.max;
+      }
+      if (objectRange.min >= currentRange.max - 0.001 && objectRange.min < rightBoundary) {
+        rightBoundary = objectRange.min;
+      }
+    });
+
+    if (!Number.isFinite(rightBoundary)) {
+      const snapResult: WallSnapResult | null = this._currentSnapResult;
+      if (snapResult !== null && this._buildingManager !== null) {
+        const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(snapResult.wallId);
+        if (wallObj !== undefined && wallObj.category === 'wall' && (wallObj as WallData).subType === 'straight') {
+          rightBoundary = this._computeStraightWallLength(wallObj as StraightWallData);
+        }
+      }
+    }
+
+    return {
+      left: leftBoundary,
+      right: rightBoundary,
+    };
   }
 
   /**
@@ -1027,6 +1391,9 @@ export class StlPlaceTool {
       `放置 STL 模型 "${this._activeModel.name}"`
     );
     this._historyManager.execute(cmd);
+
+    /* 普通 STL 放置完成后隐藏临时四方向距离标注，正式对象不保留该辅助线。 */
+    this._stlPlacementDimensionRenderer.clear(scene);
 
     console.log(`✅ STL 模型已放置: "${this._activeModel.name}" 于 (${placedMesh.position.x.toFixed(2)}, ${placedMesh.position.y.toFixed(2)}, ${placedMesh.position.z.toFixed(2)})`);
   }

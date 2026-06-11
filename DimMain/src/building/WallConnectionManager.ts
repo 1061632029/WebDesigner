@@ -442,7 +442,7 @@ export class WallConnectionManager {
       return noMiter;
     }
 
-    /* 使用两条节点射线的角平分线作为唯一斜切线，保证同节点双墙斜切结果确定。 */
+    /* 使用两条节点射线的角平分线作为侧边匹配参考，保证同节点双墙斜切结果确定。 */
     const seamDirX: number = inwardDirX + normalizedOtherDirX;
     const seamDirZ: number = inwardDirZ + normalizedOtherDirZ;
     const seamLen: number = Math.sqrt(seamDirX * seamDirX + seamDirZ * seamDirZ);
@@ -452,7 +452,22 @@ export class WallConnectionManager {
 
     const normalizedSeamDirX: number = seamDirX / seamLen;
     const normalizedSeamDirZ: number = seamDirZ / seamLen;
-    const frontOffset: number | null = this._tryComputeLineIntersectionParameter(
+
+    /* 相邻墙侧边方向必须按其 start -> end 全局方向计算，才能正确处理反向绘制的墙体。 */
+    const otherGlobalDirX: number = otherConnection.endpoint === 'start'
+      ? normalizedOtherDirX
+      : -normalizedOtherDirX;
+    const otherGlobalDirZ: number = otherConnection.endpoint === 'start'
+      ? normalizedOtherDirZ
+      : -normalizedOtherDirZ;
+    const otherGlobalNormalX: number = -otherGlobalDirZ;
+    const otherGlobalNormalZ: number = otherGlobalDirX;
+    const otherHalfThick: number = otherData.thickness / 2;
+
+    /* 先计算旧角平分线偏移作为参考，再在相邻墙前/后侧边交点中选择对应侧边。
+     * 这样墙厚变化后，剖切端点会落在两面墙真实侧边交点上，避免衔接处断开或重叠。
+     */
+    const preferredFrontOffset: number | null = this._tryComputeLineIntersectionParameter(
       jointPos.x + globalNormalX * halfThick,
       jointPos.z + globalNormalZ * halfThick,
       inwardDirX,
@@ -462,7 +477,7 @@ export class WallConnectionManager {
       normalizedSeamDirX,
       normalizedSeamDirZ
     );
-    const backOffset: number | null = this._tryComputeLineIntersectionParameter(
+    const preferredBackOffset: number | null = this._tryComputeLineIntersectionParameter(
       jointPos.x - globalNormalX * halfThick,
       jointPos.z - globalNormalZ * halfThick,
       inwardDirX,
@@ -472,16 +487,101 @@ export class WallConnectionManager {
       normalizedSeamDirX,
       normalizedSeamDirZ
     );
+
+    const frontToOtherFrontOffset: number | null = this._tryComputeLineIntersectionParameter(
+      jointPos.x + globalNormalX * halfThick,
+      jointPos.z + globalNormalZ * halfThick,
+      inwardDirX,
+      inwardDirZ,
+      jointPos.x + otherGlobalNormalX * otherHalfThick,
+      jointPos.z + otherGlobalNormalZ * otherHalfThick,
+      normalizedOtherDirX,
+      normalizedOtherDirZ
+    );
+    const frontToOtherBackOffset: number | null = this._tryComputeLineIntersectionParameter(
+      jointPos.x + globalNormalX * halfThick,
+      jointPos.z + globalNormalZ * halfThick,
+      inwardDirX,
+      inwardDirZ,
+      jointPos.x - otherGlobalNormalX * otherHalfThick,
+      jointPos.z - otherGlobalNormalZ * otherHalfThick,
+      normalizedOtherDirX,
+      normalizedOtherDirZ
+    );
+    const backToOtherFrontOffset: number | null = this._tryComputeLineIntersectionParameter(
+      jointPos.x - globalNormalX * halfThick,
+      jointPos.z - globalNormalZ * halfThick,
+      inwardDirX,
+      inwardDirZ,
+      jointPos.x + otherGlobalNormalX * otherHalfThick,
+      jointPos.z + otherGlobalNormalZ * otherHalfThick,
+      normalizedOtherDirX,
+      normalizedOtherDirZ
+    );
+    const backToOtherBackOffset: number | null = this._tryComputeLineIntersectionParameter(
+      jointPos.x - globalNormalX * halfThick,
+      jointPos.z - globalNormalZ * halfThick,
+      inwardDirX,
+      inwardDirZ,
+      jointPos.x - otherGlobalNormalX * otherHalfThick,
+      jointPos.z - otherGlobalNormalZ * otherHalfThick,
+      normalizedOtherDirX,
+      normalizedOtherDirZ
+    );
+
+    const frontOffset: number | null = this._chooseClosestMiterOffset(
+      frontToOtherFrontOffset,
+      frontToOtherBackOffset,
+      preferredFrontOffset
+    );
+    const backOffset: number | null = this._chooseClosestMiterOffset(
+      backToOtherFrontOffset,
+      backToOtherBackOffset,
+      preferredBackOffset
+    );
     if (frontOffset === null || backOffset === null) {
       return noMiter;
     }
 
-    const maxOffset: number = Math.min(myLen * 0.45, thickness * 2.5);
+    const maxOffset: number = Math.min(myLen * 0.45, Math.max(thickness, otherData.thickness) * 2.5);
     if (Math.abs(frontOffset) > maxOffset || Math.abs(backOffset) > maxOffset) {
       return noMiter;
     }
 
     return { frontOffset: frontOffset, backOffset: backOffset };
+  }
+
+  /**
+   * 从两个候选斜切偏移中选择最接近参考偏移的有效值。
+   * 关键流程：墙体厚度不一致时，真实剖切点来自两墙侧边线交点；参考偏移只负责判定当前侧边应该对接相邻墙的哪一侧。
+   * @param firstOffset - 第一个候选偏移
+   * @param secondOffset - 第二个候选偏移
+   * @param preferredOffset - 由中心线角平分线得到的参考偏移
+   * @returns 最合适的候选偏移；两个候选都无效时返回 null
+   */
+  private _chooseClosestMiterOffset(
+    firstOffset: number | null,
+    secondOffset: number | null,
+    preferredOffset: number | null
+  ): number | null {
+    if (firstOffset === null && secondOffset === null) {
+      return null;
+    }
+    if (firstOffset === null) {
+      return secondOffset;
+    }
+    if (secondOffset === null) {
+      return firstOffset;
+    }
+
+    /* 参考偏移不可用时，选择绝对缩进更小的候选，避免异常角度下产生过长剖切。 */
+    if (preferredOffset === null) {
+      return Math.abs(firstOffset) <= Math.abs(secondOffset) ? firstOffset : secondOffset;
+    }
+
+    const firstDistance: number = Math.abs(firstOffset - preferredOffset);
+    const secondDistance: number = Math.abs(secondOffset - preferredOffset);
+    return firstDistance <= secondDistance ? firstOffset : secondOffset;
   }
 
   /**

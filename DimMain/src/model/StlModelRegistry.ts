@@ -155,4 +155,32 @@ export const STL_MODEL_LIST: StlModelDef[] = [
     defaultWidth: DEFAULT_DOOR_WIDTH_M,
     defaultHeight: DEFAULT_DOOR_HEIGHT_M,
   },
+  {
+    id: 'stl-tv',
+    name: '电视TCL',
+    url: '/models/电视TCL.stl',
+    category: 'model',
+    icon: '🚪',
+  },
+  {
+    id: 'stl-tvtable',
+    name: '电视柜',
+    url: '/models/电视柜.stl',
+    category: 'model',
+    icon: '🚪',
+  },
+  {
+    id: 'stl-safa',
+    name: '沙发',
+    url: '/models/沙发.stl',
+    category: 'model',
+    icon: '🚪',
+  },
+   {
+    id: 'stl-safaJA803',
+    name: '沙发JA803',
+    url: '/models/沙发JA803.stl',
+    category: 'model',
+    icon: '🚪',
+  },
 ];
