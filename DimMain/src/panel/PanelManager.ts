@@ -8,6 +8,9 @@ import type {
   LeftPanelConfig,
   ToolbarItem,
   PropertyGroup,
+  PropertyItem,
+  PropertyPanelValue,
+  PhotoStorageItem,
   LayoutState,
 } from './PanelTypes';
 
@@ -32,6 +35,9 @@ export class PanelManager {
 
   /** 右侧属性分组列表 */
   private _propertyGroups: Array<PropertyGroup> = [];
+
+  /** 照片存储栏图片列表 */
+  private _photoStorageItems: Array<PhotoStorageItem> = [];
 
   /**
    * 当前激活的工具栏按钮 ID（null 表示无激活）
@@ -227,6 +233,57 @@ export class PanelManager {
   }
 
   /**
+   * 根据属性项 ID 查找当前右侧属性面板中的属性项
+   * @param itemId - 属性项唯一标识
+   * @returns 匹配的属性项，未找到时返回 null
+   */
+  public findPropertyItem(itemId: string): PropertyItem | null {
+    for (const group of this._propertyGroups) {
+      for (const item of group.items) {
+        if (item.id === itemId) {
+          return item;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 仅更新当前属性面板中指定属性项的显示值，不触发业务 onChange 回调
+   * @param itemId - 属性项唯一标识
+   * @param value - 新的显示值
+   * @returns 是否成功找到并更新属性项
+   */
+  public updatePropertyItemValue(itemId: string, value: PropertyPanelValue): boolean {
+    const item: PropertyItem | null = this.findPropertyItem(itemId);
+    if (item === null) {
+      return false;
+    }
+
+    /* 根据控件类型校验并写入显示值，避免把错误类型写入当前面板状态。 */
+    if ((item.type === 'number' || item.type === 'slider') && typeof value === 'number') {
+      item.value = value;
+      this._notify();
+      return true;
+    }
+
+    if ((item.type === 'color' || item.type === 'select') && typeof value === 'string') {
+      item.value = value;
+      this._notify();
+      return true;
+    }
+
+    if (item.type === 'toggle' && typeof value === 'boolean') {
+      item.value = value;
+      this._notify();
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
    * 切换属性分组的展开/折叠状态
    * @param index - 分组索引
    */
@@ -236,6 +293,43 @@ export class PanelManager {
       group.expanded = !group.expanded;
       this._notify();
     }
+  }
+
+  /* ========== 照片存储栏 ========== */
+
+  /**
+   * 添加照片存储项
+   * @param item - 新增照片数据
+   */
+  public addPhotoStorageItem(item: PhotoStorageItem): void {
+    /* 新拍摄图片插入列表顶部，便于用户优先查看最近拍摄结果。 */
+    this._photoStorageItems = [item, ...this._photoStorageItems];
+    this._notify();
+  }
+
+  /**
+   * 删除指定照片存储项
+   * @param id - 照片唯一标识
+   */
+  public removePhotoStorageItem(id: string): void {
+    this._photoStorageItems = this._photoStorageItems.filter((item: PhotoStorageItem): boolean => item.id !== id);
+    this._notify();
+  }
+
+  /**
+   * 清空照片存储栏
+   */
+  public clearPhotoStorageItems(): void {
+    this._photoStorageItems = [];
+    this._notify();
+  }
+
+  /**
+   * 获取照片存储项列表
+   * @returns 照片存储项快照
+   */
+  public getPhotoStorageItems(): Array<PhotoStorageItem> {
+    return [...this._photoStorageItems];
   }
 
   /* ========== 布局状态 ========== */
@@ -273,6 +367,7 @@ export class PanelManager {
     this._leftPanels.clear();
     this._toolbarItems.clear();
     this._propertyGroups = [];
+    this._photoStorageItems = [];
     this._listeners.clear();
   }
 }

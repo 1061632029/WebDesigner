@@ -254,11 +254,11 @@ export class StlPlaceTool {
     /* 自动居中并缩放到合理尺寸 */
     this._normalizePreviewMesh(this._previewMesh);
 
-    /* 门窗布置预览：仅显示 2D 平面符号，不显示 STL 模型本体。
-     * 处理逻辑：先按注册表默认宽高缩放预览 Mesh，再创建 2D 图标，确保图标尺寸基于实际门窗尺寸。
-     * 父 Mesh 仍保持可见用于承载位置、旋转、吸附与放置状态；仅隐藏自身材质，避免子级 2D 图标被一并隐藏。
+    /* STL 布置预览尺寸初始化：门窗按默认宽高缩放，普通模型按默认长宽高缩放。
+     * 处理逻辑：先记录归一化后几何体局部原始尺寸，再将注册表中的米制默认尺寸转换为各轴 scale。
+     * 门窗预览仍仅显示 2D 平面符号；普通模型预览直接显示缩放后的 STL 本体。
      */
-    if (DOOR_WINDOW_CATEGORIES.has(model.category)) {
+    if (DOOR_WINDOW_CATEGORIES.has(model.category) || model.category === 'model') {
       this._previewMesh.geometry.computeBoundingBox();
       const previewLocalBox: THREE.Box3 | null = this._previewMesh.geometry.boundingBox;
       if (previewLocalBox !== null) {
@@ -274,7 +274,20 @@ export class StlPlaceTool {
           previewOriginalSizeX,
           previewOriginalSizeY
         );
+        this._applyDefaultModelDimensions(
+          this._previewMesh,
+          model,
+          previewOriginalSizeX,
+          previewOriginalSizeY,
+          previewOriginalSizeZ
+        );
       }
+    }
+
+    /* 门窗布置预览：仅显示 2D 平面符号，不显示 STL 模型本体。
+     * 父 Mesh 仍保持可见用于承载位置、旋转、吸附与放置状态；仅隐藏自身材质，避免子级 2D 图标被一并隐藏。
+     */
+    if (DOOR_WINDOW_CATEGORIES.has(model.category)) {
       previewMaterial.visible = false;
       DoorWindow2DSymbolHelper.attachSymbol(this._previewMesh, true);
     }
@@ -1199,6 +1212,45 @@ export class StlPlaceTool {
   }
 
   /**
+   * 按模型注册表中的默认长宽高缩放普通 STL 模型。
+   * @param mesh - 待缩放的预览或正式 Mesh
+   * @param model - 当前 STL 模型定义
+   * @param originalSizeX - 模型局部 X 轴原始长度（米）
+   * @param originalSizeY - 模型局部 Y 轴原始高度（米）
+   * @param originalSizeZ - 模型局部 Z 轴原始宽度（米）
+   */
+  private _applyDefaultModelDimensions(
+    mesh: THREE.Mesh,
+    model: StlModelDef,
+    originalSizeX: number,
+    originalSizeY: number,
+    originalSizeZ: number
+  ): void {
+    /* 普通模型默认长宽高仅对 category='model' 生效。
+     * 轴向约定与属性面板保持一致：局部 X=长，局部 Z=宽，局部 Y=高。
+     */
+    if (model.category !== 'model') {
+      return;
+    }
+
+    const defaultModelLength: number | undefined = model.defaultModelLength;
+    const defaultModelWidth: number | undefined = model.defaultModelWidth;
+    const defaultModelHeight: number | undefined = model.defaultModelHeight;
+
+    if (defaultModelLength !== undefined && originalSizeX > 0) {
+      mesh.scale.setX(defaultModelLength / originalSizeX);
+    }
+
+    if (defaultModelWidth !== undefined && originalSizeZ > 0) {
+      mesh.scale.setZ(defaultModelWidth / originalSizeZ);
+    }
+
+    if (defaultModelHeight !== undefined && originalSizeY > 0) {
+      mesh.scale.setY(defaultModelHeight / originalSizeY);
+    }
+  }
+
+  /**
    * 放置模型：克隆预览 Mesh 为正式对象添加到场景
    * 门窗类型：放置后对吸附的墙体执行扣洞操作
    */
@@ -1282,9 +1334,10 @@ export class StlPlaceTool {
       placedMesh.userData['originalSizeY'] = originalSizeY;
       placedMesh.userData['originalSizeZ'] = originalSizeZ;
       this._applyDefaultDoorWindowDimensions(placedMesh, this._activeModel, originalSizeX, originalSizeY);
+      this._applyDefaultModelDimensions(placedMesh, this._activeModel, originalSizeX, originalSizeY, originalSizeZ);
     }
 
-    /* 更新世界矩阵（确保默认门窗宽高缩放已生效，后续包围盒、碰撞检测和扣洞都使用最终尺寸） */
+    /* 更新世界矩阵（确保默认门窗宽高和普通模型长宽高缩放已生效，后续包围盒、碰撞检测和扣洞都使用最终尺寸） */
     placedMesh.updateMatrixWorld(true);
 
     /* 计算并存储 AABB 包围盒到 userData */

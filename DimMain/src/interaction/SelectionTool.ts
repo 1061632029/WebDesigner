@@ -7,7 +7,7 @@
 
 import * as THREE from 'three/webgpu';
 import type { SelectionManager } from './SelectionManager';
-import type { BuildingObjectManager, StraightWallDragSnapshot } from '../building/BuildingObjectManager';
+import type { BuildingObjectManager, BeamDragSnapshot, BeamJointDragSnapshot, StraightWallDragSnapshot, WallJointDragSnapshot } from '../building/BuildingObjectManager';
 import { RaycastHelper } from './RaycastHelper';
 import type { MeshFaceHitResult } from './RaycastHelper';
 import type { SceneManager } from '../scene/SceneManager';
@@ -18,7 +18,11 @@ import type { BBoxSnapResult } from '../model/StlBBoxSnapHelper';
 import { StlSnapGuideLines } from '../model/StlSnapGuideLines';
 import { StlMoveCommand } from '../history/commands/StlMoveCommand';
 import { WallMoveCommand } from '../history/commands/WallMoveCommand';
+import { BeamMoveCommand } from '../history/commands/BeamMoveCommand';
+import { WallJointMoveCommand } from '../history/commands/WallJointMoveCommand';
+import { BeamJointMoveCommand } from '../history/commands/BeamJointMoveCommand';
 import { BoundingBoxHelper } from './BoundingBoxHelper';
+import { StlRotationAngleHelper } from '../model/StlRotationAngleHelper';
 import { DoorWindow2DSymbolHelper } from '../model/DoorWindow2DSymbolHelper';
 import { DoorWindowPlacementDimensionRenderer } from '../model/DoorWindowPlacementDimensionRenderer';
 import type { DoorWindowDimensionEditSide } from '../model/DoorWindowPlacementDimensionRenderer';
@@ -28,17 +32,53 @@ import { WallOpeningCutter } from '../building/WallOpeningCutter';
 import { StlMoveWithOpeningCommand } from '../history/commands/StlMoveWithOpeningCommand';
 import { TransformCommand } from '../history/commands/TransformCommand';
 import type { TransformSnapshot } from '../history/commands/TransformCommand';
-import type { BuildingObject, Point2D, StraightWallData, WallOpening } from '../building/BuildingTypes';
+import { SNAP_THRESHOLD } from '../building/BuildingTypes';
+import type { BeamData, BuildingObject, Point2D, StraightWallData, WallOpening } from '../building/BuildingTypes';
 import type { WallSnapResult } from '../building/WallSnapHelper';
 import { DoorOpeningDirectionHelper } from '../model/DoorOpeningDirectionHelper';
 import { HoverOutlineHelper } from './HoverOutlineHelper';
 import type { OrbitControlsWrapper } from '../camera/OrbitControlsWrapper';
+import { WallJointNodeRenderer } from '../building/WallJointNodeRenderer';
+import type { JointNodeOwnerType } from '../building/WallJointNodeRenderer';
+import { Stl2DObbSelectionHelper } from './Stl2DObbSelectionHelper';
+import type { Stl2DObbHitResult } from './Stl2DObbSelectionHelper';
+import { StlRotateDragHelper } from './StlRotateDragHelper';
+import { LineElementDragGeometryHelper } from './LineElementDragGeometryHelper';
+import type { LineElementDragGeometry } from './LineElementDragGeometryHelper';
+import { PlanarPlacementSnapService } from '../building/PlanarPlacementSnapService';
+import { PlanarPlacementGuideRenderer } from '../building/PlanarPlacementGuideRenderer';
+import type { PlanarPlacementGuideLine, PlanarPlacementSnapResult } from '../building/PlanarPlacementSnapTypes';
 
 /** 米与毫米之间的换算倍率。 */
 const MILLIMETER_TO_METER: number = 0.001;
 
 /** 鼠标悬停轮廓临时阻断原因。*/
 type HoverOutlineBlockReason = 'leftButton' | 'wheel';
+
+/** STL 旋转捕获步长：拖拽角度满足 45° 倍数时进行捕获。 */
+const STL_ROTATE_SNAP_STEP_RADIANS: number = Math.PI / 4;
+
+/** STL 旋转捕获阈值：接近 45° 倍数时吸附，偏离超过 6° 后才允许脱离捕获。 */
+const STL_ROTATE_SNAP_RELEASE_RADIANS: number = THREE.MathUtils.degToRad(6);
+
+/** 衔接点拖拽快照类型，墙与梁在交互层复用同一套拖拽流程。 */
+type JointDragSnapshot = WallJointDragSnapshot | BeamJointDragSnapshot;
+
+/** 线式构件拖拽捕获候选点，通常为起点、终点或中点。 */
+interface LinearDragSnapAnchor {
+  /** 当前候选点位置。 */
+  position: Point2D;
+}
+
+/** 线式构件法向拖拽捕获候选结果。 */
+interface LinearDragSnapCandidate {
+  /** 捕获修正后的拖拽偏移。 */
+  offset: Point2D;
+  /** 法向修正距离绝对值，用于选择最近捕获目标。 */
+  distance: number;
+  /** 捕获辅助线集合。 */
+  guideLines: PlanarPlacementGuideLine[];
+}
 
 /**
  * 选择交互工具
@@ -71,6 +111,9 @@ export class SelectionTool {
 
   /** 射线投射辅助器 */
   private _raycastHelper: RaycastHelper = new RaycastHelper();
+
+  /** 2D 模式 STL OBB 投影选择辅助器 */
+  private readonly _stl2DObbSelectionHelper: Stl2DObbSelectionHelper = new Stl2DObbSelectionHelper();
 
   /** 鼠标悬停轮廓辅助器 */
   private _hoverOutlineHelper: HoverOutlineHelper = new HoverOutlineHelper();
@@ -117,6 +160,12 @@ export class SelectionTool {
   /** 2D 直墙精确命中容差（米）：避免点击墙体附近空白处时因 Mesh 射线误命中而无法取消选中 */
   private static readonly WALL_2D_HIT_TOLERANCE: number = 0.005;
 
+  /** 墙/梁拖拽捕获辅助线半长，单位米。 */
+  private static readonly LINEAR_DRAG_SNAP_GUIDE_HALF_LENGTH: number = 12;
+
+  /** 拖拽捕获修正有效残差，单位米。 */
+  private static readonly LINEAR_DRAG_SNAP_RESIDUAL_EPSILON: number = 0.001;
+
   /** 当前视图模式（2D 模式下 STL 选中时显示包围盒） */
   private _viewMode: ViewMode = '3d';
 
@@ -158,6 +207,51 @@ export class SelectionTool {
   /** 墙体拖拽开始时的直墙与连接节点快照，用于按 P + L 方式实时预览。 */
   private _dragWallSnapshot: StraightWallDragSnapshot | null = null;
 
+  /** 是否正在拖拽 2D 梁实体。 */
+  private _isDraggingBeam: boolean = false;
+
+  /** 当前拖拽的梁 ID。 */
+  private _dragBeamId: string | null = null;
+
+  /** 梁拖拽开始快照，用于实时预览与最终命令提交前回滚。 */
+  private _dragBeamSnapshot: BeamDragSnapshot | null = null;
+
+  /** 梁拖拽起始鼠标地面投影点。 */
+  private _dragBeamStartGroundPoint: THREE.Vector3 = new THREE.Vector3();
+
+  /** 梁拖拽起始中心线参考点。 */
+  private _dragBeamStartLinePoint: Point2D = { x: 0, z: 0 };
+
+  /** 梁允许拖拽的截面宽度法向方向。 */
+  private _dragBeamNormal: THREE.Vector3 = new THREE.Vector3();
+
+  /** 梁拖拽命中点到中心线的法向距离。 */
+  private _dragBeamHitToLineNormalDistance: number = 0;
+
+  /** 梁拖拽过程中已实时应用的累计偏移。 */
+  private _dragBeamAppliedOffset: Point2D = { x: 0, z: 0 };
+
+  /** 是否正在拖拽墙体衔接点圆片。 */
+  private _isDraggingWallJoint: boolean = false;
+
+  /** 当前拖拽的墙体衔接点 ID。 */
+  private _dragWallJointId: string | null = null;
+
+  /** 墙体衔接点拖拽起始鼠标地面投影点。 */
+  private _dragWallJointStartGroundPoint: THREE.Vector3 = new THREE.Vector3();
+
+  /** 墙体衔接点拖拽过程中已实时应用的累计偏移。 */
+  private _dragWallJointAppliedOffset: Point2D = { x: 0, z: 0 };
+
+  /** 墙体衔接点拖拽开始快照，用于实时预览与最终命令提交前回滚。 */
+  private _dragWallJointSnapshot: WallJointDragSnapshot | null = null;
+
+  /** 梁衔接点拖拽开始快照，用于实时预览与最终命令提交前回滚。 */
+  private _dragBeamJointSnapshot: BeamJointDragSnapshot | null = null;
+
+  /** 当前拖拽衔接点所属对象类型。 */
+  private _dragJointOwnerType: JointNodeOwnerType = 'wall';
+
   /** 拖拽开始时 Mesh 的世界坐标快照（用于命令栈记录 before 位置） */
   private _dragStartMeshPos: THREE.Vector3 = new THREE.Vector3();
 
@@ -177,8 +271,35 @@ export class SelectionTool {
   /** 拖拽时的射线投射器 */
   private _dragRaycaster: THREE.Raycaster = new THREE.Raycaster();
 
+  /** STL 旋转标注拖拽时的几何计算辅助工具。 */
+  private readonly _stlRotateDragHelper: StlRotateDragHelper = new StlRotateDragHelper();
+
+  /** 是否正在通过 2D 旋转标注拖拽 STL 模型。 */
+  private _isRotatingStl: boolean = false;
+
+  /** STL 旋转开始时鼠标相对模型中心的 XZ 平面角度。 */
+  private _rotateStartPointerAngle: number = 0;
+
+  /** STL 旋转开始时模型自身 Y 轴旋转角。 */
+  private _rotateStartMeshY: number = 0;
+
+  /** STL 旋转开始时 Mesh 的完整位姿快照，用于撤销/重做。 */
+  private _rotateStartSnapshot: TransformSnapshot | null = null;
+
+  /** STL 旋转当前捕获到的 45° 倍数角；未捕获时为 null。 */
+  private _rotateSnappedMeshY: number | null = null;
+
+  /** STL 旋转轮盘拖拽开始时的固定世界缩放，避免拖动过程轮盘半径忽大忽小。 */
+  private _rotateWheelWorldScale: number = 0;
+
   /** 拖拽时的包围盒吸附虚线提示（拖拽开始时创建，结束时销毁） */
   private _dragSnapGuideLines: StlSnapGuideLines | null = null;
+
+  /** 墙/梁拖拽过程使用的平面捕获服务。 */
+  private _planarDragSnapService: PlanarPlacementSnapService | null = null;
+
+  /** 墙/梁拖拽过程使用的平面捕获辅助线渲染器。 */
+  private _planarDragGuideRenderer: PlanarPlacementGuideRenderer | null = null;
 
   /** 2D 门窗拖拽/选中时的沿墙距离标注渲染器（由 BuildingContext 注入的共享对象池）。 */
   private readonly _doorWindowDimensionRenderer: DoorWindowPlacementDimensionRenderer;
@@ -229,6 +350,10 @@ export class SelectionTool {
     this._doorWindowDimensionRenderer = doorWindowDimensionRenderer ?? new DoorWindowPlacementDimensionRenderer();
     this._stlPlacementDimensionRenderer = stlPlacementDimensionRenderer ?? new StlPlacementDimensionRenderer();
     this._ownsStlPlacementDimensionRenderer = stlPlacementDimensionRenderer === undefined;
+    if (sceneManager !== undefined) {
+      this._planarDragSnapService = new PlanarPlacementSnapService((): BuildingObject[] => this._objectManager.getAll());
+      this._planarDragGuideRenderer = new PlanarPlacementGuideRenderer(sceneManager);
+    }
   }
 
   /* ========== 启用/禁用 ========== */
@@ -435,7 +560,12 @@ export class SelectionTool {
       }
     }
 
-    /* 2D 模式下：检测是否按下在已选中的 STL 模型上，若是则启动拖拽 */
+      /* 2D 模式下：优先检测墙体衔接点圆片拖拽，避免圆片下方墙体或 STL 抢占输入。 */
+      if (this._tryStartWallJointDrag(event)) {
+        return;
+      }
+
+      /* 2D 模式下：检测是否按下在已选中的 STL 模型上，若是则启动拖拽 */
     if (
       this._viewMode === '2d' &&
       this._camera !== null &&
@@ -444,11 +574,18 @@ export class SelectionTool {
     ) {
       const selectedMesh: THREE.Mesh | null = this._selectionManager.selectedStlMesh;
       if (selectedMesh !== null && this._is2DDraggableStl(selectedMesh)) {
-        /* 射线检测是否命中了当前选中的 STL Mesh */
         const rect: DOMRect = this._domElement.getBoundingClientRect();
         const ndcX: number = ((event.clientX - rect.left) / rect.width) * 2 - 1;
         const ndcY: number = -((event.clientY - rect.top) / rect.height) * 2 + 1;
         this._dragRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this._camera);
+
+        /* 优先检测旋转标注，命中时进入旋转拖拽，避免下方 STL Mesh 抢占输入。 */
+        if (BoundingBoxHelper.hitTestRotateAnnotation(selectedMesh, this._sceneManager.getScene(), this._dragRaycaster)) {
+          this._beginStlRotateDrag(selectedMesh);
+          return;
+        }
+
+        /* 射线检测是否命中了当前选中的 STL Mesh */
         const hits: Array<THREE.Intersection> = this._dragRaycaster.intersectObject(selectedMesh, true);
 
         if (hits.length > 0) {
@@ -488,6 +625,11 @@ export class SelectionTool {
       if (!this._isDraggingStl && this._tryStartWallDrag(event)) {
         return;
       }
+
+      /* 2D 模式下：检测是否按下在已选中的梁实体上，若是则启动沿梁截面宽度法向拖拽。 */
+      if (!this._isDraggingStl && this._tryStartBeamDrag(event)) {
+        return;
+      }
     }
   };
 
@@ -505,6 +647,14 @@ export class SelectionTool {
     }
 
     /* 若正在拖拽 STL 模型，结束拖拽并提交命令（优先于点选处理） */
+    if (this._isRotatingStl) {
+      const selectedMesh: THREE.Mesh | null = this._selectionManager.selectedStlMesh;
+      this._endStlRotateDrag(selectedMesh);
+      this._mouseDownPos = null;
+      this._skipNextClick = false;
+      return;
+    }
+
     if (this._isDraggingStl) {
       const selectedMesh: THREE.Mesh | null = this._selectionManager.selectedStlMesh;
       this._endDrag(selectedMesh);
@@ -516,6 +666,22 @@ export class SelectionTool {
     /* 若正在拖拽墙体，结束拖拽并提交墙体移动命令。 */
     if (this._isDraggingWall) {
       this._endWallDrag();
+      this._mouseDownPos = null;
+      this._skipNextClick = false;
+      return;
+    }
+
+    /* 若正在拖拽梁，结束拖拽并提交梁移动命令。 */
+    if (this._isDraggingBeam) {
+      this._endBeamDrag();
+      this._mouseDownPos = null;
+      this._skipNextClick = false;
+      return;
+    }
+
+    /* 若正在拖拽墙体衔接点，结束拖拽并提交衔接点移动命令。 */
+    if (this._isDraggingWallJoint) {
+      this._endWallJointDrag();
       this._mouseDownPos = null;
       this._skipNextClick = false;
       return;
@@ -575,15 +741,20 @@ export class SelectionTool {
       try {
         /* 优先处理建筑对象删除 */
         if (this._selectionManager.hasSelection && this._historyManager !== null) {
-          /* 删除楼板前二次确认：楼板删除会级联清理房间墙体、门窗和天花板。 */
-          if (this._selectionManager.hasSelectedSlab()) {
-            const confirmed: boolean = window.confirm('删除楼板会将整个房间相关模型全部删除，是否进行删除');
-            if (!confirmed) {
-              return;
+          /* 删除楼板或墙体时走级联命令：墙体需同步清理依赖楼板、天花板和门窗。 */
+          const hasSelectedSlab: boolean = this._selectionManager.hasSelectedSlab();
+          const hasSelectedWall: boolean = this._selectionManager.hasSelectedWall();
+          if (hasSelectedSlab || hasSelectedWall) {
+            /* 删除楼板前二次确认：楼板删除会级联清理房间墙体、门窗和天花板。 */
+            if (hasSelectedSlab) {
+              const confirmed: boolean = window.confirm('删除楼板会将整个房间相关模型全部删除，是否进行删除');
+              if (!confirmed) {
+                return;
+              }
             }
 
             if (this._sceneManager === null) {
-              console.warn('[SelectionTool] 删除楼板失败：场景管理器未注入，无法级联删除门窗 STL');
+              console.warn('[SelectionTool] 级联删除失败：场景管理器未注入，无法级联删除门窗 STL');
               return;
             }
 
@@ -653,7 +824,7 @@ export class SelectionTool {
       return;
     }
 
-    if (this._isDraggingStl || this._isDraggingWall || this._dimensionEditKind !== null) {
+    if (this._isDraggingStl || this._isDraggingWall || this._isDraggingBeam || this._isDraggingWallJoint || this._dimensionEditKind !== null) {
       this._clearHoverOutline();
       return;
     }
@@ -742,6 +913,14 @@ export class SelectionTool {
       return null;
     }
 
+    /* 2D 模式下衔接节点圆片属于可拖拽拓扑控制点，悬停预选必须优先于门窗符号、墙体和 STL。 */
+    if (this._viewMode === '2d') {
+      const wallJointTarget: THREE.Object3D | null = this._pickWallJointHoverTarget(screenX, screenY);
+      if (wallJointTarget !== null) {
+        return wallJointTarget;
+      }
+    }
+
     /* 2D 模式下门窗平面符号与墙体重叠，悬停检测也需优先回溯到门窗 STL。 */
     if (this._viewMode === '2d') {
       const doorWindowTarget: THREE.Mesh | null = this._pickDoorWindow2DSymbolOwner(screenX, screenY);
@@ -788,6 +967,38 @@ export class SelectionTool {
     }
 
     return null;
+  }
+
+  /**
+   * 2D 模式下拾取墙体衔接节点圆片作为最高优先级悬停目标。
+   * @param screenX - 屏幕坐标 X
+   * @param screenY - 屏幕坐标 Y
+   * @returns 命中的衔接节点圆片；未命中时返回 null
+   */
+  private _pickWallJointHoverTarget(screenX: number, screenY: number): THREE.Object3D | null {
+    if (this._sceneManager === null || this._camera === null || this._domElement === null) {
+      return null;
+    }
+
+    const scene: THREE.Scene = this._sceneManager.getScene();
+    const targets: THREE.Object3D[] = WallJointNodeRenderer.collectVisibleNodeMeshes(scene);
+    if (targets.length === 0) {
+      return null;
+    }
+
+    /* 节点预选流程：仅对衔接节点圆片做独立拾取，避免下方墙体、门窗符号或 STL 抢占高亮。 */
+    const hit: MeshFaceHitResult | null = this._raycastHelper.screenToMeshFace(
+      screenX,
+      screenY,
+      this._camera,
+      this._domElement,
+      targets
+    );
+    if (hit === null) {
+      return null;
+    }
+
+    return hit.mesh;
   }
 
   /**
@@ -892,8 +1103,18 @@ export class SelectionTool {
     /* ===== 收集 STL 模型 Mesh ===== */
     const stlTargets: Array<THREE.Object3D> = this._collectStlMeshes();
 
+    if (this._viewMode === '2d') {
+      const stlObbHit: Stl2DObbHitResult | null = this._pickStlBy2DObb(screenX, screenY, stlTargets);
+      if (stlObbHit !== null) {
+        this._selectStlMesh(stlObbHit.mesh, isCtrl);
+        return;
+      }
+    }
+
     /* ===== 合并为统一目标列表，一次射线拾取 ===== */
-    const allTargets: Array<THREE.Object3D> = [...buildingTargets, ...stlTargets];
+    const allTargets: Array<THREE.Object3D> = this._viewMode === '2d'
+      ? buildingTargets
+      : [...buildingTargets, ...stlTargets];
 
     const hit: MeshFaceHitResult | null = this._raycastHelper.screenToMeshFace(
       screenX,
@@ -1027,6 +1248,36 @@ export class SelectionTool {
   }
 
   /**
+   * 2D 模式下通过 STL 的 OBB 平面投影执行点选命中检测。
+   * @param screenX - 屏幕坐标 X
+   * @param screenY - 屏幕坐标 Y
+   * @param stlTargets - 待检测 STL Mesh 集合
+   * @returns OBB 投影命中结果；未命中或无法投影到地面时返回 null
+   */
+  private _pickStlBy2DObb(
+    screenX: number,
+    screenY: number,
+    stlTargets: Array<THREE.Object3D>
+  ): Stl2DObbHitResult | null {
+    if (this._camera === null || this._domElement === null || stlTargets.length === 0) {
+      return null;
+    }
+
+    const groundPoint: Point2D | null = this._raycastHelper.screenToGround(
+      screenX,
+      screenY,
+      this._camera,
+      this._domElement
+    );
+    if (groundPoint === null) {
+      return null;
+    }
+
+    /* STL 2D 点选流程：使用 OBB 在 XZ 平面的投影做包含判断，避免 3D 射线受高度和三角面遮挡影响。 */
+    return this._stl2DObbSelectionHelper.pickByPoint(groundPoint, stlTargets);
+  }
+
+  /**
    * 判断 STL Mesh 是否允许在 2D 模式下通过选中对象拖拽移动。
    * @param mesh - 待检测的 STL Mesh
    * @returns 普通模型或门窗模型返回 true
@@ -1063,6 +1314,173 @@ export class SelectionTool {
   }
 
   /* ========== 2D 模式 STL 拖拽逻辑 ========== */
+
+  /**
+   * 尝试启动 2D 墙体衔接点圆片拖拽。
+   * 命中圆片后记录拖拽开始快照，拖拽过程按鼠标在地面的总偏移实时预览所有直连墙体端点。
+   * @param event - 鼠标按下事件
+   * @returns 成功启动衔接点拖拽时返回 true
+   */
+  private _tryStartWallJointDrag(event: MouseEvent): boolean {
+    if (this._viewMode !== '2d' || this._sceneManager === null || this._camera === null || this._domElement === null) {
+      return false;
+    }
+
+    const scene: THREE.Scene = this._sceneManager.getScene();
+    const targets: THREE.Object3D[] = WallJointNodeRenderer.collectVisibleNodeMeshes(scene);
+    if (targets.length === 0) {
+      return false;
+    }
+
+    const rect: DOMRect = this._domElement.getBoundingClientRect();
+    const ndcX: number = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY: number = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this._dragRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this._camera);
+
+    const hits: THREE.Intersection[] = this._dragRaycaster.intersectObjects(targets, true);
+    if (hits.length === 0) {
+      return false;
+    }
+
+    const hitObject: THREE.Object3D = hits[0]!.object;
+    const jointIdValue: unknown = hitObject.userData['wallJointId'];
+    if (typeof jointIdValue !== 'string' || jointIdValue.length === 0) {
+      return false;
+    }
+
+    const ownerTypeValue: unknown = hitObject.userData['jointNodeOwnerType'];
+    const ownerType: JointNodeOwnerType = ownerTypeValue === 'beam' ? 'beam' : 'wall';
+
+    const groundHit: THREE.Vector3 | null = this._dragRaycaster.ray.intersectPlane(
+      this._dragGroundPlane,
+      this._dragWallJointStartGroundPoint
+    );
+    if (groundHit === null) {
+      return false;
+    }
+
+    const dragSnapshot: JointDragSnapshot | null = ownerType === 'beam'
+      ? this._objectManager.createBeamJointDragSnapshot(jointIdValue)
+      : this._objectManager.createWallJointDragSnapshot(jointIdValue);
+    if (dragSnapshot === null) {
+      return false;
+    }
+
+    this._isDraggingWallJoint = true;
+    this._dragWallJointId = jointIdValue;
+    this._dragJointOwnerType = ownerType;
+    this._dragWallJointSnapshot = ownerType === 'wall' ? dragSnapshot as WallJointDragSnapshot : null;
+    this._dragBeamJointSnapshot = ownerType === 'beam' ? dragSnapshot as BeamJointDragSnapshot : null;
+    this._dragWallJointAppliedOffset = { x: 0, z: 0 };
+    this._skipNextClick = true;
+    this._clearHoverOutline();
+
+    this._domElement.addEventListener('mousemove', this._onWallJointDragMouseMove);
+    return true;
+  }
+
+  /**
+   * 墙体衔接点拖拽过程中的鼠标移动处理。
+   * @param event - 鼠标移动事件
+   */
+  private _onWallJointDragMouseMove = (event: MouseEvent): void => {
+    if (
+      !this._isDraggingWallJoint ||
+      (this._dragWallJointSnapshot === null && this._dragBeamJointSnapshot === null) ||
+      this._camera === null ||
+      this._domElement === null
+    ) {
+      return;
+    }
+
+    const groundPoint: THREE.Vector3 = new THREE.Vector3();
+    const groundHit: THREE.Vector3 | null = this._screenPointToGroundPoint(event.clientX, event.clientY, groundPoint);
+    if (groundHit === null) {
+      return;
+    }
+
+    /* 衔接点跟随流程：以拖拽开始时的鼠标地面投影为 P，当前鼠标地面投影为 Q，总偏移 L=Q-P。 */
+    const rawTargetOffset: Point2D = {
+      x: groundPoint.x - this._dragWallJointStartGroundPoint.x,
+      z: groundPoint.z - this._dragWallJointStartGroundPoint.z,
+    };
+    const targetOffset: Point2D = this._applyJointDragSnap(rawTargetOffset);
+    if (
+      Math.abs(targetOffset.x - this._dragWallJointAppliedOffset.x) < 0.000001 &&
+      Math.abs(targetOffset.z - this._dragWallJointAppliedOffset.z) < 0.000001
+    ) {
+      return;
+    }
+
+    if (this._dragJointOwnerType === 'beam' && this._dragBeamJointSnapshot !== null) {
+      this._objectManager.moveBeamJointFromSnapshot(this._dragBeamJointSnapshot, targetOffset);
+    } else if (this._dragWallJointSnapshot !== null) {
+      this._objectManager.moveWallJointFromSnapshot(this._dragWallJointSnapshot, targetOffset);
+    }
+    this._dragWallJointAppliedOffset = targetOffset;
+  };
+
+  /** 结束墙体衔接点拖拽并把最终位移写入历史命令。 */
+  private _endWallJointDrag(): void {
+    if (
+      !this._isDraggingWallJoint ||
+      this._dragWallJointId === null ||
+      (this._dragWallJointSnapshot === null && this._dragBeamJointSnapshot === null)
+    ) {
+      return;
+    }
+
+    if (this._domElement !== null) {
+      this._domElement.removeEventListener('mousemove', this._onWallJointDragMouseMove);
+    }
+
+    const jointId: string = this._dragWallJointId;
+    const appliedOffset: Point2D = {
+      x: this._dragWallJointAppliedOffset.x,
+      z: this._dragWallJointAppliedOffset.z,
+    };
+    this._hidePlanarDragGuideLines();
+    if (
+      this._historyManager !== null &&
+      (Math.abs(appliedOffset.x) > 0.000001 || Math.abs(appliedOffset.z) > 0.000001)
+    ) {
+      /* 先回滚实时预览位移，再由命令栈执行同一位移，保证撤销/重做状态一致。 */
+      if (this._dragJointOwnerType === 'beam' && this._dragBeamJointSnapshot !== null) {
+        this._objectManager.moveBeamJointFromSnapshot(this._dragBeamJointSnapshot, { x: 0, z: 0 });
+        const command: BeamJointMoveCommand = new BeamJointMoveCommand(
+          this._objectManager,
+          this._dragBeamJointSnapshot,
+          appliedOffset,
+          `2D 拖拽移动梁衔接点 "${jointId}"`
+        );
+        this._historyManager.execute(command);
+      } else if (this._dragWallJointSnapshot !== null) {
+        this._objectManager.moveWallJointFromSnapshot(this._dragWallJointSnapshot, { x: 0, z: 0 });
+        const command: WallJointMoveCommand = new WallJointMoveCommand(
+          this._objectManager,
+          this._dragWallJointSnapshot,
+          appliedOffset,
+          `2D 拖拽移动墙体衔接点 "${jointId}"`
+        );
+        this._historyManager.execute(command);
+      }
+    }
+
+    this._selectionManager.refreshSelectionHighlight();
+    this._resetWallJointDragState();
+  }
+
+  /** 重置墙体衔接点拖拽运行时状态。 */
+  private _resetWallJointDragState(): void {
+    this._isDraggingWallJoint = false;
+    this._dragWallJointId = null;
+    this._dragWallJointAppliedOffset = { x: 0, z: 0 };
+    this._dragWallJointSnapshot = null;
+    this._dragBeamJointSnapshot = null;
+    this._dragJointOwnerType = 'wall';
+    this._dragWallJointStartGroundPoint.set(0, 0, 0);
+    this._hidePlanarDragGuideLines();
+  }
 
   /**
    * 尝试启动 2D 直墙实体拖拽。
@@ -1188,10 +1606,11 @@ export class SelectionTool {
       (groundPoint.x - this._dragWallStartLinePoint.x) * this._dragWallNormal.x +
       (groundPoint.z - this._dragWallStartLinePoint.z) * this._dragWallNormal.z;
     const normalDistance: number = currentMouseNormalDistance - this._dragWallHitToLineNormalDistance;
-    const targetOffset: Point2D = {
+    const rawTargetOffset: Point2D = {
       x: this._dragWallNormal.x * normalDistance,
       z: this._dragWallNormal.z * normalDistance,
     };
+    const targetOffset: Point2D = this._applyWallNormalDragSnap(rawTargetOffset);
     if (
       Math.abs(targetOffset.x - this._dragWallAppliedOffset.x) < 0.000001 &&
       Math.abs(targetOffset.z - this._dragWallAppliedOffset.z) < 0.000001
@@ -1219,6 +1638,7 @@ export class SelectionTool {
 
     const wallId: string = this._dragWallId;
     const appliedOffset: Point2D = { x: this._dragWallAppliedOffset.x, z: this._dragWallAppliedOffset.z };
+    this._hidePlanarDragGuideLines();
     if (
       this._historyManager !== null &&
       (Math.abs(appliedOffset.x) > 0.000001 || Math.abs(appliedOffset.z) > 0.000001)
@@ -1230,7 +1650,7 @@ export class SelectionTool {
       );
       const command: WallMoveCommand = new WallMoveCommand(
         this._objectManager,
-        wallId,
+        this._dragWallSnapshot,
         appliedOffset,
         `2D 法向拖拽移动墙体 "${wallId}"`
       );
@@ -1251,6 +1671,415 @@ export class SelectionTool {
     this._dragWallStartLinePoint = { x: 0, z: 0 };
     this._dragWallHitToLineNormalDistance = 0;
     this._dragWallNormal.set(0, 0, 0);
+    this._hidePlanarDragGuideLines();
+  }
+
+  /**
+   * 尝试启动 2D 梁实体方向拖拽。
+   * 仅允许单选梁，并把拖拽方向锁定到梁中心线的截面宽度法向方向。
+   * @param event - 鼠标按下事件
+   * @returns 成功启动梁拖拽时返回 true
+   */
+  private _tryStartBeamDrag(event: MouseEvent): boolean {
+    if (this._camera === null || this._domElement === null) {
+      return false;
+    }
+
+    const selectedIds: string[] = Array.from(this._selectionManager.selectedIds);
+    if (selectedIds.length !== 1) {
+      return false;
+    }
+
+    const beamId: string = selectedIds[0]!;
+    const beamObject: BuildingObject | undefined = this._objectManager.getById(beamId);
+    if (beamObject === undefined || beamObject.category !== 'beam') {
+      return false;
+    }
+
+    const beamMesh: THREE.Mesh | undefined = this._objectManager.getMeshById(beamId);
+    if (beamMesh === undefined || !beamMesh.visible) {
+      return false;
+    }
+
+    const rect: DOMRect = this._domElement.getBoundingClientRect();
+    const ndcX: number = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY: number = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this._dragRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this._camera);
+
+    const hits: Array<THREE.Intersection> = this._dragRaycaster.intersectObject(beamMesh, true);
+    if (hits.length === 0) {
+      return false;
+    }
+
+    const groundHit: THREE.Vector3 | null = this._dragRaycaster.ray.intersectPlane(
+      this._dragGroundPlane,
+      this._dragBeamStartGroundPoint
+    );
+    if (groundHit === null) {
+      return false;
+    }
+
+    const beamData: BeamData = beamObject as BeamData;
+    const geometry: LineElementDragGeometry | null = LineElementDragGeometryHelper.createGeometry(
+      beamData.start,
+      beamData.end
+    );
+    if (geometry === null) {
+      return false;
+    }
+
+    const hitPoint: Point2D = {
+      x: this._dragBeamStartGroundPoint.x,
+      z: this._dragBeamStartGroundPoint.z,
+    };
+    if (!LineElementDragGeometryHelper.isPointInsideBody(
+      hitPoint,
+      beamData.start,
+      geometry,
+      beamData.width,
+      SelectionTool.WALL_2D_HIT_TOLERANCE
+    )) {
+      return false;
+    }
+
+    const dragBeamSnapshot: BeamDragSnapshot | null = this._objectManager.createBeamDragSnapshot(beamId);
+    if (dragBeamSnapshot === null) {
+      return false;
+    }
+
+    this._dragBeamNormal.set(geometry.normal.x, 0, geometry.normal.z);
+    this._dragBeamStartLinePoint = { x: beamData.start.x, z: beamData.start.z };
+    this._dragBeamHitToLineNormalDistance =
+      (hitPoint.x - this._dragBeamStartLinePoint.x) * geometry.normal.x +
+      (hitPoint.z - this._dragBeamStartLinePoint.z) * geometry.normal.z;
+    this._dragBeamAppliedOffset = { x: 0, z: 0 };
+    this._dragBeamSnapshot = dragBeamSnapshot;
+    this._dragBeamId = beamId;
+    this._isDraggingBeam = true;
+    this._skipNextClick = true;
+    this._clearHoverOutline();
+
+    this._domElement.addEventListener('mousemove', this._onBeamDragMouseMove);
+    return true;
+  }
+
+  /**
+   * 梁拖拽过程中的鼠标移动处理。
+   * 根据鼠标地面投影点反推梁中心线目标位置，并只保留梁截面宽度法向分量。
+   * @param event - 鼠标移动事件
+   */
+  private _onBeamDragMouseMove = (event: MouseEvent): void => {
+    if (
+      !this._isDraggingBeam ||
+      this._dragBeamId === null ||
+      this._dragBeamSnapshot === null ||
+      this._camera === null ||
+      this._domElement === null
+    ) {
+      return;
+    }
+
+    const groundPoint: THREE.Vector3 = new THREE.Vector3();
+    const groundHit: THREE.Vector3 | null = this._screenPointToGroundPoint(event.clientX, event.clientY, groundPoint);
+    if (groundHit === null) {
+      return;
+    }
+
+    const normal: Point2D = { x: this._dragBeamNormal.x, z: this._dragBeamNormal.z };
+    const rawTargetOffset: Point2D = LineElementDragGeometryHelper.computeNormalOffset(
+      { x: groundPoint.x, z: groundPoint.z },
+      this._dragBeamStartLinePoint,
+      normal,
+      this._dragBeamHitToLineNormalDistance
+    );
+    const targetOffset: Point2D = this._applyBeamNormalDragSnap(rawTargetOffset);
+    if (
+      Math.abs(targetOffset.x - this._dragBeamAppliedOffset.x) < 0.000001 &&
+      Math.abs(targetOffset.z - this._dragBeamAppliedOffset.z) < 0.000001
+    ) {
+      return;
+    }
+
+    /* 梁实时预览流程：始终以拖拽开始快照 P + 当前总偏移 L 计算，避免多次 mousemove 累加误差。 */
+    this._objectManager.moveBeamFromSnapshot(this._dragBeamSnapshot, targetOffset);
+    this._dragBeamAppliedOffset = targetOffset;
+  };
+
+  /** 结束梁拖拽并把最终法向位移写入历史命令。 */
+  private _endBeamDrag(): void {
+    if (!this._isDraggingBeam || this._dragBeamId === null || this._dragBeamSnapshot === null) {
+      return;
+    }
+
+    if (this._domElement !== null) {
+      this._domElement.removeEventListener('mousemove', this._onBeamDragMouseMove);
+    }
+
+    const beamId: string = this._dragBeamId;
+    const appliedOffset: Point2D = { x: this._dragBeamAppliedOffset.x, z: this._dragBeamAppliedOffset.z };
+    this._hidePlanarDragGuideLines();
+    if (
+      this._historyManager !== null &&
+      (Math.abs(appliedOffset.x) > 0.000001 || Math.abs(appliedOffset.z) > 0.000001)
+    ) {
+      /* 先回滚实时预览位移，再由命令栈执行同一位移，保证撤销/重做状态一致。 */
+      this._objectManager.moveBeamFromSnapshot(this._dragBeamSnapshot, { x: 0, z: 0 });
+      const command: BeamMoveCommand = new BeamMoveCommand(
+        this._objectManager,
+        this._dragBeamSnapshot,
+        appliedOffset,
+        `2D 法向拖拽移动梁 "${beamId}"`
+      );
+      this._historyManager.execute(command);
+    }
+
+    if (this._selectionManager.selectedIds.has(beamId)) {
+      this._selectionManager.refreshSelectionHighlight();
+    }
+
+    this._resetBeamDragState();
+  }
+
+  /** 重置梁拖拽运行时状态。 */
+  private _resetBeamDragState(): void {
+    this._isDraggingBeam = false;
+    this._dragBeamId = null;
+    this._dragBeamSnapshot = null;
+    this._dragBeamStartGroundPoint.set(0, 0, 0);
+    this._dragBeamStartLinePoint = { x: 0, z: 0 };
+    this._dragBeamNormal.set(0, 0, 0);
+    this._dragBeamHitToLineNormalDistance = 0;
+    this._dragBeamAppliedOffset = { x: 0, z: 0 };
+    this._hidePlanarDragGuideLines();
+  }
+
+  /**
+   * 对墙体衔接点或梁衔接点拖拽偏移执行捕获检测。
+   * 关键流程：把拖拽开始衔接点坐标加上原始偏移得到候选点，排除当前受影响对象后执行平面捕获。
+   * @param rawOffset - 鼠标计算出的原始拖拽偏移
+   * @returns 捕获修正后的拖拽偏移；无捕获时返回原始偏移
+   */
+  private _applyJointDragSnap(rawOffset: Point2D): Point2D {
+    const jointStart: Point2D | null = this._getActiveJointDragStartPoint();
+    if (jointStart === null || this._planarDragSnapService === null) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    const excludedObjectIds: Set<string> = this._collectActiveJointDragExcludedObjectIds();
+    const rawPoint: Point2D = {
+      x: jointStart.x + rawOffset.x,
+      z: jointStart.z + rawOffset.z,
+    };
+    const snapResult: PlanarPlacementSnapResult = this._planarDragSnapService.snap(
+      rawPoint,
+      SNAP_THRESHOLD,
+      jointStart,
+      SelectionTool.LINEAR_DRAG_SNAP_GUIDE_HALF_LENGTH,
+      excludedObjectIds
+    );
+    if (!snapResult.snapped) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    this._updatePlanarDragGuideLines(snapResult.guideLines);
+    return {
+      x: snapResult.position.x - jointStart.x,
+      z: snapResult.position.z - jointStart.z,
+    };
+  }
+
+  /**
+   * 对直墙法向拖拽偏移执行捕获检测。
+   * @param rawOffset - 墙体法向拖拽原始偏移
+   * @returns 捕获修正后的法向偏移
+   */
+  private _applyWallNormalDragSnap(rawOffset: Point2D): Point2D {
+    if (this._dragWallSnapshot === null) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    const normal: Point2D = { x: this._dragWallNormal.x, z: this._dragWallNormal.z };
+    const anchors: LinearDragSnapAnchor[] = this._buildWallNormalDragSnapAnchors(this._dragWallSnapshot);
+    const excludedObjectIds: Set<string> = new Set<string>(Array.from(this._dragWallSnapshot.wallPositions.keys()));
+    return this._applyLinearNormalDragSnap(rawOffset, normal, anchors, excludedObjectIds);
+  }
+
+  /**
+   * 对梁法向拖拽偏移执行捕获检测。
+   * @param rawOffset - 梁法向拖拽原始偏移
+   * @returns 捕获修正后的法向偏移
+   */
+  private _applyBeamNormalDragSnap(rawOffset: Point2D): Point2D {
+    if (this._dragBeamSnapshot === null) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    const normal: Point2D = { x: this._dragBeamNormal.x, z: this._dragBeamNormal.z };
+    const anchors: LinearDragSnapAnchor[] = this._buildBeamNormalDragSnapAnchors(this._dragBeamSnapshot);
+    const excludedObjectIds: Set<string> = new Set<string>(Array.from(this._dragBeamSnapshot.beamPositions.keys()));
+    return this._applyLinearNormalDragSnap(rawOffset, normal, anchors, excludedObjectIds);
+  }
+
+  /**
+   * 对线式构件法向拖拽候选点执行捕获检测，并把捕获修正投影回法向位移。
+   * @param rawOffset - 原始法向偏移
+   * @param normal - 当前构件允许移动的法向单位向量
+   * @param anchors - 拖拽开始时参与捕获的起点、终点和中点
+   * @param excludedObjectIds - 捕获时需要排除的当前移动对象 ID 集合
+   * @returns 捕获修正后的法向偏移
+   */
+  private _applyLinearNormalDragSnap(
+    rawOffset: Point2D,
+    normal: Point2D,
+    anchors: LinearDragSnapAnchor[],
+    excludedObjectIds: Set<string>
+  ): Point2D {
+    if (this._planarDragSnapService === null || anchors.length === 0) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    let nearestCandidate: LinearDragSnapCandidate | null = null;
+    for (const anchor of anchors) {
+      const rawPoint: Point2D = {
+        x: anchor.position.x + rawOffset.x,
+        z: anchor.position.z + rawOffset.z,
+      };
+      const snapResult: PlanarPlacementSnapResult = this._planarDragSnapService.snap(
+        rawPoint,
+        SNAP_THRESHOLD,
+        null,
+        SelectionTool.LINEAR_DRAG_SNAP_GUIDE_HALF_LENGTH,
+        excludedObjectIds
+      );
+      if (!snapResult.snapped) {
+        continue;
+      }
+
+      const correctionX: number = snapResult.position.x - rawPoint.x;
+      const correctionZ: number = snapResult.position.z - rawPoint.z;
+      const normalDelta: number = correctionX * normal.x + correctionZ * normal.z;
+      const residualX: number = correctionX - normal.x * normalDelta;
+      const residualZ: number = correctionZ - normal.z * normalDelta;
+      const residualDistance: number = Math.sqrt(residualX * residualX + residualZ * residualZ);
+      if (residualDistance > SelectionTool.LINEAR_DRAG_SNAP_RESIDUAL_EPSILON) {
+        /* 法向拖拽只能沿当前法向修正；若捕获点不在法向轨迹上，则跳过该捕获结果。 */
+        continue;
+      }
+
+      const candidate: LinearDragSnapCandidate = {
+        offset: {
+          x: rawOffset.x + normal.x * normalDelta,
+          z: rawOffset.z + normal.z * normalDelta,
+        },
+        distance: Math.abs(normalDelta),
+        guideLines: snapResult.guideLines,
+      };
+      if (nearestCandidate === null || candidate.distance < nearestCandidate.distance) {
+        nearestCandidate = candidate;
+      }
+    }
+
+    if (nearestCandidate === null) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    this._updatePlanarDragGuideLines(nearestCandidate.guideLines);
+    return nearestCandidate.offset;
+  }
+
+  /**
+   * 构建直墙法向移动时参与捕获检测的锚点集合。
+   * @param snapshot - 直墙拖拽开始快照
+   * @returns 所有受影响墙体的起点、终点和中点锚点
+   */
+  private _buildWallNormalDragSnapAnchors(snapshot: StraightWallDragSnapshot): LinearDragSnapAnchor[] {
+    const anchors: LinearDragSnapAnchor[] = [];
+    for (const wallPosition of snapshot.wallPositions.values()) {
+      this._appendLinearDragSnapAnchors(anchors, wallPosition.start, wallPosition.end);
+    }
+    return anchors;
+  }
+
+  /**
+   * 构建梁法向移动时参与捕获检测的锚点集合。
+   * @param snapshot - 梁拖拽开始快照
+   * @returns 所有受影响梁的起点、终点和中点锚点
+   */
+  private _buildBeamNormalDragSnapAnchors(snapshot: BeamDragSnapshot): LinearDragSnapAnchor[] {
+    const anchors: LinearDragSnapAnchor[] = [];
+    for (const beamPosition of snapshot.beamPositions.values()) {
+      this._appendLinearDragSnapAnchors(anchors, beamPosition.start, beamPosition.end);
+    }
+    return anchors;
+  }
+
+  /**
+   * 追加线式构件的起点、终点和中点捕获锚点。
+   * @param anchors - 锚点集合
+   * @param start - 线式构件起点
+   * @param end - 线式构件终点
+   */
+  private _appendLinearDragSnapAnchors(anchors: LinearDragSnapAnchor[], start: Point2D, end: Point2D): void {
+    anchors.push({ position: start });
+    anchors.push({ position: end });
+    anchors.push({
+      position: {
+        x: (start.x + end.x) / 2,
+        z: (start.z + end.z) / 2,
+      },
+    });
+  }
+
+  /**
+   * 获取当前衔接点拖拽的起始点。
+   * @returns 当前墙/梁衔接点起始坐标；未处于衔接点拖拽时返回 null
+   */
+  private _getActiveJointDragStartPoint(): Point2D | null {
+    if (this._dragJointOwnerType === 'beam' && this._dragBeamJointSnapshot !== null) {
+      return this._dragBeamJointSnapshot.jointStart;
+    }
+    if (this._dragWallJointSnapshot !== null) {
+      return this._dragWallJointSnapshot.jointStart;
+    }
+    return null;
+  }
+
+  /**
+   * 收集当前衔接点拖拽需要排除的对象 ID，避免捕获到自身或同组联动对象。
+   * @returns 受当前衔接点拖拽影响的墙/梁对象 ID 集合
+   */
+  private _collectActiveJointDragExcludedObjectIds(): Set<string> {
+    if (this._dragJointOwnerType === 'beam' && this._dragBeamJointSnapshot !== null) {
+      return new Set<string>(Array.from(this._dragBeamJointSnapshot.beamPositions.keys()));
+    }
+    if (this._dragWallJointSnapshot !== null) {
+      return new Set<string>(Array.from(this._dragWallJointSnapshot.wallPositions.keys()));
+    }
+    return new Set<string>();
+  }
+
+  /**
+   * 更新墙/梁拖拽捕获辅助线。
+   * @param guideLines - 捕获检测返回的辅助线集合
+   */
+  private _updatePlanarDragGuideLines(guideLines: PlanarPlacementGuideLine[]): void {
+    if (this._planarDragGuideRenderer === null) {
+      return;
+    }
+    this._planarDragGuideRenderer.update(guideLines);
+  }
+
+  /** 隐藏墙/梁拖拽捕获辅助线。 */
+  private _hidePlanarDragGuideLines(): void {
+    if (this._planarDragGuideRenderer !== null) {
+      this._planarDragGuideRenderer.hide();
+    }
   }
 
   /**
@@ -1411,6 +2240,219 @@ export class SelectionTool {
     this._updateDraggingOutline(selectedMesh);
     this._updateSelectedStlDimension(selectedMesh);
   };
+
+  /**
+   * 开始普通 STL 的 2D 旋转标注拖拽。
+   * @param selectedMesh - 当前选中的普通 STL Mesh
+   */
+  private _beginStlRotateDrag(selectedMesh: THREE.Mesh): void {
+    const pointerAngle: number | null = this._stlRotateDragHelper.computePointerAngle(this._dragRaycaster, selectedMesh);
+    if (pointerAngle === null) {
+      return;
+    }
+
+    /* 旋转拖拽流程：记录起始鼠标角度和 Mesh 位姿，mousemove 中只改变 Y 轴旋转。 */
+    this._isRotatingStl = true;
+    this._skipNextClick = true;
+    this._rotateStartPointerAngle = pointerAngle;
+    this._rotateStartMeshY = selectedMesh.rotation.y;
+    this._rotateStartSnapshot = TransformCommand.capture(selectedMesh);
+    this._rotateSnappedMeshY = null;
+    this._rotateWheelWorldScale = this._computeRotateWheelWorldScale(selectedMesh);
+    this._clearHoverOutline();
+    this._updateSelectedStlDimension(selectedMesh);
+
+    if (this._sceneManager !== null) {
+      BoundingBoxHelper.attachRotatingWheel(
+        selectedMesh,
+        this._sceneManager.getScene(),
+        selectedMesh.rotation.y,
+        this._rotateWheelWorldScale
+      );
+    }
+
+    if (this._domElement !== null) {
+      this._domElement.addEventListener('mousemove', this._onStlRotateMouseMove);
+    }
+  }
+
+  /**
+   * 普通 STL 旋转标注拖拽过程中的鼠标移动处理。
+   * @param event - 鼠标移动事件
+   */
+  private _onStlRotateMouseMove = (event: MouseEvent): void => {
+    if (!this._isRotatingStl || this._camera === null || this._domElement === null) {
+      return;
+    }
+
+    const selectedMesh: THREE.Mesh | null = this._selectionManager.selectedStlMesh;
+    if (selectedMesh === null) {
+      return;
+    }
+
+    const rect: DOMRect = this._domElement.getBoundingClientRect();
+    const ndcX: number = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY: number = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this._dragRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this._camera);
+
+    const pointerAngle: number | null = this._stlRotateDragHelper.computePointerAngle(this._dragRaycaster, selectedMesh);
+    if (pointerAngle === null) {
+      return;
+    }
+
+    /* 根据鼠标绕模型中心的角度差同向更新 Y 轴旋转，并在 45° 倍数处捕获。 */
+    const deltaAngle: number = pointerAngle - this._rotateStartPointerAngle;
+    const rawMeshY: number = this._rotateStartMeshY - deltaAngle;
+    const snappedMeshY: number = this._resolveStlRotateSnappedAngle(rawMeshY);
+    selectedMesh.rotation.y = snappedMeshY;
+    StlRotationAngleHelper.syncUserDataFromMesh(selectedMesh);
+    /* 旋转拖拽实时同步流程：Mesh 角度变化后立即通知属性面板读取最新 rotationAngle，避免等到鼠标松开才刷新。 */
+    this._selectionManager.refreshSelectedStl();
+    selectedMesh.updateMatrixWorld(true);
+
+    if (this._sceneManager !== null) {
+      BoundingBoxHelper.attachRotatingWheel(
+        selectedMesh,
+        this._sceneManager.getScene(),
+        selectedMesh.rotation.y,
+        this._rotateWheelWorldScale
+      );
+    }
+    this._updateSelectedStlDimension(selectedMesh);
+  };
+
+  /**
+   * 计算旋转轮盘拖拽期间使用的固定世界缩放。
+   * 关键流程：拖拽开始时根据当前相机和画布高度计算 1 个逻辑像素对应的世界尺寸，后续轮盘重建始终复用该缩放。
+   * @param selectedMesh - 当前选中的普通 STL Mesh，用于透视相机兜底估算相机距离
+   * @returns 固定世界缩放；无法计算时返回 0 并交由包围盒辅助类使用默认缩放
+   */
+  private _computeRotateWheelWorldScale(selectedMesh: THREE.Mesh): number {
+    if (this._camera === null || this._domElement === null) {
+      return 0;
+    }
+
+    const rendererHeight: number = this._domElement.clientHeight;
+    if (rendererHeight <= 0) {
+      return 0;
+    }
+
+    /* 正交俯视相机下，使用可见高度除以画布高度，得到固定屏幕像素到世界尺寸的换算比例。 */
+    if (this._camera instanceof THREE.OrthographicCamera) {
+      const visibleHeight: number = (this._camera.top - this._camera.bottom) / this._camera.zoom;
+      return visibleHeight / rendererHeight;
+    }
+
+    /* 透视相机兜底：以模型中心到相机距离估算当前屏幕像素对应的世界尺寸。 */
+    if (this._camera instanceof THREE.PerspectiveCamera) {
+      const meshCenter: THREE.Vector3 = new THREE.Vector3();
+      selectedMesh.getWorldPosition(meshCenter);
+      const distanceToCamera: number = meshCenter.distanceTo(this._camera.position);
+      const visibleHeight: number = 2 * Math.tan(THREE.MathUtils.degToRad(this._camera.fov) / 2) * distanceToCamera;
+      return visibleHeight / rendererHeight;
+    }
+
+    return 0;
+  }
+
+  /**
+   * 解析普通 STL 旋转拖拽时的 45° 捕获结果。
+   * 关键流程：原始角接近 45° 倍数时吸附；已捕获时，原始角偏离捕获角超过 6° 才解除并恢复连续变化。
+   * @param rawMeshY - 鼠标实时计算出的原始 Mesh Y 轴旋转角，单位弧度
+   * @returns 实际应用到 Mesh 的 Y 轴旋转角，单位弧度
+   */
+  private _resolveStlRotateSnappedAngle(rawMeshY: number): number {
+    if (this._rotateSnappedMeshY !== null) {
+      const snappedDelta: number = Math.abs(this._normalizeAngleRadians(rawMeshY - this._rotateSnappedMeshY));
+      if (snappedDelta <= STL_ROTATE_SNAP_RELEASE_RADIANS) {
+        return this._rotateSnappedMeshY;
+      }
+
+      this._rotateSnappedMeshY = null;
+      return rawMeshY;
+    }
+
+    const nearestSnapAngle: number = Math.round(rawMeshY / STL_ROTATE_SNAP_STEP_RADIANS) * STL_ROTATE_SNAP_STEP_RADIANS;
+    const nearestSnapDelta: number = Math.abs(this._normalizeAngleRadians(rawMeshY - nearestSnapAngle));
+    if (nearestSnapDelta > STL_ROTATE_SNAP_RELEASE_RADIANS) {
+      return rawMeshY;
+    }
+
+    this._rotateSnappedMeshY = nearestSnapAngle;
+    return nearestSnapAngle;
+  }
+
+  /**
+   * 将角度归一化到 -π 到 π 范围内，便于计算跨 360° 边界的最短角差。
+   * @param angle - 待归一化角度，单位弧度
+   * @returns 归一化后的角度，单位弧度
+   */
+  private _normalizeAngleRadians(angle: number): number {
+    let normalizedAngle: number = angle;
+    while (normalizedAngle > Math.PI) {
+      normalizedAngle -= Math.PI * 2;
+    }
+    while (normalizedAngle < -Math.PI) {
+      normalizedAngle += Math.PI * 2;
+    }
+    return normalizedAngle;
+  }
+
+  /**
+   * 结束普通 STL 旋转标注拖拽，并在旋转变化时写入历史命令。
+   * @param mesh - 当前选中的 STL Mesh
+   */
+  private _endStlRotateDrag(mesh: THREE.Mesh | null): void {
+    if (!this._isRotatingStl) {
+      return;
+    }
+
+    if (this._domElement !== null) {
+      this._domElement.removeEventListener('mousemove', this._onStlRotateMouseMove);
+    }
+
+    if (
+      mesh !== null &&
+      this._historyManager !== null &&
+      this._rotateStartSnapshot !== null &&
+      Math.abs(mesh.rotation.y - this._rotateStartSnapshot.rotation.y) > 0.000001
+    ) {
+      const afterSnapshot: TransformSnapshot = TransformCommand.capture(mesh);
+      this._applyTransformSnapshot(mesh, this._rotateStartSnapshot);
+      const command: TransformCommand = new TransformCommand(
+        mesh,
+        this._rotateStartSnapshot,
+        afterSnapshot,
+        `旋转 STL 模型 "${mesh.name}"`
+      );
+      this._historyManager.execute(command);
+    }
+
+    this._isRotatingStl = false;
+    this._rotateStartSnapshot = null;
+    this._rotateSnappedMeshY = null;
+    this._rotateWheelWorldScale = 0;
+
+    if (mesh !== null) {
+      this._selectionManager.refreshSelectedStlHighlight(this._viewMode);
+      StlRotationAngleHelper.syncUserDataFromMesh(mesh);
+      this._selectionManager.refreshSelectedStl();
+      this._updateSelectedStlDimension(mesh);
+    }
+  }
+
+  /**
+   * 将位姿快照应用到指定对象。
+   * @param target - 目标对象
+   * @param snapshot - 位姿快照
+   */
+  private _applyTransformSnapshot(target: THREE.Object3D, snapshot: TransformSnapshot): void {
+    target.position.set(snapshot.position.x, snapshot.position.y, snapshot.position.z);
+    target.rotation.set(snapshot.rotation.x, snapshot.rotation.y, snapshot.rotation.z);
+    target.scale.set(snapshot.scale.x, snapshot.scale.y, snapshot.scale.z);
+    target.updateMatrix();
+    target.updateMatrixWorld(true);
+  }
 
   /**
    * 根据当前 STL 类型刷新对应动态距离标注。
@@ -2433,6 +3475,18 @@ export class SelectionTool {
       this._dragWallId = null;
       this._dragWallAppliedOffset = { x: 0, z: 0 };
       this._dragWallSnapshot = null;
+    }
+    if (this._isDraggingBeam) {
+      if (this._domElement !== null) {
+        this._domElement.removeEventListener('mousemove', this._onBeamDragMouseMove);
+      }
+      this._resetBeamDragState();
+    }
+    if (this._isDraggingWallJoint) {
+      if (this._domElement !== null) {
+        this._domElement.removeEventListener('mousemove', this._onWallJointDragMouseMove);
+      }
+      this._resetWallJointDragState();
     }
     this._clearDoorWindowDimension();
     this._clearStlPlacementDimension();

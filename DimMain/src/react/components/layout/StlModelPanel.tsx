@@ -8,11 +8,17 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { STL_MODEL_LIST } from '../../../model/StlModelRegistry';
 import { generateStlThumbnail } from '../../../model/StlPreviewRenderer';
+import { resolveStlModelIconByName } from '../../../model/StlModelIconResolver';
 import { useStlPlaceBridge } from '../../context/StlPlaceContext';
 import { useViewMode } from '../../context/ViewModeContext';
 import type { StlModelDef } from '../../../model/StlModelRegistry';
 import type { StlPlaceBridge } from '../../context/StlPlaceContext';
 import type { ViewModeContextValue } from '../../context/ViewModeContext';
+
+/** 普通 STL 模型列表：门窗模型放入基础几何体分组，不在 CAD 模型分组生成缩略图。 */
+const CAD_STL_MODEL_LIST: StlModelDef[] = STL_MODEL_LIST.filter(
+  (model: StlModelDef): boolean => model.category === 'model'
+);
 
 /**
  * STL 模型面板
@@ -30,14 +36,14 @@ export function StlModelPanel(): React.ReactElement {
   /** 视图模式上下文：布置前强制切换到 2D */
   const { setViewMode }: ViewModeContextValue = useViewMode();
 
-  /* 组件挂载时异步生成所有模型的缩略图 */
+  /* 组件挂载时异步生成普通模型缩略图，门窗模型使用基础几何体小图标展示，不参与 STL 渲染预览。 */
   useEffect((): (() => void) => {
     let cancelled: boolean = false;
 
     const loadThumbnails = async (): Promise<void> => {
       const newMap: Map<string, string> = new Map();
 
-      for (const model of STL_MODEL_LIST) {
+      for (const model of CAD_STL_MODEL_LIST) {
         if (cancelled) {
           return;
         }
@@ -92,8 +98,9 @@ export function StlModelPanel(): React.ReactElement {
 
       {/* 模型卡片网格 */}
       <div style={gridStyle}>
-        {STL_MODEL_LIST.map((model: StlModelDef): React.ReactElement => {
+        {CAD_STL_MODEL_LIST.map((model: StlModelDef): React.ReactElement => {
           const thumbUrl: string | undefined = thumbnails.get(model.id);
+          const displayIcon: string = resolveStlModelIconByName(model.name, model.icon);
 
           return (
             <button
@@ -113,7 +120,7 @@ export function StlModelPanel(): React.ReactElement {
                   />
                 ) : (
                   /* 加载中使用 emoji 占位 */
-                  <span style={emojiStyle}>{model.icon}</span>
+                  <span style={emojiStyle}>{displayIcon}</span>
                 )}
               </div>
 

@@ -5,6 +5,7 @@
 
 import React from 'react';
 import { PanelManager } from '../../panel/PanelManager';
+import { PropertyPanelController } from '../../panel/PropertyPanelController';
 
 /**
  * PanelContext 值类型
@@ -12,6 +13,8 @@ import { PanelManager } from '../../panel/PanelManager';
 export interface PanelContextValue {
   /** 面板管理器实例 */
   panelManager: PanelManager;
+  /** 右侧属性面板统一调用控制器 */
+  propertyPanelController: PropertyPanelController;
 }
 
 /**

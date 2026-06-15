@@ -19,10 +19,25 @@ import type {
   PlanarPlacementSnapResult,
 } from './PlanarPlacementSnapTypes';
 
+/** 平面布置内部线捕获目标类型，额外包含绘制过程中的临时正交线 */
+type PlanarPlacementInternalLineTargetType = 'extension-line' | 'endpoint-normal-line' | 'orthogonal';
+
+/** 平面布置内部线捕获目标，统一描述实体捕获线和临时正交捕获线 */
+interface PlanarPlacementInternalLineTarget {
+  /** 捕获目标类型 */
+  type: PlanarPlacementInternalLineTargetType;
+  /** 来源对象 ID；正交线不来源于已有对象，因此为 null */
+  objectId: string | null;
+  /** 线目标起点 */
+  start: Point2D;
+  /** 线目标终点 */
+  end: Point2D;
+}
+
 /** 捕获线命中候选项，携带投影点和显示虚线用于计算单线落点或双线交点 */
 interface PlanarPlacementLineSnapCandidate {
   /** 来源线捕获目标 */
-  target: PlanarPlacementLineTarget;
+  target: PlanarPlacementInternalLineTarget;
   /** 鼠标点投影到捕获线后的点 */
   projectedPoint: Point2D;
   /** 当前捕获线显示虚线 */
@@ -56,7 +71,7 @@ const MIN_LINE_LENGTH: number = 0.001;
 
 /**
  * 平面线式布置统一捕获服务
- * 关键流程：先收集强点目标，再计算延长线目标，最后在没有强捕获时应用正交约束。
+ * 关键流程：先收集强点目标，再把实体线目标和临时正交线统一为线候选，支持线线交点捕获。
  */
 export class PlanarPlacementSnapService {
   /** 捕获目标来源对象读取函数 */
@@ -80,23 +95,23 @@ export class PlanarPlacementSnapService {
     rawPoint: Point2D,
     threshold: number,
     orthogonalAnchor: Point2D | null,
-    guideHalfLength: number = GUIDE_HALF_LENGTH
+    guideHalfLength: number = GUIDE_HALF_LENGTH,
+    excludedObjectIds: Set<string> | null = null
   ): PlanarPlacementSnapResult {
-    const pointSnapResult: PlanarPlacementSnapResult | null = this._snapToPointTargets(rawPoint, threshold);
+    const pointSnapResult: PlanarPlacementSnapResult | null = this._snapToPointTargets(rawPoint, threshold, excludedObjectIds);
     if (pointSnapResult !== null) {
       return pointSnapResult;
     }
 
-    const lineSnapResult: PlanarPlacementSnapResult | null = this._snapToLineTargets(rawPoint, threshold, guideHalfLength);
+    const lineSnapResult: PlanarPlacementSnapResult | null = this._snapToLineTargets(
+      rawPoint,
+      threshold,
+      guideHalfLength,
+      excludedObjectIds,
+      orthogonalAnchor
+    );
     if (lineSnapResult !== null) {
       return lineSnapResult;
-    }
-
-    if (orthogonalAnchor !== null) {
-      const orthogonalResult: PlanarPlacementSnapResult | null = this._snapToOrthogonal(rawPoint, orthogonalAnchor, guideHalfLength);
-      if (orthogonalResult !== null) {
-        return orthogonalResult;
-      }
     }
 
     return {
@@ -114,11 +129,15 @@ export class PlanarPlacementSnapService {
    * 收集所有平面点捕获目标
    * @returns 端点、中点、圆弧圆心和整圆圆心目标列表
    */
-  private _collectPointTargets(): PlanarPlacementPointTarget[] {
+  private _collectPointTargets(excludedObjectIds: Set<string> | null): PlanarPlacementPointTarget[] {
     const targets: PlanarPlacementPointTarget[] = [];
     const objects: BuildingObject[] = this._getObjects();
 
     for (const object of objects) {
+      if (excludedObjectIds !== null && excludedObjectIds.has(object.id)) {
+        /* 拖拽捕获流程：排除正在移动的对象，避免对象捕获到自身当前位置造成抖动或无法移动。 */
+        continue;
+      }
       if (object.category === 'wall') {
         this._appendWallPointTargets(targets, object as WallData);
       } else if (object.category === 'beam') {
@@ -135,11 +154,15 @@ export class PlanarPlacementSnapService {
    * 收集所有平面线捕获目标
    * @returns 墙和梁中心线延长线、端点 XZ 法向延长线目标列表
    */
-  private _collectLineTargets(): PlanarPlacementLineTarget[] {
+  private _collectLineTargets(excludedObjectIds: Set<string> | null): PlanarPlacementLineTarget[] {
     const targets: PlanarPlacementLineTarget[] = [];
     const objects: BuildingObject[] = this._getObjects();
 
     for (const object of objects) {
+      if (excludedObjectIds !== null && excludedObjectIds.has(object.id)) {
+        /* 拖拽捕获流程：排除正在移动的对象，线目标也不参与自身捕获。 */
+        continue;
+      }
       if (object.category === 'wall') {
         const wallData: WallData = object as WallData;
         if (wallData.subType === 'straight') {
@@ -281,8 +304,8 @@ export class PlanarPlacementSnapService {
    * @param threshold - 捕获阈值
    * @returns 点捕获结果或 null
    */
-  private _snapToPointTargets(rawPoint: Point2D, threshold: number): PlanarPlacementSnapResult | null {
-    const targets: PlanarPlacementPointTarget[] = this._collectPointTargets();
+  private _snapToPointTargets(rawPoint: Point2D, threshold: number, excludedObjectIds: Set<string> | null): PlanarPlacementSnapResult | null {
+    const targets: PlanarPlacementPointTarget[] = this._collectPointTargets(excludedObjectIds);
     let nearestTarget: PlanarPlacementPointTarget | null = null;
     let nearestDistance: number = Number.POSITIVE_INFINITY;
 
@@ -316,11 +339,17 @@ export class PlanarPlacementSnapService {
    * @param guideHalfLength - 辅助虚线半长
    * @returns 线捕获结果或 null
    */
-  private _snapToLineTargets(rawPoint: Point2D, threshold: number, guideHalfLength: number): PlanarPlacementSnapResult | null {
-    const targets: PlanarPlacementLineTarget[] = this._collectLineTargets();
+  private _snapToLineTargets(
+    rawPoint: Point2D,
+    threshold: number,
+    guideHalfLength: number,
+    excludedObjectIds: Set<string> | null,
+    orthogonalAnchor: Point2D | null
+  ): PlanarPlacementSnapResult | null {
+    const targets: PlanarPlacementLineTarget[] = this._collectLineTargets(excludedObjectIds);
     const candidates: PlanarPlacementLineSnapCandidate[] = [];
 
-    /* 线捕获关键流程：先收集阈值内所有有效捕获线，单线返回投影点，双线返回交点。 */
+    /* 线捕获关键流程：先收集阈值内所有实体捕获线，随后追加可触发的正交线，单线返回投影点，双线返回交点。 */
     for (const target of targets) {
       const projectedPoint: Point2D | null = this._projectToInfiniteLine(rawPoint, target.start, target.end);
       if (projectedPoint === null) {
@@ -351,6 +380,14 @@ export class PlanarPlacementSnapService {
         distance: distance,
       });
     }
+
+    this._appendOrthogonalLineCandidate(
+      candidates,
+      rawPoint,
+      threshold,
+      guideHalfLength,
+      orthogonalAnchor
+    );
 
     if (candidates.length === 0) {
       return null;
@@ -390,11 +427,13 @@ export class PlanarPlacementSnapService {
     }
 
     const singleGuideLines: PlanarPlacementGuideLine[] = [nearestCandidate.guideLine];
+    const singleSnapType: 'extension-line' | 'endpoint-normal-line' | 'orthogonal' = nearestCandidate.target.type;
+    const singleShowSnapPoint: boolean = nearestCandidate.target.type === 'orthogonal';
 
     return {
       snapped: true,
-      showSnapPoint: false,
-      type: nearestCandidate.target.type,
+      showSnapPoint: singleShowSnapPoint,
+      type: singleSnapType,
       position: nearestCandidate.projectedPoint,
       objectId: nearestCandidate.target.objectId,
       guideLine: nearestCandidate.guideLine,
@@ -446,7 +485,7 @@ export class PlanarPlacementSnapService {
    * @returns 主辅助虚线；无效线返回 null
    */
   private _buildPrimaryLineGuideLine(
-    target: PlanarPlacementLineTarget,
+    target: PlanarPlacementInternalLineTarget,
     snappedPoint: Point2D,
     guideHalfLength: number
   ): PlanarPlacementGuideLine | null {
@@ -464,6 +503,99 @@ export class PlanarPlacementSnapService {
       return ENDPOINT_NORMAL_LINE_PRIORITY;
     }
     return EXTENSION_LINE_PRIORITY;
+  }
+
+  /**
+   * 追加正交线捕获候选
+   * 关键流程：仅在线式布置存在起点且鼠标方向接近水平/垂直时，把正交约束转换为临时无限线候选，参与后续线线交点计算。
+   * @param candidates - 当前捕获候选列表
+   * @param rawPoint - 原始鼠标投射点
+   * @param threshold - 捕获距离阈值；正交线保留角度触发逻辑，不用距离阈值强制裁剪
+   * @param guideHalfLength - 辅助虚线半长
+   * @param orthogonalAnchor - 正交约束锚点；不存在时不追加正交线
+   */
+  private _appendOrthogonalLineCandidate(
+    candidates: PlanarPlacementLineSnapCandidate[],
+    rawPoint: Point2D,
+    threshold: number,
+    guideHalfLength: number,
+    orthogonalAnchor: Point2D | null
+  ): void {
+    if (orthogonalAnchor === null) {
+      return;
+    }
+
+    const dx: number = rawPoint.x - orthogonalAnchor.x;
+    const dz: number = rawPoint.z - orthogonalAnchor.z;
+    const length: number = Math.sqrt(dx * dx + dz * dz);
+    if (length < MIN_LINE_LENGTH) {
+      return;
+    }
+
+    const sinThreshold: number = Math.sin(ORTHOGONAL_ANGLE_THRESHOLD_RADIAN);
+    const horizontalOffsetRatio: number = Math.abs(dz) / length;
+    const verticalOffsetRatio: number = Math.abs(dx) / length;
+
+    let projectedPoint: Point2D | null = null;
+    let target: PlanarPlacementInternalLineTarget | null = null;
+    if (horizontalOffsetRatio <= sinThreshold) {
+      projectedPoint = { x: rawPoint.x, z: orthogonalAnchor.z };
+      target = {
+        type: 'orthogonal',
+        objectId: null,
+        start: orthogonalAnchor,
+        end: { x: orthogonalAnchor.x + 1, z: orthogonalAnchor.z },
+      };
+    } else if (verticalOffsetRatio <= sinThreshold) {
+      projectedPoint = { x: orthogonalAnchor.x, z: rawPoint.z };
+      target = {
+        type: 'orthogonal',
+        objectId: null,
+        start: orthogonalAnchor,
+        end: { x: orthogonalAnchor.x, z: orthogonalAnchor.z + 1 },
+      };
+    }
+
+    if (projectedPoint === null || target === null) {
+      return;
+    }
+
+    const guideLine: PlanarPlacementGuideLine | null = this._buildOrthogonalGuideLine(
+      target,
+      projectedPoint,
+      guideHalfLength
+    );
+    if (guideLine === null) {
+      return;
+    }
+
+    candidates.push({
+      target: target,
+      projectedPoint: projectedPoint,
+      guideLine: guideLine,
+      priority: ENDPOINT_NORMAL_LINE_PRIORITY + 1,
+      distance: Math.min(this._distance(rawPoint, projectedPoint), threshold),
+    });
+  }
+
+  /**
+   * 构建正交捕获辅助虚线
+   * @param target - 正交内部线目标
+   * @param snappedPoint - 当前正交投影点
+   * @param guideHalfLength - 辅助虚线半长
+   * @returns 正交辅助虚线；目标无效时返回 null
+   */
+  private _buildOrthogonalGuideLine(
+    target: PlanarPlacementInternalLineTarget,
+    snappedPoint: Point2D,
+    guideHalfLength: number
+  ): PlanarPlacementGuideLine | null {
+    return this._buildExtensionGuideLine(
+      target.start,
+      target.end,
+      snappedPoint,
+      Math.max(guideHalfLength, ORTHOGONAL_GUIDE_HALF_LENGTH)
+    );
   }
 
   /**
@@ -582,8 +714,8 @@ export class PlanarPlacementSnapService {
    * @returns 已存在同位置辅助线时返回 true
    */
   private _hasSimilarGuideLine(
-    existingTargets: PlanarPlacementLineTarget[],
-    candidateTarget: PlanarPlacementLineTarget
+    existingTargets: PlanarPlacementInternalLineTarget[],
+    candidateTarget: PlanarPlacementInternalLineTarget
   ): boolean {
     const directionCosineThreshold: number = Math.cos(Math.PI / 180);
     const candidateDirection: Point2D | null = this._normalizeLineDirection(candidateTarget.start, candidateTarget.end);
@@ -605,60 +737,6 @@ export class PlanarPlacementSnapService {
     }
 
     return false;
-  }
-
-  /**
-   * 对线式布置第二点执行水平/垂直正交约束
-   * @param rawPoint - 原始点
-   * @param anchor - 布置线起点
-   * @param guideHalfLength - 辅助虚线半长
-   * @returns 正交捕获结果或 null
-   */
-  private _snapToOrthogonal(rawPoint: Point2D, anchor: Point2D, guideHalfLength: number): PlanarPlacementSnapResult | null {
-    const dx: number = rawPoint.x - anchor.x;
-    const dz: number = rawPoint.z - anchor.z;
-    const length: number = Math.sqrt(dx * dx + dz * dz);
-    if (length < MIN_LINE_LENGTH) {
-      return null;
-    }
-
-    const sinThreshold: number = Math.sin(ORTHOGONAL_ANGLE_THRESHOLD_RADIAN);
-    const horizontalOffsetRatio: number = Math.abs(dz) / length;
-    const verticalOffsetRatio: number = Math.abs(dx) / length;
-
-    let snappedPoint: Point2D | null = null;
-    let guideDirectionX: number = 0;
-    let guideDirectionZ: number = 0;
-    if (horizontalOffsetRatio <= sinThreshold) {
-      snappedPoint = { x: rawPoint.x, z: anchor.z };
-      guideDirectionX = 1;
-      guideDirectionZ = 0;
-    } else if (verticalOffsetRatio <= sinThreshold) {
-      snappedPoint = { x: anchor.x, z: rawPoint.z };
-      guideDirectionX = 0;
-      guideDirectionZ = 1;
-    }
-
-    if (snappedPoint === null) {
-      return null;
-    }
-
-    const guideLine: PlanarPlacementGuideLine = this._buildGuideLineByDirection(
-      snappedPoint,
-      guideDirectionX,
-      guideDirectionZ,
-      Math.max(guideHalfLength, ORTHOGONAL_GUIDE_HALF_LENGTH)
-    );
-
-    return {
-      snapped: true,
-      showSnapPoint: true,
-      type: 'orthogonal',
-      position: snappedPoint,
-      objectId: null,
-      guideLine: guideLine,
-      guideLines: [guideLine],
-    };
   }
 
   /**

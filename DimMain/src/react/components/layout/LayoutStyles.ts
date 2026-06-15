@@ -224,6 +224,233 @@ export const rightPanelStyle: React.CSSProperties = {
   overflowX: 'hidden',
 };
 
+/** 照片存储栏容器：复用右侧栏宽度，确保场景/模型菜单切换时视口宽度稳定。 */
+export const photoStoragePanelStyle: React.CSSProperties = {
+  width: RIGHT_PANEL_WIDTH,
+  minWidth: RIGHT_PANEL_WIDTH,
+  height: '100%',
+  backgroundColor: '#fff',
+  borderLeft: '1px solid #e0e0e0',
+  display: 'flex',
+  flexDirection: 'column',
+  overflowY: 'auto',
+  overflowX: 'hidden',
+};
+
+/** 照片存储栏标题区域。 */
+export const photoStorageTitleStyle: React.CSSProperties = {
+  padding: '12px 16px',
+  fontSize: 16,
+  fontWeight: 600,
+  borderBottom: '1px solid #e8e8e8',
+};
+
+/** 照片存储栏内容区域。 */
+export const photoStorageContentStyle: React.CSSProperties = {
+  flex: 1,
+  padding: 16,
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 12,
+};
+
+/** 照片存储栏空状态提示。 */
+export const photoStorageEmptyStyle: React.CSSProperties = {
+  padding: 20,
+  border: '1px dashed #d8d8d8',
+  borderRadius: 8,
+  color: '#999',
+  fontSize: 12,
+  lineHeight: 1.6,
+  textAlign: 'center',
+  backgroundColor: '#fafafa',
+};
+
+/** 照片存储列表容器。 */
+export const photoStorageListStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 12,
+};
+
+/** 照片卡片容器。 */
+export const photoStorageCardStyle: React.CSSProperties = {
+  border: '1px solid #e8e8e8',
+  borderRadius: 10,
+  backgroundColor: '#fff',
+  overflow: 'hidden',
+  boxShadow: '0 2px 8px rgba(0, 0, 0, 0.04)',
+};
+
+/** 照片缩略图按钮。 */
+export const photoStorageImageStyle: React.CSSProperties = {
+  display: 'block',
+  width: '100%',
+  height: 132,
+  padding: 0,
+  border: 'none',
+  backgroundColor: '#f4f4f6',
+  cursor: 'pointer',
+  overflow: 'hidden',
+};
+
+/** 照片元信息区域。 */
+export const photoStorageMetaStyle: React.CSSProperties = {
+  padding: '10px 12px 8px',
+};
+
+/** 照片名称。 */
+export const photoStorageNameStyle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 600,
+  color: '#333',
+  whiteSpace: 'nowrap',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+};
+
+/** 照片拍摄时间。 */
+export const photoStorageTimeStyle: React.CSSProperties = {
+  marginTop: 4,
+  fontSize: 11,
+  color: '#888',
+};
+
+/** 照片操作按钮区域。 */
+export const photoStorageActionsStyle: React.CSSProperties = {
+  display: 'flex',
+  gap: 8,
+  padding: '0 12px 12px',
+};
+
+/** 照片普通操作按钮。 */
+export const photoStorageActionButtonStyle: React.CSSProperties = {
+  flex: 1,
+  height: 28,
+  border: '1px solid #d8d8d8',
+  borderRadius: 6,
+  backgroundColor: '#fafafa',
+  color: '#555',
+  cursor: 'pointer',
+  fontSize: 12,
+};
+
+/** 照片删除按钮。 */
+export const photoStorageDeleteButtonStyle: React.CSSProperties = {
+  ...photoStorageActionButtonStyle,
+  border: '1px solid #ffd2d2',
+  backgroundColor: '#fff7f7',
+  color: '#d9363e',
+};
+
+/** 照片预览遮罩层。 */
+export const photoPreviewOverlayStyle: React.CSSProperties = {
+  position: 'fixed',
+  left: 0,
+  top: 0,
+  right: 0,
+  bottom: 0,
+  zIndex: 9999,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: 32,
+  backgroundColor: 'rgba(0, 0, 0, 0.58)',
+};
+
+/** 照片预览弹窗容器。 */
+export const photoPreviewDialogStyle: React.CSSProperties = {
+  width: 'min(960px, 92vw)',
+  maxHeight: '88vh',
+  display: 'flex',
+  flexDirection: 'column',
+  borderRadius: 12,
+  overflow: 'hidden',
+  backgroundColor: '#fff',
+  boxShadow: '0 16px 48px rgba(0, 0, 0, 0.32)',
+};
+
+/** 照片预览标题栏。 */
+export const photoPreviewHeaderStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 16,
+  padding: '12px 16px',
+  borderBottom: '1px solid #eeeeee',
+};
+
+/** 照片预览标题文字。 */
+export const photoPreviewTitleStyle: React.CSSProperties = {
+  minWidth: 0,
+  color: '#222',
+  fontSize: 14,
+  fontWeight: 600,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+/** 照片预览关闭按钮。 */
+export const photoPreviewCloseButtonStyle: React.CSSProperties = {
+  height: 30,
+  padding: '0 12px',
+  border: '1px solid #d8d8d8',
+  borderRadius: 6,
+  backgroundColor: '#fafafa',
+  color: '#444',
+  cursor: 'pointer',
+  fontSize: 12,
+};
+
+/** 照片预览图片承载区域。 */
+export const photoPreviewImageWrapStyle: React.CSSProperties = {
+  flex: 1,
+  minHeight: 240,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  padding: 16,
+  backgroundColor: '#202028',
+  overflow: 'auto',
+};
+
+/** 照片预览大图。 */
+export const photoPreviewImageStyle: React.CSSProperties = {
+  maxWidth: '100%',
+  maxHeight: '62vh',
+  objectFit: 'contain',
+  borderRadius: 6,
+};
+
+/** 照片预览底部信息栏。 */
+export const photoPreviewFooterStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 16,
+  padding: '12px 16px',
+  borderTop: '1px solid #eeeeee',
+};
+
+/** 照片预览信息文本。 */
+export const photoPreviewInfoStyle: React.CSSProperties = {
+  color: '#666',
+  fontSize: 12,
+};
+
+/** 照片预览主操作按钮。 */
+export const photoPreviewPrimaryButtonStyle: React.CSSProperties = {
+  height: 32,
+  padding: '0 14px',
+  border: '1px solid #4a6cf7',
+  borderRadius: 6,
+  backgroundColor: '#4a6cf7',
+  color: '#fff',
+  cursor: 'pointer',
+  fontSize: 12,
+};
+
 /** 属性分组标题行 */
 export const propertyGroupHeaderStyle: React.CSSProperties = {
   display: 'flex',

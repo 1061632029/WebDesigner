@@ -138,6 +138,11 @@ export function BuildingProvider(props: { children: React.ReactNode }): React.Re
       /* 对象更新流程不一定改变总数，例如墙体拖拽刷新楼板 outline；此处递增版本号确保楼板、天花板和标注组件同步刷新。 */
       setObjectCount((currentVersion: number): number => currentVersion + 1);
     });
+    const unsubSelection: () => void = selMgr.onChange((selectedIds: ReadonlySet<string>): void => {
+      /* 选中状态同步流程：弧形墙半径/角度常驻标注只在对应弧墙被点选时显示。 */
+      tool.setSelectedWallIds(selectedIds);
+    });
+    tool.setSelectedWallIds(selMgr.selectedIds);
 
     /* 暴露给子组件 */
     setObjectManager(objMgr);
@@ -160,6 +165,7 @@ export function BuildingProvider(props: { children: React.ReactNode }): React.Re
     return (): void => {
       unsubTool();
       unsubObj();
+      unsubSelection();
       tool.dispose();
       /* 选中管理器先释放（避免 dispose 时仍引用已释放的 mesh） */
       selMgr.dispose();

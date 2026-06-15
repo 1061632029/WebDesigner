@@ -34,8 +34,11 @@ import { useFitSceneBridge } from '../react/context/FitSceneContext';
 import type { FitSceneBridge } from '../react/context/FitSceneContext';
 import { useClearSceneBridge } from '../react/context/ClearSceneContext';
 import type { ClearSceneBridge } from '../react/context/ClearSceneContext';
+import { useRoomScreenshotBridge } from '../react/context/RoomScreenshotContext';
+import type { RoomScreenshotBridge } from '../react/context/RoomScreenshotContext';
 import { fitSceneToView } from '../camera/FitSceneUtil';
 import type { OrbitControlsWrapper } from '../camera/OrbitControlsWrapper';
+import { captureRoomScreenshot, DEFAULT_ROOM_SCREENSHOT_OPTIONS } from '../utils/RoomScreenshotUtil';
 import { RaycastHelper } from '../interaction/RaycastHelper';
 import { IndoorVisibilityController } from '../interaction/IndoorVisibilityController';
 import { ClearSceneCommand } from '../history/commands/ClearSceneCommand';
@@ -410,6 +413,9 @@ function WallDrawSceneInner(): React.ReactElement {
       {/* 清空场景处理器：注入 clearScene 回调到 ClearSceneBridge */}
       <ClearSceneHandler />
 
+      {/* 房间拍摄处理器：注入按房间空间裁剪的截图回调 */}
+      <RoomScreenshotHandler />
+
       {/* 标注显隐控制器：3D 模式隐藏标注，2D 模式显示标注 */}
       <AnnotationVisibilityController />
 
@@ -446,6 +452,9 @@ function StlPlaceHandler(): null {
 
   /** StlPlaceTool 实例（随 Engine 创建一次） */
   const toolRef: React.MutableRefObject<StlPlaceTool | null> = useRef<StlPlaceTool | null>(null);
+
+  /** 上一次视图模式，用于识别从 2D 切换到 3D 的布置取消场景 */
+  const previousViewModeRef: React.MutableRefObject<ViewMode> = useRef<ViewMode>(viewMode);
 
   useEffect((): (() => void) => {
     /* 创建布置工具（传入 historyManager，放置操作支持撤销/重做） */
@@ -499,15 +508,33 @@ function StlPlaceHandler(): null {
   }, [engine, bridge, buildingCtx.objectManager, buildingCtx.drawTool, buildingCtx.setInteractionMode]);
 
   /**
-   * 视图模式变化时同步到 StlPlaceTool
-   * 2D 模式下布置预览时显示平面投影包围盒
+   * 视图模式变化时同步布置工具状态。
+   * 2D 切换到 3D 时取消模型布置和墙/梁线式布置，避免三维模式继续保留布置状态。
    */
   useEffect((): void => {
+    const previousViewMode: ViewMode = previousViewModeRef.current;
+    const switchedFrom2DTo3D: boolean = previousViewMode === '2d' && viewMode === '3d';
+
+    if (switchedFrom2DTo3D && buildingCtx.drawTool !== null && buildingCtx.drawTool.mode !== 'none') {
+      /* 墙/梁布置取消流程：复用 WallDrawTool.deactivate，统一清理预览线、起点、吸附点、矩形墙尺寸标注和事件监听。 */
+      buildingCtx.drawTool.deactivate();
+      buildingCtx.setInteractionMode('select');
+    }
+
     const tool: StlPlaceTool | null = toolRef.current;
     if (tool !== null) {
+      const shouldCancelPlacement: boolean = switchedFrom2DTo3D && tool.isActive;
+      if (shouldCancelPlacement) {
+        /* 模型布置取消流程：复用工具自身 deactivate，统一清理预览 Mesh、距离标注、洞口预览和事件监听。 */
+        tool.deactivate();
+        buildingCtx.setInteractionMode('select');
+      }
+
       tool.setViewMode(viewMode);
     }
-  }, [viewMode]);
+
+    previousViewModeRef.current = viewMode;
+  }, [viewMode, buildingCtx.drawTool, buildingCtx.setInteractionMode]);
 
   return null;
 }
@@ -654,6 +681,47 @@ function ClearSceneHandler(): null {
       bridge.clearSceneRef.current = null;
     };
   }, [engine, buildingCtx.objectManager, bridge, historyManager, selection]);
+
+  return null;
+}
+
+/**
+ * 房间拍摄处理器
+ * 在 Canvas 内部获取 Engine / BuildingObjectManager，向 RoomScreenshotBridge 注入真实房间截图裁剪逻辑。
+ */
+function RoomScreenshotHandler(): null {
+  const engine: Engine = useEngine();
+  const buildingCtx: BuildingContextValue = useBuildingContext();
+  const bridge: RoomScreenshotBridge = useRoomScreenshotBridge();
+
+  useEffect((): (() => void) => {
+    /**
+     * 执行房间拍摄。
+     * @returns 裁剪后的 PNG DataURL
+     */
+    bridge.captureRoomScreenshotRef.current = (): string => {
+      if (engine.renderer === null) {
+        console.warn('[RoomScreenshotHandler] 渲染器尚未初始化，无法拍摄房间');
+        return '';
+      }
+
+      if (buildingCtx.objectManager === null) {
+        console.warn('[RoomScreenshotHandler] 建筑对象管理器尚未就绪，无法拍摄房间');
+        return engine.renderer.domElement.toDataURL('image/png');
+      }
+
+      const camera: THREE.Camera = engine.cameraManager.getActiveCamera();
+      const scene: THREE.Scene = engine.sceneManager.getScene();
+      const canvas: HTMLCanvasElement = engine.renderer.domElement;
+      /* 拍摄前主动渲染当前场景一帧，确保 Canvas 缓冲中存在最新可读取画面。 */
+      engine.renderer.render(scene, camera);
+      return captureRoomScreenshot(canvas, camera, buildingCtx.objectManager, DEFAULT_ROOM_SCREENSHOT_OPTIONS);
+    };
+
+    return (): void => {
+      bridge.captureRoomScreenshotRef.current = null;
+    };
+  }, [engine, buildingCtx.objectManager, bridge]);
 
   return null;
 }

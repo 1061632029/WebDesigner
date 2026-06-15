@@ -14,7 +14,7 @@ import type {
   WallSubtractionRect,
   WallOpening,
 } from './BuildingTypes';
-import { getDefaultMaterial } from './BuildingTypes';
+import { WALL_DEFAULTS, getDefaultMaterial } from './BuildingTypes';
 
 /**
  * 墙体几何构建器
@@ -222,7 +222,10 @@ export class WallGeometryBuilder {
    * @param data - 弧形墙数据
    * @returns BufferGeometry
    */
-  private _buildArcWall(data: ArcWallData): THREE.BufferGeometry {
+  private _buildArcWall(
+    data: ArcWallData,
+    miter: MiterParams = WallGeometryBuilder.NO_MITER
+  ): THREE.BufferGeometry {
     const segments: number = data.segments;
     const halfThick: number = data.thickness / 2;
     const elevation: number = data.elevation;
@@ -243,9 +246,12 @@ export class WallGeometryBuilder {
     const uvs: number[] = [];
     const indices: number[] = [];
 
-    /* 为每个中心线点计算内外侧偏移点 */
+    /* 为每个中心线点计算内外侧偏移点，同时缓存该采样点的平滑侧面法线。
+     * 弧形墙外/内侧面会复用这些采样点顶点生成连续条带，避免每段独立四边形产生可见竖向拼缝。
+     */
     const outerPoints: Point2D[] = [];
     const innerPoints: Point2D[] = [];
+    const sideNormals: Point2D[] = [];
 
     for (let i: number = 0; i < centerPoints.length; i++) {
       /* 计算该点处的法线方向 */
@@ -292,8 +298,51 @@ export class WallGeometryBuilder {
         nz = avgLen > 0.001 ? avgZ / avgLen : n1z;
       }
 
+      sideNormals.push({ x: nx, z: nz });
       outerPoints.push({ x: cp.x + nx * halfThick, z: cp.z + nz * halfThick });
       innerPoints.push({ x: cp.x - nx * halfThick, z: cp.z - nz * halfThick });
+    }
+
+    /*
+     * 弧形墙端部裁剪：沿端点切线方向分别移动外侧/内侧角点。
+     * start 端使用第一段切线朝墙体内部缩进，end 端使用最后一段切线反向朝墙体内部缩进，
+     * 从而让弧墙在与直墙或另一段弧墙衔接时形成斜切端面。
+     */
+    const firstCenterPoint: Point2D = centerPoints[0]!;
+    const secondCenterPoint: Point2D = centerPoints[1]!;
+    const startTangentX: number = secondCenterPoint.x - firstCenterPoint.x;
+    const startTangentZ: number = secondCenterPoint.z - firstCenterPoint.z;
+    const startTangentLength: number = Math.sqrt(startTangentX * startTangentX + startTangentZ * startTangentZ);
+    if (startTangentLength > 0.001) {
+      const startInwardX: number = startTangentX / startTangentLength;
+      const startInwardZ: number = startTangentZ / startTangentLength;
+      outerPoints[0] = {
+        x: outerPoints[0]!.x + startInwardX * miter.start.frontOffset,
+        z: outerPoints[0]!.z + startInwardZ * miter.start.frontOffset,
+      };
+      innerPoints[0] = {
+        x: innerPoints[0]!.x + startInwardX * miter.start.backOffset,
+        z: innerPoints[0]!.z + startInwardZ * miter.start.backOffset,
+      };
+    }
+
+    const lastCenterIndex: number = centerPoints.length - 1;
+    const lastCenterPoint: Point2D = centerPoints[lastCenterIndex]!;
+    const previousCenterPoint: Point2D = centerPoints[lastCenterIndex - 1]!;
+    const endTangentX: number = lastCenterPoint.x - previousCenterPoint.x;
+    const endTangentZ: number = lastCenterPoint.z - previousCenterPoint.z;
+    const endTangentLength: number = Math.sqrt(endTangentX * endTangentX + endTangentZ * endTangentZ);
+    if (endTangentLength > 0.001) {
+      const endInwardX: number = -endTangentX / endTangentLength;
+      const endInwardZ: number = -endTangentZ / endTangentLength;
+      outerPoints[lastCenterIndex] = {
+        x: outerPoints[lastCenterIndex]!.x + endInwardX * miter.end.frontOffset,
+        z: outerPoints[lastCenterIndex]!.z + endInwardZ * miter.end.frontOffset,
+      };
+      innerPoints[lastCenterIndex] = {
+        x: innerPoints[lastCenterIndex]!.x + endInwardX * miter.end.backOffset,
+        z: innerPoints[lastCenterIndex]!.z + endInwardZ * miter.end.backOffset,
+      };
     }
 
     const yBottom: number = elevation;
@@ -317,52 +366,59 @@ export class WallGeometryBuilder {
      * materialIndex: 0=外侧面, 1=内侧面, 2=顶面, 3=底面, 4=起点端面, 5=终点端面
      */
 
-    /* ===== 外侧面 (materialIndex=0) ===== */
+    /* ===== 外侧面 (materialIndex=0) =====
+     * 关键流程：外侧弧面使用同一组底/顶采样顶点组成连续条带，段与段之间共享顶点和插值法线。
+     * 这样可以从拓扑层面取消独立面片造成的竖向明暗接缝，并保留弧线边界采样精度。
+     */
     const outerIndexStart: number = indices.length;
+    const outerBaseIdx: number = positions.length / 3;
     for (let i: number = 0; i < centerPoints.length - 1; i++) {
-      const baseIdx: number = positions.length / 3;
-      const o0: Point2D = outerPoints[i]!;
-      const o1: Point2D = outerPoints[i + 1]!;
-      const segDx: number = o1.x - o0.x;
-      const segDz: number = o1.z - o0.z;
-      const segLen: number = Math.sqrt(segDx * segDx + segDz * segDz);
-      const faceNx: number = segLen > 0 ? -segDz / segLen : 0;
-      const faceNz: number = segLen > 0 ? segDx / segLen : 0;
-
-      positions.push(o0.x, yBottom, o0.z, o1.x, yBottom, o1.z, o1.x, yTop, o1.z, o0.x, yTop, o0.z);
-      normalsArr.push(faceNx, 0, faceNz, faceNx, 0, faceNz, faceNx, 0, faceNz, faceNx, 0, faceNz);
-
-      /* UV：U 沿弧长归一化，V 沿高度归一化 */
-      const u0: number = totalArcLength > 0 ? segArcLengths[i]! / totalArcLength * totalArcLength : 0;
-      const u1: number = totalArcLength > 0 ? segArcLengths[i + 1]! / totalArcLength * totalArcLength : 0;
-      uvs.push(u0, 0, u1, 0, u1, wallHeight, u0, wallHeight);
-
-      indices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
+      const currentBottomIndex: number = outerBaseIdx + i * 2;
+      const nextBottomIndex: number = outerBaseIdx + (i + 1) * 2;
+      indices.push(
+        currentBottomIndex,
+        nextBottomIndex,
+        nextBottomIndex + 1,
+        currentBottomIndex,
+        nextBottomIndex + 1,
+        currentBottomIndex + 1
+      );
+    }
+    for (let i: number = 0; i < outerPoints.length; i++) {
+      const outerPoint: Point2D = outerPoints[i]!;
+      const sideNormal: Point2D = sideNormals[i]!;
+      const u: number = totalArcLength > 0 ? segArcLengths[i]! / totalArcLength * totalArcLength : 0;
+      positions.push(outerPoint.x, yBottom, outerPoint.z, outerPoint.x, yTop, outerPoint.z);
+      normalsArr.push(sideNormal.x, 0, sideNormal.z, sideNormal.x, 0, sideNormal.z);
+      uvs.push(u, 0, u, wallHeight);
     }
     const outerIndexCount: number = indices.length - outerIndexStart;
 
-    /* ===== 内侧面 (materialIndex=1) ===== */
+    /* ===== 内侧面 (materialIndex=1) =====
+     * 关键流程：内侧弧面同样复用连续条带顶点，并使用外侧法线的反方向作为平滑法线。
+     * 共享顶点可减少弧墙内侧因分段面片产生的竖向视觉缝。
+     */
     const innerIndexStart: number = indices.length;
+    const innerBaseIdx: number = positions.length / 3;
     for (let i: number = 0; i < centerPoints.length - 1; i++) {
-      const baseIdx: number = positions.length / 3;
-      const in0: Point2D = innerPoints[i]!;
-      const in1: Point2D = innerPoints[i + 1]!;
-      const o0: Point2D = outerPoints[i]!;
-      const o1: Point2D = outerPoints[i + 1]!;
-      const segDx: number = o1.x - o0.x;
-      const segDz: number = o1.z - o0.z;
-      const segLen: number = Math.sqrt(segDx * segDx + segDz * segDz);
-      const faceNx: number = segLen > 0 ? -segDz / segLen : 0;
-      const faceNz: number = segLen > 0 ? segDx / segLen : 0;
-
-      positions.push(in1.x, yBottom, in1.z, in0.x, yBottom, in0.z, in0.x, yTop, in0.z, in1.x, yTop, in1.z);
-      normalsArr.push(-faceNx, 0, -faceNz, -faceNx, 0, -faceNz, -faceNx, 0, -faceNz, -faceNx, 0, -faceNz);
-
-      const u0: number = totalArcLength > 0 ? segArcLengths[i + 1]! / totalArcLength * totalArcLength : 0;
-      const u1: number = totalArcLength > 0 ? segArcLengths[i]! / totalArcLength * totalArcLength : 0;
-      uvs.push(u0, 0, u1, 0, u1, wallHeight, u0, wallHeight);
-
-      indices.push(baseIdx, baseIdx + 1, baseIdx + 2, baseIdx, baseIdx + 2, baseIdx + 3);
+      const currentBottomIndex: number = innerBaseIdx + i * 2;
+      const nextBottomIndex: number = innerBaseIdx + (i + 1) * 2;
+      indices.push(
+        nextBottomIndex,
+        currentBottomIndex,
+        currentBottomIndex + 1,
+        nextBottomIndex,
+        currentBottomIndex + 1,
+        nextBottomIndex + 1
+      );
+    }
+    for (let i: number = 0; i < innerPoints.length; i++) {
+      const innerPoint: Point2D = innerPoints[i]!;
+      const sideNormal: Point2D = sideNormals[i]!;
+      const u: number = totalArcLength > 0 ? segArcLengths[i]! / totalArcLength * totalArcLength : 0;
+      positions.push(innerPoint.x, yBottom, innerPoint.z, innerPoint.x, yTop, innerPoint.z);
+      normalsArr.push(-sideNormal.x, 0, -sideNormal.z, -sideNormal.x, 0, -sideNormal.z);
+      uvs.push(u, 0, u, wallHeight);
     }
     const innerIndexCount: number = indices.length - innerIndexStart;
 
@@ -562,6 +618,16 @@ export class WallGeometryBuilder {
       return this._buildStraightWallWithOpenings(data, miter);
     }
     return this._buildStraightWall(data, miter);
+  }
+
+  /**
+   * 构建带 miter 偏移的弧形墙几何体。
+   * @param data - 弧形墙数据
+   * @param miter - 起终点衔接裁剪偏移参数
+   * @returns BufferGeometry
+   */
+  public buildArcWithMiter(data: ArcWallData, miter: MiterParams): THREE.BufferGeometry {
+    return this._buildArcWall(data, miter);
   }
 
   /**
@@ -1460,7 +1526,7 @@ export class WallGeometryBuilder {
    * @param bulge - 弧度因子（tan(angle/4)，DXF/DWG 标准）
    * @param thickness - 墙体厚度
    * @param height - 墙体高度
-   * @param segments - 弧线分段数，默认 16
+   * @param segments - 弧线分段数，默认使用全局弧墙细分配置
    * @returns BufferGeometry
    */
   public buildArcPreview(
@@ -1469,7 +1535,7 @@ export class WallGeometryBuilder {
     bulge: number,
     thickness: number,
     height: number,
-    segments: number = 16
+    segments: number = WALL_DEFAULTS.arcSegments
   ): THREE.BufferGeometry {
     /** 预览用占位包围盒 */
     const emptyBoundingBox = {

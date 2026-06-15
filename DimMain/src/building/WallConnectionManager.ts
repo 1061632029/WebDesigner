@@ -13,6 +13,7 @@ import type {
   MiterParams,
   MiterEndParams,
   WallSubtractionRect,
+  WallEndpointDirection,
 } from './BuildingTypes';
 import { SNAP_THRESHOLD } from './BuildingTypes';
 import { IdGenerator } from './IdGenerator';
@@ -307,7 +308,8 @@ export class WallConnectionManager {
     wallStart: Point2D,
     wallEnd: Point2D,
     thickness: number,
-    getWallEndpoints: (id: string) => { start: Point2D; end: Point2D; thickness: number } | null
+    getWallEndpoints: (id: string) => { start: Point2D; end: Point2D; thickness: number } | null,
+    getWallEndpointDirection?: (id: string) => WallEndpointDirection | null
   ): MiterParams {
     /* 零偏移的默认值 */
     const noMiter: MiterEndParams = { frontOffset: 0, backOffset: 0 };
@@ -320,14 +322,14 @@ export class WallConnectionManager {
     /* 计算起点端的斜切参数 */
     const startMiter: MiterEndParams = mapping.start !== null
       ? this._computeEndpointMiter(
-          mapping.start, wallId, 'start', wallStart, wallEnd, thickness, getWallEndpoints
+          mapping.start, wallId, 'start', wallStart, wallEnd, thickness, getWallEndpoints, getWallEndpointDirection
         )
       : noMiter;
 
     /* 计算终点端的斜切参数 */
     const endMiter: MiterEndParams = mapping.end !== null
       ? this._computeEndpointMiter(
-          mapping.end, wallId, 'end', wallStart, wallEnd, thickness, getWallEndpoints
+          mapping.end, wallId, 'end', wallStart, wallEnd, thickness, getWallEndpoints, getWallEndpointDirection
         )
       : noMiter;
 
@@ -356,7 +358,8 @@ export class WallConnectionManager {
     wallStart: Point2D,
     wallEnd: Point2D,
     thickness: number,
-    getWallEndpoints: (id: string) => { start: Point2D; end: Point2D; thickness: number } | null
+    getWallEndpoints: (id: string) => { start: Point2D; end: Point2D; thickness: number } | null,
+    getWallEndpointDirection?: (id: string) => WallEndpointDirection | null
   ): MiterEndParams {
     const noMiter: MiterEndParams = { frontOffset: 0, backOffset: 0 };
 
@@ -371,18 +374,17 @@ export class WallConnectionManager {
     }
 
     const jointPos: Point2D = joint.position;
-    let myDirX: number;
-    let myDirZ: number;
-    if (endpoint === 'start') {
-      /* 起点在节点上，向内方向 = 终点 - 节点。 */
-      myDirX = wallEnd.x - jointPos.x;
-      myDirZ = wallEnd.z - jointPos.z;
-    } else {
-      /* 终点在节点上，向内方向 = 起点 - 节点。 */
-      myDirX = wallStart.x - jointPos.x;
-      myDirZ = wallStart.z - jointPos.z;
-    }
-
+    const fallbackMyDir: Point2D = endpoint === 'start'
+      ? { x: wallEnd.x - jointPos.x, z: wallEnd.z - jointPos.z }
+      : { x: wallStart.x - jointPos.x, z: wallStart.z - jointPos.z };
+    const currentEndpointDirection: WallEndpointDirection | null = getWallEndpointDirection !== undefined
+      ? getWallEndpointDirection(wallId)
+      : null;
+    const currentInwardDir: Point2D = currentEndpointDirection !== null
+      ? (endpoint === 'start' ? currentEndpointDirection.startInwardDir : currentEndpointDirection.endInwardDir)
+      : fallbackMyDir;
+    const myDirX: number = currentInwardDir.x;
+    const myDirZ: number = currentInwardDir.z;
     const myLen: number = Math.sqrt(myDirX * myDirX + myDirZ * myDirZ);
     if (myLen < 0.001) {
       return noMiter;
@@ -420,15 +422,17 @@ export class WallConnectionManager {
       return noMiter;
     }
 
-    let otherDirX: number;
-    let otherDirZ: number;
-    if (otherConnection.endpoint === 'start') {
-      otherDirX = otherData.end.x - jointPos.x;
-      otherDirZ = otherData.end.z - jointPos.z;
-    } else {
-      otherDirX = otherData.start.x - jointPos.x;
-      otherDirZ = otherData.start.z - jointPos.z;
-    }
+    const otherEndpointDirection: WallEndpointDirection | null = getWallEndpointDirection !== undefined
+      ? getWallEndpointDirection(otherConnection.wallId)
+      : null;
+    const fallbackOtherDir: Point2D = otherConnection.endpoint === 'start'
+      ? { x: otherData.end.x - jointPos.x, z: otherData.end.z - jointPos.z }
+      : { x: otherData.start.x - jointPos.x, z: otherData.start.z - jointPos.z };
+    const otherInwardDir: Point2D = otherEndpointDirection !== null
+      ? (otherConnection.endpoint === 'start' ? otherEndpointDirection.startInwardDir : otherEndpointDirection.endInwardDir)
+      : fallbackOtherDir;
+    const otherDirX: number = otherInwardDir.x;
+    const otherDirZ: number = otherInwardDir.z;
 
     const otherLen: number = Math.sqrt(otherDirX * otherDirX + otherDirZ * otherDirZ);
     if (otherLen < 0.001) {

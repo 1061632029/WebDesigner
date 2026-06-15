@@ -5,13 +5,15 @@
  */
 
 import * as THREE from 'three/webgpu';
-import type { BeamData, BuildingObject, Point2D, DrawToolMode, DrawToolState, StraightWallData, RectWallData } from './BuildingTypes';
+import type { BeamData, BuildingObject, Point2D, DrawToolMode, DrawToolState, StraightWallData, RectWallData, ArcWallData } from './BuildingTypes';
 import { WALL_DEFAULTS, BEAM_DEFAULTS, SNAP_THRESHOLD } from './BuildingTypes';
 import { WallGeometryBuilder } from './WallGeometryBuilder';
 import { BeamGeometryBuilder } from './BeamGeometryBuilder';
 import { BuildingObjectManager } from './BuildingObjectManager';
 import { RaycastHelper } from '../interaction/RaycastHelper';
 import { RectDimensionRenderer, type RectPreviewEditAxis } from './RectDimensionRenderer';
+import { StraightWallDimensionRenderer } from './StraightWallDimensionRenderer';
+import { ArcWallRadiusDimensionRenderer, type ArcWallPreviewEditTarget, type ArcWallDimensionPickResult } from './ArcWallRadiusDimensionRenderer';
 import { PlanarPlacementSnapService } from './PlanarPlacementSnapService';
 import { PlanarPlacementGuideRenderer } from './PlanarPlacementGuideRenderer';
 import { WallPlacementLineConverter } from './WallPlacementLineConverter';
@@ -22,6 +24,8 @@ import type { CommandHistoryManager } from '../history/CommandHistoryManager';
 import { StraightWallCreateCommand } from '../history/commands/StraightWallCreateCommand';
 import { ConnectedStraightWallCreateCommand } from '../history/commands/ConnectedStraightWallCreateCommand';
 import type { PreviousStraightWallEndpointUpdate } from '../history/commands/ConnectedStraightWallCreateCommand';
+import { ClosedStraightWallLoopCreateCommand } from '../history/commands/ClosedStraightWallLoopCreateCommand';
+import type { ClosedLoopStraightWallUpdate } from '../history/commands/ClosedStraightWallLoopCreateCommand';
 import { RectWallCreateCommand } from '../history/commands/RectWallCreateCommand';
 import { BeamCreateCommand } from '../history/commands/BeamCreateCommand';
 
@@ -29,6 +33,9 @@ import { BeamCreateCommand } from '../history/commands/BeamCreateCommand';
  * 绘制工具状态变更回调
  */
 export type DrawToolChangeCallback = () => void;
+
+/** 捕获点标记最高渲染顺序，确保绿色圆圈显示在所有辅助标注和 2D 符号之上。 */
+const SNAP_MARKER_RENDER_ORDER: number = 20000;
 
 /**
  * 墙体绘制工具
@@ -46,6 +53,8 @@ export class WallDrawTool {
   private _endPoint: Point2D | null = null;
   /** 弧形墙弧度因子 */
   private _bulge: number = 0;
+  /** 弧形墙第三点布置阶段的当前鼠标方向点，用于半径动态标注定位。 */
+  private _arcPreviewControlPoint: Point2D | null = null;
 
   /** 建筑对象管理器 */
   private _objectManager: BuildingObjectManager;
@@ -53,6 +62,8 @@ export class WallDrawTool {
   private _sceneManager: SceneManager;
   /** 射线投射辅助器 */
   private _raycastHelper: RaycastHelper = new RaycastHelper();
+  /** 弧形墙常驻标注拾取射线，用于点击半径/角度标注进入编辑态。 */
+  private _arcDimensionLabelRaycaster: THREE.Raycaster = new THREE.Raycaster();
   /** 墙体几何构建器（用于预览） */
   private _wallBuilder: WallGeometryBuilder = new WallGeometryBuilder();
 
@@ -103,8 +114,20 @@ export class WallDrawTool {
   /** 连续直墙上一段创建出的墙体 ID，用于在下一段创建时回写衔接端点。 */
   private _previousStraightWallId: string | null = null;
 
+  /** 连续直墙本轮绘制的内侧节点序列，用于闭合时按完整内侧轮廓统一反算中心线。 */
+  private _straightInnerPathPoints: Point2D[] = [];
+
+  /** 连续直墙本轮绘制已创建的墙体 ID 序列，与内侧节点边一一对应。 */
+  private _straightPathWallIds: string[] = [];
+
   /** 矩形墙尺寸标注渲染器（仅保留绘制过程中的预览标注） */
   private _rectDimRenderer: RectDimensionRenderer;
+
+  /** 直墙动态尺寸标注渲染器，用于直墙布置过程中的长度标注。 */
+  private _straightDimRenderer: StraightWallDimensionRenderer;
+
+  /** 弧形墙半径动态标注渲染器，用于弧度布置阶段显示毫米半径。 */
+  private _arcRadiusDimRenderer: ArcWallRadiusDimensionRenderer;
 
   /** 矩形墙预览当前可编辑尺寸轴，默认编辑水平尺寸。 */
   private _rectPreviewEditAxis: RectPreviewEditAxis = 'horizontal';
@@ -114,6 +137,27 @@ export class WallDrawTool {
 
   /** 矩形墙预览是否刚由键盘尺寸驱动，用于鼠标移动时恢复鼠标驱动。 */
   private _rectPreviewKeyboardSized: boolean = false;
+
+  /** 直墙预览尺寸输入缓冲，单位为毫米。 */
+  private _straightPreviewDimensionInput: string = '';
+
+  /** 直墙预览是否已由键盘尺寸输入驱动。 */
+  private _straightPreviewKeyboardSized: boolean = false;
+
+  /** 弧形墙预览当前键盘编辑目标，Tab 在半径与角度之间切换。 */
+  private _arcPreviewEditTarget: ArcWallPreviewEditTarget = 'radius';
+
+  /** 弧形墙预览半径输入缓存，单位为毫米。 */
+  private _arcPreviewRadiusInput: string = '';
+
+  /** 弧形墙预览角度输入缓存，单位为度。 */
+  private _arcPreviewAngleInput: string = '';
+
+  /** 弧形墙预览是否已由键盘尺寸控制，点击确认时避免被鼠标点覆盖。 */
+  private _arcPreviewKeyboardSized: boolean = false;
+
+  /** 当前正在通过常驻标注编辑的弧形墙 ID；为空表示新建弧形墙流程。 */
+  private _editingArcWallId: string | null = null;
 
   /** 平面线式布置统一捕获服务 */
   private _planarSnapService: PlanarPlacementSnapService;
@@ -140,6 +184,8 @@ export class WallDrawTool {
 
     /* 创建矩形墙尺寸标注渲染器：仅用于矩形墙绘制过程中的临时预览。 */
     this._rectDimRenderer = new RectDimensionRenderer(sceneManager);
+    this._straightDimRenderer = new StraightWallDimensionRenderer(sceneManager);
+    this._arcRadiusDimRenderer = new ArcWallRadiusDimensionRenderer(sceneManager);
 
     /* 创建墙/梁线式布置统一捕获服务和虚线渲染器 */
     this._planarSnapService = new PlanarPlacementSnapService((): BuildingObject[] => this._objectManager.getAll());
@@ -193,6 +239,10 @@ export class WallDrawTool {
 
     if (mode === 'rect-wall') {
       this._resetRectPreviewDimensionEdit(true);
+    } else if (mode === 'straight-wall') {
+      this._resetStraightPreviewDimensionEdit();
+    } else if (mode === 'arc-wall') {
+      this._resetArcPreviewDimensionEdit(true);
     }
 
     /* 绑定事件（使用箭头函数保持 this 引用） */
@@ -226,15 +276,22 @@ export class WallDrawTool {
     this._clearSnapMarker();
     this._planarGuideRenderer.hide();
     this._rectDimRenderer.clearPreview();
+    this._straightDimRenderer.clearPreview();
+    this._arcRadiusDimRenderer.clearPreview();
     
     this._mode = 'none';
     this._state = 'idle';
     this._startPoint = null;
     this._endPoint = null;
     this._bulge = 0;
+    this._arcPreviewControlPoint = null;
     this._previousStraightInnerStart = null;
     this._previousStraightWallId = null;
+    this._straightInnerPathPoints = [];
+    this._straightPathWallIds = [];
     this._resetRectPreviewDimensionEdit(true);
+    this._resetStraightPreviewDimensionEdit();
+    this._resetArcPreviewDimensionEdit(true);
     this._getCameraFn = null;
     this._domElement = null;
 
@@ -252,6 +309,16 @@ export class WallDrawTool {
 
     /* 每次事件处理时实时获取当前相机（确保视图切换后使用最新相机） */
     const camera: THREE.Camera = this._getCameraFn();
+
+    /* 弧形墙常驻标注优先拾取：点击半径/角度标注时直接进入与布置阶段一致的编辑状态。 */
+    const pickedArcDimension: ArcWallDimensionPickResult | null = this._pickArcWallDimensionLabel(
+      event.clientX,
+      event.clientY,
+      camera
+    );
+    if (pickedArcDimension !== null && this._enterArcWallDimensionEdit(pickedArcDimension)) {
+      return;
+    }
 
     /* 射线投射到地平面，获取世界坐标 */
     const rawPoint: Point2D | null = this._raycastHelper.screenToGround(
@@ -303,12 +370,21 @@ export class WallDrawTool {
 
     /* picking-bulge 阶段：鼠标移动更新 bulge 而非终点 */
     if (this._state === 'picking-bulge') {
+      /* 弧形墙第三点阶段：记录当前鼠标方向点，半径动态标注使用圆心到该方向与弧墙的交点。 */
+      if (this._mode === 'arc-wall') {
+        /* 鼠标移动恢复拖拽控弧，清空半径/角度键盘输入，避免旧输入继续覆盖动态标注。 */
+        this._resetArcPreviewDimensionEdit(false);
+      }
+      this._arcPreviewControlPoint = point;
       this._bulge = this._computeBulgeFromPoint(point);
     } else {
       /* picking-end 阶段：使用吸附后的坐标更新终点 */
       if (this._mode === 'rect-wall') {
         /* 鼠标移动恢复实时拖拽驱动：清空键盘输入缓冲，后续尺寸重新按鼠标位置计算。 */
         this._resetRectPreviewDimensionEdit(false);
+      } else if (this._mode === 'straight-wall') {
+        /* 鼠标移动恢复实时拖拽驱动：清空直墙键盘输入缓冲，后续长度重新按鼠标位置计算。 */
+        this._resetStraightPreviewDimensionEdit();
       }
       this._endPoint = point;
     }
@@ -333,7 +409,15 @@ export class WallDrawTool {
    * 键盘按键
    */
   private _handleKeyDown = (event: KeyboardEvent): void => {
+    if (this._handleStraightPreviewDimensionKeyDown(event)) {
+      return;
+    }
+
     if (this._handleRectPreviewDimensionKeyDown(event)) {
+      return;
+    }
+
+    if (this._handleArcPreviewDimensionKeyDown(event)) {
       return;
     }
 
@@ -353,40 +437,164 @@ export class WallDrawTool {
 
   private _handleStraightWallClick(point: Point2D): void {
     if (this._state === 'picking-start') {
-      /* 确定起点 */
+      /* 第一次点击确定直墙内侧绘制线起点，并显示起点标记。 */
       this._startPoint = point;
+      this._straightInnerPathPoints = [{ x: point.x, z: point.z }];
+      this._straightPathWallIds = [];
       this._state = 'picking-end';
       this._showStartMarker(point);
       this._notify();
-    } else if (this._state === 'picking-end') {
-      /* 确定终点，创建墙体 */
-      this._endPoint = point;
-      const createdWallId: string = this._createStraightWallByHistory(
-        this._previousStraightInnerStart,
-        this._startPoint!,
-        this._endPoint
-      );
-      this._clearPreview();
-
-      /* 连续模式：终点变为下一段起点 */
-      if (this._continuous) {
-        this._previousStraightInnerStart = this._startPoint;
-        this._previousStraightWallId = createdWallId;
-        this._startPoint = point;
-        this._clearStartMarker();
-        this._showStartMarker(point);
-        /* 保持 picking-end 状态 */
-      } else {
-        this._previousStraightInnerStart = null;
-        this._previousStraightWallId = null;
-        this._startPoint = null;
-        this._endPoint = null;
-        this._state = 'picking-start';
-        this._clearStartMarker();
-      }
-
-      this._notify();
+      return;
     }
+
+    if (this._state === 'picking-end') {
+      /* 允许用户输入尺寸后直接点击确认，确认前先尝试应用当前输入。 */
+      this._applyStraightPreviewDimensionInput();
+      /* 确认流程：键盘尺寸驱动后保留已编辑终点；鼠标驱动时使用当前点击点。 */
+      const confirmedEndPoint: Point2D = this._straightPreviewKeyboardSized && this._endPoint !== null ? this._endPoint : point;
+      this._endPoint = confirmedEndPoint;
+      this._confirmStraightWallPreview();
+    }
+  }
+
+  /**
+   * 按当前直墙预览完成墙体布置。
+   * 关键流程：先应用尚未提交的长度输入，再创建直墙并按连续绘制规则重置起终点。
+   */
+  private _confirmStraightWallPreview(): void {
+    if (this._startPoint === null || this._endPoint === null) {
+      return;
+    }
+
+    this._applyStraightPreviewDimensionInput();
+
+    /* 确定终点，创建墙体。 */
+    const closedLoopEndPoint: Point2D | null = this._resolveStraightClosedLoopEndPoint(this._endPoint);
+    const confirmedEndPoint: Point2D = closedLoopEndPoint !== null
+      ? closedLoopEndPoint
+      : { x: this._endPoint.x, z: this._endPoint.z };
+    const createdWallId: string = closedLoopEndPoint !== null
+      ? this._createClosedStraightWallLoopByHistory(this._startPoint, confirmedEndPoint)
+      : this._createStraightWallByHistory(
+        this._previousStraightInnerStart,
+        this._startPoint,
+        confirmedEndPoint
+      );
+    this._straightDimRenderer.clearPreview();
+    this._resetStraightPreviewDimensionEdit();
+    this._clearPreview();
+
+    if (closedLoopEndPoint !== null) {
+      /* 闭合完成后结束本轮连续路径，下一次点击重新开始，避免继续沿旧轮廓追加墙体。 */
+      this._clearStartMarker();
+      this._previousStraightInnerStart = null;
+      this._previousStraightWallId = null;
+      this._straightInnerPathPoints = [];
+      this._straightPathWallIds = [];
+      this._startPoint = null;
+      this._endPoint = null;
+      this._state = 'picking-start';
+      this._notify();
+      return;
+    }
+
+    /* 连续模式：终点变为下一段起点。 */
+    if (this._continuous) {
+      this._previousStraightInnerStart = this._startPoint;
+      this._previousStraightWallId = createdWallId;
+      this._straightPathWallIds.push(createdWallId);
+      this._straightInnerPathPoints.push({ x: confirmedEndPoint.x, z: confirmedEndPoint.z });
+      this._startPoint = confirmedEndPoint;
+      this._endPoint = null;
+      this._clearStartMarker();
+      this._showStartMarker(confirmedEndPoint);
+      /* 保持 picking-end 状态。 */
+    } else {
+      this._previousStraightInnerStart = null;
+      this._previousStraightWallId = null;
+      this._straightInnerPathPoints = [];
+      this._straightPathWallIds = [];
+      this._startPoint = null;
+      this._endPoint = null;
+      this._state = 'picking-start';
+    }
+
+    this._notify();
+  }
+
+  /**
+   * 拾取弧形墙常驻半径/角度标注。
+   * 关键流程：将屏幕坐标转换为 NDC 后射线检测场景对象，再交给标注渲染器解析 userData。
+   * @param clientX - 鼠标屏幕 X 坐标
+   * @param clientY - 鼠标屏幕 Y 坐标
+   * @param camera - 当前视图相机
+   * @returns 命中的弧墙标注信息；未命中时返回 null
+   */
+  private _pickArcWallDimensionLabel(clientX: number, clientY: number, camera: THREE.Camera): ArcWallDimensionPickResult | null {
+    if (this._domElement === null) {
+      return null;
+    }
+
+    /* 优先使用屏幕空间热区拾取 Sprite 标签，解决 Three.js Raycaster 对可视化文字 Sprite 命中不稳定的问题。 */
+    const screenPicked: ArcWallDimensionPickResult | null = this._arcRadiusDimRenderer.pickDimensionLabelByScreenPoint(
+      clientX,
+      clientY,
+      camera,
+      this._domElement
+    );
+    if (screenPicked !== null) {
+      return screenPicked;
+    }
+
+    const rect: DOMRect = this._domElement.getBoundingClientRect();
+    const ndc: THREE.Vector2 = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    this._arcDimensionLabelRaycaster.setFromCamera(ndc, camera);
+
+    const intersections: THREE.Intersection[] = this._arcDimensionLabelRaycaster.intersectObjects(
+      this._sceneManager.getScene().children,
+      true
+    );
+    for (const intersection of intersections) {
+      const picked: ArcWallDimensionPickResult | null = this._arcRadiusDimRenderer.pickDimensionLabel(intersection.object);
+      if (picked !== null) {
+        return picked;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 进入已有弧形墙标注编辑状态。
+   * @param picked - 被点击的标注信息
+   * @returns true 表示已成功进入编辑状态
+   */
+  private _enterArcWallDimensionEdit(picked: ArcWallDimensionPickResult): boolean {
+    const arcWall: ArcWallData | null = this._findArcWallById(picked.wallId);
+    if (arcWall === null) {
+      this._arcRadiusDimRenderer.clearPersistent(picked.wallId);
+      return false;
+    }
+
+    this._cancelCurrentDraw();
+    this._mode = 'arc-wall';
+    this._state = 'picking-bulge';
+    this._editingArcWallId = arcWall.id;
+    this._startPoint = { x: arcWall.start.x, z: arcWall.start.z };
+    this._endPoint = { x: arcWall.end.x, z: arcWall.end.z };
+    this._bulge = arcWall.bulge;
+    this._arcPreviewControlPoint = null;
+    this._arcPreviewEditTarget = picked.target;
+    this._arcPreviewRadiusInput = '';
+    this._arcPreviewAngleInput = '';
+    this._arcPreviewKeyboardSized = true;
+    this._showStartMarker(this._startPoint);
+    this._updatePreview();
+    this._notify();
+    return true;
   }
 
   /**
@@ -437,25 +645,18 @@ export class WallDrawTool {
     } else if (this._state === 'picking-end') {
       /* 第二步：确定终点 */
       this._endPoint = point;
+      this._arcPreviewControlPoint = null;
+      this._resetArcPreviewDimensionEdit(true);
       this._state = 'picking-bulge';
       this._notify();
     } else if (this._state === 'picking-bulge') {
-      /* 第三步：根据鼠标到弦线的距离计算 bulge，创建弧形墙 */
-      this._bulge = this._computeBulgeFromPoint(point);
-
-      /* 使用弧形墙创建方法 */
-      const id: string = this._objectManager.createArcWall(
-        this._startPoint!, this._endPoint!, this._bulge, this._thickness, this._height
-      );
-      console.log(`[WallDrawTool] 弧形墙已创建, id=${id}, bulge=${this._bulge.toFixed(3)}`);
-
-      this._clearPreview();
-      this._clearStartMarker();
-      this._startPoint = null;
-      this._endPoint = null;
-      this._bulge = 0;
-      this._state = 'picking-start';
-      this._notify();
+      /* 第三步：把当前点击点作为弧上一点，按三点定弧计算 bulge 后创建弧形墙。 */
+      this._applyArcPreviewDimensionInput();
+      if (!this._arcPreviewKeyboardSized) {
+        this._arcPreviewControlPoint = point;
+        this._bulge = this._computeBulgeFromPoint(point);
+      }
+      this._confirmArcWallPreview();
     }
   }
 
@@ -554,7 +755,158 @@ export class WallDrawTool {
         this._rectPreviewEditAxis,
         this._getRectPreviewDimensionInputText()
       );
+    } else if (this._mode === 'straight-wall') {
+      /* 直墙模式：同步更新长度动态标注，支持键盘输入覆盖显示。 */
+      this._straightDimRenderer.updatePreview(
+        this._startPoint,
+        this._endPoint,
+        this._getStraightPreviewDimensionInputText()
+      );
+    } else if (this._mode === 'arc-wall' && this._state === 'picking-bulge') {
+      /* 弧形墙模式：新建时显示临时预览标注；编辑已有墙时复用常驻标注并高亮当前编辑项，避免重复显示。 */
+      if (this._editingArcWallId !== null) {
+        this._arcRadiusDimRenderer.clearPreview();
+        this._arcRadiusDimRenderer.updatePersistent(
+          this._editingArcWallId,
+          this._startPoint,
+          this._endPoint,
+          this._bulge,
+          this._arcPreviewEditTarget,
+          this._getArcPreviewRadiusInputText(),
+          this._getArcPreviewAngleInputText()
+        );
+      } else {
+        this._arcRadiusDimRenderer.updatePreview(
+          this._startPoint,
+          this._endPoint,
+          this._bulge,
+          this._arcPreviewControlPoint,
+          this._arcPreviewEditTarget,
+          this._getArcPreviewRadiusInputText(),
+          this._getArcPreviewAngleInputText()
+        );
+      }
+    } else {
+      this._arcRadiusDimRenderer.clearPreview();
     }
+  }
+
+  /**
+   * 处理直墙预览尺寸键盘编辑。
+   * 关键流程：数字键更新长度输入，Enter 应用当前输入并完成布置，退格/删除修正输入文本。
+   * @param event - 键盘事件
+   * @returns true 表示事件已被直墙尺寸编辑消费
+   */
+  private _handleStraightPreviewDimensionKeyDown(event: KeyboardEvent): boolean {
+    if (!this._canEditStraightPreviewDimension()) {
+      return false;
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      this._confirmStraightWallPreview();
+      return true;
+    }
+
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      if (this._straightPreviewDimensionInput.length > 0) {
+        this._straightPreviewDimensionInput = this._straightPreviewDimensionInput.slice(0, -1);
+        this._updatePreview();
+        this._notify();
+      }
+      return true;
+    }
+
+    if (event.key === 'Delete') {
+      event.preventDefault();
+      if (this._straightPreviewDimensionInput.length > 0) {
+        this._straightPreviewDimensionInput = '';
+        this._updatePreview();
+        this._notify();
+      }
+      return true;
+    }
+
+    if (/^[0-9]$/.test(event.key)) {
+      event.preventDefault();
+      this._straightPreviewDimensionInput = `${this._straightPreviewDimensionInput}${event.key}`;
+      this._straightPreviewKeyboardSized = true;
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 判断当前是否允许编辑直墙预览尺寸。
+   * @returns true 表示当前处于直墙第二点布置阶段，且预览端点有效
+   */
+  private _canEditStraightPreviewDimension(): boolean {
+    return this._mode === 'straight-wall'
+      && this._state === 'picking-end'
+      && this._startPoint !== null
+      && this._endPoint !== null;
+  }
+
+  /**
+   * 应用当前输入缓冲到直墙预览终点。
+   * 关键流程：输入值按毫米解析，并沿当前预览方向重算终点，保持墙体朝向不变。
+   * @returns true 表示已成功应用输入尺寸
+   */
+  private _applyStraightPreviewDimensionInput(): boolean {
+    if (this._startPoint === null || this._endPoint === null || this._straightPreviewDimensionInput.length === 0) {
+      return false;
+    }
+
+    const dimensionMillimeters: number = Number.parseFloat(this._straightPreviewDimensionInput);
+    if (!Number.isFinite(dimensionMillimeters)) {
+      return false;
+    }
+
+    const dimensionMeters: number = dimensionMillimeters / 1000;
+    if (dimensionMeters < 0.1) {
+      return false;
+    }
+
+    const dx: number = this._endPoint.x - this._startPoint.x;
+    const dz: number = this._endPoint.z - this._startPoint.z;
+    const currentLength: number = Math.sqrt(dx * dx + dz * dz);
+    if (currentLength < 0.001) {
+      return false;
+    }
+
+    const directionX: number = dx / currentLength;
+    const directionZ: number = dz / currentLength;
+    this._endPoint = {
+      x: this._startPoint.x + directionX * dimensionMeters,
+      z: this._startPoint.z + directionZ * dimensionMeters,
+    };
+    this._straightPreviewDimensionInput = '';
+    this._straightPreviewKeyboardSized = true;
+    return true;
+  }
+
+  /**
+   * 重置直墙预览尺寸编辑状态。
+   */
+  private _resetStraightPreviewDimensionEdit(): void {
+    this._straightPreviewDimensionInput = '';
+    this._straightPreviewKeyboardSized = false;
+  }
+
+  /**
+   * 获取直墙当前输入显示文本。
+   * @returns 有输入时返回毫米文本；无输入时返回 null 以显示真实尺寸
+   */
+  private _getStraightPreviewDimensionInputText(): string | null {
+    if (this._straightPreviewDimensionInput.length === 0) {
+      return null;
+    }
+
+    return this._straightPreviewDimensionInput;
   }
 
   /**
@@ -692,6 +1044,255 @@ export class WallDrawTool {
     }
 
     return this._rectPreviewDimensionInput;
+  }
+
+  /**
+   * 处理弧形墙预览半径/角度键盘编辑。
+   * 关键流程：Tab 在半径与角度标注之间切换，数字键写入当前标注，Enter 应用输入并确认创建弧形墙。
+   * @param event - 键盘事件
+   * @returns true 表示事件已被弧形墙标注编辑消费
+   */
+  private _handleArcPreviewDimensionKeyDown(event: KeyboardEvent): boolean {
+    if (!this._canEditArcPreviewDimension()) {
+      return false;
+    }
+
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      this._applyArcPreviewDimensionInput();
+      this._toggleArcPreviewEditTarget();
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      this._applyArcPreviewDimensionInput();
+      this._confirmArcWallPreview();
+      return true;
+    }
+
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      this._removeArcPreviewInputLastChar();
+      return true;
+    }
+
+    if (event.key === 'Delete') {
+      event.preventDefault();
+      this._clearArcPreviewActiveInput();
+      return true;
+    }
+
+    if (/^[0-9]$/.test(event.key)) {
+      event.preventDefault();
+      if (this._arcPreviewEditTarget === 'radius') {
+        this._arcPreviewRadiusInput = `${this._arcPreviewRadiusInput}${event.key}`;
+      } else {
+        this._arcPreviewAngleInput = `${this._arcPreviewAngleInput}${event.key}`;
+      }
+      this._arcPreviewKeyboardSized = true;
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 判断当前是否允许编辑弧形墙预览标注。
+   * @returns true 表示当前处于弧形墙第三点布置阶段且起终点有效
+   */
+  private _canEditArcPreviewDimension(): boolean {
+    return this._mode === 'arc-wall'
+      && this._state === 'picking-bulge'
+      && this._startPoint !== null
+      && this._endPoint !== null;
+  }
+
+  /**
+   * 应用当前弧形墙半径或角度输入。
+   * @returns true 表示当前输入已成功转换为 bulge
+   */
+  private _applyArcPreviewDimensionInput(): boolean {
+    if (this._arcPreviewEditTarget === 'radius') {
+      return this._applyArcPreviewRadiusInput();
+    }
+
+    return this._applyArcPreviewAngleInput();
+  }
+
+  /**
+   * 应用半径输入并重算 bulge。
+   * @returns true 表示半径输入有效并已应用
+   */
+  private _applyArcPreviewRadiusInput(): boolean {
+    if (this._startPoint === null || this._endPoint === null || this._arcPreviewRadiusInput.length === 0) {
+      return false;
+    }
+
+    const radiusMillimeters: number = Number.parseFloat(this._arcPreviewRadiusInput);
+    if (!Number.isFinite(radiusMillimeters)) {
+      return false;
+    }
+
+    const radiusMeters: number = radiusMillimeters / 1000;
+    const chordLength: number = this._calculateArcPreviewChordLength();
+    if (chordLength < 0.001 || radiusMeters < chordLength / 2) {
+      return false;
+    }
+
+    const includedAngle: number = 2 * Math.asin(Math.min(1, chordLength / (2 * radiusMeters)));
+    this._bulge = this._getCurrentArcBulgeSign() * Math.tan(includedAngle / 4);
+    this._arcPreviewRadiusInput = '';
+    this._arcPreviewKeyboardSized = true;
+    return true;
+  }
+
+  /**
+   * 应用角度输入并重算 bulge。
+   * @returns true 表示角度输入有效并已应用
+   */
+  private _applyArcPreviewAngleInput(): boolean {
+    if (this._arcPreviewAngleInput.length === 0) {
+      return false;
+    }
+
+    const angleDegrees: number = Number.parseFloat(this._arcPreviewAngleInput);
+    if (!Number.isFinite(angleDegrees) || angleDegrees <= 0 || angleDegrees >= 360) {
+      return false;
+    }
+
+    const includedAngle: number = angleDegrees * Math.PI / 180;
+    this._bulge = this._getCurrentArcBulgeSign() * Math.tan(includedAngle / 4);
+    this._arcPreviewAngleInput = '';
+    this._arcPreviewKeyboardSized = true;
+    return true;
+  }
+
+  /**
+   * 按当前预览参数创建弧形墙并清理预览状态。
+   */
+  private _confirmArcWallPreview(): void {
+    if (this._startPoint === null || this._endPoint === null || Math.abs(this._bulge) < 0.000001) {
+      return;
+    }
+
+    if (this._editingArcWallId !== null) {
+      /* 已有弧墙编辑确认：复用布置阶段的半径/角度计算结果，直接更新中心弧数据并刷新常驻标注。 */
+      const editingWallId: string = this._editingArcWallId;
+      this._objectManager.updateObject(editingWallId, {
+        start: { x: this._startPoint.x, z: this._startPoint.z },
+        end: { x: this._endPoint.x, z: this._endPoint.z },
+        bulge: this._bulge,
+      } as Partial<ArcWallData> as Partial<BuildingObject>);
+      this._arcRadiusDimRenderer.updatePersistent(
+        editingWallId,
+        this._startPoint,
+        this._endPoint,
+        this._bulge,
+        null,
+        null,
+        null
+      );
+      console.log(`[WallDrawTool] 弧形墙已更新, id=${editingWallId}, bulge=${this._bulge.toFixed(3)}`);
+    } else {
+      const id: string = this._objectManager.createArcWall(
+        this._startPoint, this._endPoint, this._bulge, this._thickness, this._height
+      );
+      const createdArcWall: ArcWallData | null = this._findArcWallById(id);
+      if (createdArcWall !== null) {
+        this._arcRadiusDimRenderer.updatePersistent(
+          createdArcWall.id,
+          createdArcWall.start,
+          createdArcWall.end,
+          createdArcWall.bulge,
+          null,
+          null,
+          null
+        );
+      }
+      console.log(`[WallDrawTool] 弧形墙已创建, id=${id}, bulge=${this._bulge.toFixed(3)}`);
+    }
+
+    this._arcRadiusDimRenderer.clearPreview();
+    this._clearPreview();
+    this._clearStartMarker();
+    this._startPoint = null;
+    this._endPoint = null;
+    this._bulge = 0;
+    this._arcPreviewControlPoint = null;
+    this._editingArcWallId = null;
+    this._resetArcPreviewDimensionEdit(true);
+    this._state = 'picking-start';
+    this._notify();
+  }
+
+  /** 切换弧形墙当前编辑标注。 */
+  private _toggleArcPreviewEditTarget(): void {
+    this._arcPreviewEditTarget = this._arcPreviewEditTarget === 'radius' ? 'angle' : 'radius';
+  }
+
+  /** 删除当前弧形墙输入缓冲的最后一位。 */
+  private _removeArcPreviewInputLastChar(): void {
+    if (this._arcPreviewEditTarget === 'radius' && this._arcPreviewRadiusInput.length > 0) {
+      this._arcPreviewRadiusInput = this._arcPreviewRadiusInput.slice(0, -1);
+    } else if (this._arcPreviewEditTarget === 'angle' && this._arcPreviewAngleInput.length > 0) {
+      this._arcPreviewAngleInput = this._arcPreviewAngleInput.slice(0, -1);
+    }
+    this._updatePreview();
+    this._notify();
+  }
+
+  /** 清空弧形墙当前编辑标注的输入缓冲。 */
+  private _clearArcPreviewActiveInput(): void {
+    if (this._arcPreviewEditTarget === 'radius') {
+      this._arcPreviewRadiusInput = '';
+    } else {
+      this._arcPreviewAngleInput = '';
+    }
+    this._updatePreview();
+    this._notify();
+  }
+
+  /**
+   * 重置弧形墙半径/角度编辑状态。
+   * @param resetTarget - true 时恢复默认编辑半径；false 时保留当前 Tab 选择
+   */
+  private _resetArcPreviewDimensionEdit(resetTarget: boolean): void {
+    if (resetTarget) {
+      this._arcPreviewEditTarget = 'radius';
+    }
+    this._arcPreviewRadiusInput = '';
+    this._arcPreviewAngleInput = '';
+    this._arcPreviewKeyboardSized = false;
+  }
+
+  /** @returns 弧形墙半径输入显示文本。 */
+  private _getArcPreviewRadiusInputText(): string | null {
+    return this._arcPreviewRadiusInput.length > 0 ? this._arcPreviewRadiusInput : null;
+  }
+
+  /** @returns 弧形墙角度输入显示文本。 */
+  private _getArcPreviewAngleInputText(): string | null {
+    return this._arcPreviewAngleInput.length > 0 ? this._arcPreviewAngleInput : null;
+  }
+
+  /** @returns 当前弧形墙起终点弦长，单位米。 */
+  private _calculateArcPreviewChordLength(): number {
+    if (this._startPoint === null || this._endPoint === null) {
+      return 0;
+    }
+    const dx: number = this._endPoint.x - this._startPoint.x;
+    const dz: number = this._endPoint.z - this._startPoint.z;
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  /** @returns 当前弧形墙方向符号，未形成有效弧时默认使用逆时针方向。 */
+  private _getCurrentArcBulgeSign(): number {
+    return this._bulge < 0 ? -1 : 1;
   }
 
   /**
@@ -895,7 +1496,7 @@ export class WallDrawTool {
 
   /**
    * 获取正交约束锚点
-   * @returns 直墙/梁第二点阶段的起点；其他阶段返回 null
+   * @returns 直墙、梁、弧形墙第二点阶段的起点；其他阶段返回 null
    */
   private _getOrthogonalAnchor(): Point2D | null {
     if (this._state !== 'picking-end') {
@@ -904,7 +1505,7 @@ export class WallDrawTool {
     if (this._startPoint === null) {
       return null;
     }
-    if (this._mode !== 'straight-wall' && this._mode !== 'beam') {
+    if (this._mode !== 'straight-wall' && this._mode !== 'beam' && this._mode !== 'arc-wall') {
       return null;
     }
     return this._startPoint;
@@ -923,8 +1524,12 @@ export class WallDrawTool {
       color: 0x44ff44,
       transparent: true,
       opacity: 0.8,
+      depthTest: false,
+      depthWrite: false,
     });
     this._snapMarker = new THREE.Mesh(ringGeom, ringMat);
+    /* 捕获点需要最高显示优先级：禁用深度遮挡并提升渲染顺序，避免被墙体、地面或 2D 标注覆盖。 */
+    this._snapMarker.renderOrder = SNAP_MARKER_RENDER_ORDER;
     /* 环形平放在 XZ 平面上 */
     this._snapMarker.rotation.x = Math.PI / 2;
     this._snapMarker.position.set(point.x, 0.02, point.z);
@@ -976,9 +1581,18 @@ export class WallDrawTool {
 
     if (this._historyManager !== null) {
       if (previousWallUpdate !== null) {
-        this._historyManager.execute(new ConnectedStraightWallCreateCommand(this._objectManager, wallData, previousWallUpdate));
+        this._historyManager.execute(new ConnectedStraightWallCreateCommand(
+          this._objectManager,
+          this._sceneManager.getScene(),
+          wallData,
+          previousWallUpdate
+        ));
       } else {
-        this._historyManager.execute(new StraightWallCreateCommand(this._objectManager, wallData));
+        this._historyManager.execute(new StraightWallCreateCommand(
+          this._objectManager,
+          this._sceneManager.getScene(),
+          wallData
+        ));
       }
       return wallData.id;
     }
@@ -993,6 +1607,118 @@ export class WallDrawTool {
     /* 未注入历史管理器的兼容路径：保持旧版直接创建行为。 */
     this._objectManager.addObject(wallData);
     return wallData.id;
+  }
+
+  /**
+   * 判断当前直墙终点是否应闭合到本轮连续绘制的第一个内侧节点。
+   * 关键流程：闭合捕获优先使用原始内侧首点，而不是已有墙体的中心线端点，避免首尾处再次偏移一个墙厚。
+   * @param end - 当前确认的内侧终点
+   * @returns 需要闭合时返回首个内侧节点副本；否则返回 null
+   */
+  private _resolveStraightClosedLoopEndPoint(end: Point2D): Point2D | null {
+    if (!this._continuous || this._straightInnerPathPoints.length < 3 || this._straightPathWallIds.length < 2) {
+      return null;
+    }
+
+    const firstPoint: Point2D = this._straightInnerPathPoints[0]!;
+    const dx: number = end.x - firstPoint.x;
+    const dz: number = end.z - firstPoint.z;
+    const distance: number = Math.sqrt(dx * dx + dz * dz);
+    const closeThreshold: number = Math.max(SNAP_THRESHOLD, this._thickness * 1.5);
+    if (distance > closeThreshold) {
+      return null;
+    }
+
+    return { x: firstPoint.x, z: firstPoint.z };
+  }
+
+  /**
+   * 按完整内侧闭合轮廓创建最后一段直墙并回写已有墙段中心线。
+   * 关键流程：把本轮连续内侧节点与闭合终点组成闭合多边形，统一偏移得到所有中心线，避免逐段偏移误差累积到首尾。
+   * @param start - 当前闭合段内侧起点
+   * @param end - 当前闭合段内侧终点，应等于本轮首个内侧节点
+   * @returns 创建出的闭合段直墙 ID
+   */
+  private _createClosedStraightWallLoopByHistory(start: Point2D, end: Point2D): string {
+    const innerOutline: Point2D[] = this._straightInnerPathPoints.map((point: Point2D): Point2D => ({ x: point.x, z: point.z }));
+    const latestPathPoint: Point2D | undefined = innerOutline[innerOutline.length - 1];
+    if (latestPathPoint === undefined || !this._arePointsNearlyEqual(latestPathPoint, start)) {
+      innerOutline.push({ x: start.x, z: start.z });
+    }
+
+    const firstPoint: Point2D | undefined = innerOutline[0];
+    if (firstPoint === undefined || !this._arePointsNearlyEqual(firstPoint, end) || innerOutline.length < 3) {
+      return this._createStraightWallByHistory(this._previousStraightInnerStart, start, end);
+    }
+
+    const centerLines: WallCenterLine[] = WallPlacementLineConverter.convertClosedInnerOutlineToCenterLines(
+      innerOutline,
+      this._thickness
+    );
+    if (centerLines.length !== innerOutline.length || this._straightPathWallIds.length !== innerOutline.length - 1) {
+      return this._createStraightWallByHistory(this._previousStraightInnerStart, start, end);
+    }
+
+    const wallUpdates: ClosedLoopStraightWallUpdate[] = [];
+    for (let index: number = 0; index < this._straightPathWallIds.length; index += 1) {
+      const wallId: string = this._straightPathWallIds[index]!;
+      const wallData: StraightWallData | null = this._findStraightWallById(wallId);
+      const nextLine: WallCenterLine = centerLines[index]!;
+      if (wallData === null) {
+        return this._createStraightWallByHistory(this._previousStraightInnerStart, start, end);
+      }
+
+      wallUpdates.push({
+        wallId: wallData.id,
+        previousStart: { x: wallData.start.x, z: wallData.start.z },
+        previousEnd: { x: wallData.end.x, z: wallData.end.z },
+        nextStart: { x: nextLine.start.x, z: nextLine.start.z },
+        nextEnd: { x: nextLine.end.x, z: nextLine.end.z },
+      });
+    }
+
+    const closingCenterLine: WallCenterLine = centerLines[centerLines.length - 1]!;
+    const closingWallData: StraightWallData = this._objectManager.createStraightWallData(
+      closingCenterLine.start,
+      closingCenterLine.end,
+      this._thickness,
+      this._height
+    );
+
+    if (this._historyManager !== null) {
+      this._historyManager.execute(new ClosedStraightWallLoopCreateCommand(
+        this._objectManager,
+        this._sceneManager.getScene(),
+        closingWallData,
+        wallUpdates
+      ));
+      return closingWallData.id;
+    }
+
+    /* 未注入历史管理器时，同步回写已有墙段后创建闭合段，保持与命令路径一致。 */
+    for (const update of wallUpdates) {
+      this._objectManager.updateObject(
+        update.wallId,
+        {
+          start: { x: update.nextStart.x, z: update.nextStart.z },
+          end: { x: update.nextEnd.x, z: update.nextEnd.z },
+        } as Partial<StraightWallData>
+      );
+    }
+    this._objectManager.addObject(closingWallData);
+    return closingWallData.id;
+  }
+
+  /**
+   * 判断两个二维点是否近似相等。
+   * @param pointA - 第一个点
+   * @param pointB - 第二个点
+   * @returns 距离小于容差时返回 true
+   */
+  private _arePointsNearlyEqual(pointA: Point2D, pointB: Point2D): boolean {
+    const dx: number = pointA.x - pointB.x;
+    const dz: number = pointA.z - pointB.z;
+    return Math.sqrt(dx * dx + dz * dz) <= 0.001;
   }
 
   /**
@@ -1051,6 +1777,22 @@ export class WallDrawTool {
   }
 
   /**
+   * 按 ID 查找弧形墙数据。
+   * @param wallId - 弧形墙 ID
+   * @returns 找到的弧形墙数据；不存在或类型不匹配时返回 null
+   */
+  private _findArcWallById(wallId: string): ArcWallData | null {
+    const allObjects: BuildingObject[] = this._objectManager.getAll();
+    for (const object of allObjects) {
+      if (object.id === wallId && object.category === 'wall' && object.subType === 'arc') {
+        return object as ArcWallData;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * 创建梁并按需写入历史栈
    * 关键流程：梁长度由 start/end 计算并随布置线变化，不提供手动长度写入入口。
    * @param start - 梁中心线起点
@@ -1086,6 +1828,7 @@ export class WallDrawTool {
     if (this._historyManager !== null) {
       this._historyManager.execute(new RectWallCreateCommand(
         this._objectManager,
+        this._sceneManager.getScene(),
         bundle.rect,
         bundle.children
       ));
@@ -1110,43 +1853,96 @@ export class WallDrawTool {
     this._planarGuideRenderer.hide();
     /* 取消时清除矩形墙预览标注 */
     this._rectDimRenderer.clearPreview();
+    this._straightDimRenderer.clearPreview();
+    this._arcRadiusDimRenderer.clearPreview();
     this._startPoint = null;
     this._endPoint = null;
     this._bulge = 0;
+    this._arcPreviewControlPoint = null;
+    this._editingArcWallId = null;
     this._previousStraightInnerStart = null;
     this._previousStraightWallId = null;
+    this._straightInnerPathPoints = [];
+    this._straightPathWallIds = [];
     this._resetRectPreviewDimensionEdit(true);
+    this._resetStraightPreviewDimensionEdit();
     this._state = 'picking-start';
     this._notify();
   }
 
   /**
-   * 根据第三个点计算弧度因子
+   * 根据起点、终点和弧上一点计算标准 bulge 弧度因子。
+   * 关键流程：先由三点计算外接圆，再判断弧上一点位于顺时针还是逆时针圆弧，最后按 DXF bulge 公式生成弧度因子。
+   * @param point - 用户第三次点击的弧上一点
+   * @returns 标准 bulge 值，正值表示逆时针弧，负值表示顺时针弧
    */
   private _computeBulgeFromPoint(point: Point2D): number {
     if (this._startPoint === null || this._endPoint === null) return 0;
 
-    /* 计算点到弦线的垂直距离 */
-    const dx: number = this._endPoint.x - this._startPoint.x;
-    const dz: number = this._endPoint.z - this._startPoint.z;
-    const chordLen: number = Math.sqrt(dx * dx + dz * dz);
+    const startX: number = this._startPoint.x;
+    const startZ: number = this._startPoint.z;
+    const endX: number = this._endPoint.x;
+    const endZ: number = this._endPoint.z;
+    const arcX: number = point.x;
+    const arcZ: number = point.z;
+    const chordDx: number = endX - startX;
+    const chordDz: number = endZ - startZ;
+    const chordLen: number = Math.sqrt(chordDx * chordDx + chordDz * chordDz);
 
     if (chordLen < 0.001) return 0;
 
-    /* 弦的法线 */
-    const nx: number = -dz / chordLen;
-    const nz: number = dx / chordLen;
+    /* 三点近似共线时无法稳定计算外接圆，退化为直线墙预览。 */
+    const determinant: number = 2 * (
+      startX * (endZ - arcZ)
+      + endX * (arcZ - startZ)
+      + arcX * (startZ - endZ)
+    );
+    if (Math.abs(determinant) < 0.0001) return 0;
 
-    /* 点到起点的向量在法线方向的投影 */
-    const vx: number = point.x - this._startPoint.x;
-    const vz: number = point.z - this._startPoint.z;
-    const dist: number = vx * nx + vz * nz;
+    const startSquare: number = startX * startX + startZ * startZ;
+    const endSquare: number = endX * endX + endZ * endZ;
+    const arcSquare: number = arcX * arcX + arcZ * arcZ;
 
-    /* bulge = tan(angle/4) ≈ 4 * sagitta / chordLen（近似） */
-    const sagitta: number = dist;
-    const bulge: number = (4 * sagitta) / chordLen;
+    /* 外接圆圆心用于精确判断第三点所在圆弧方向。 */
+    const centerX: number = (
+      startSquare * (endZ - arcZ)
+      + endSquare * (arcZ - startZ)
+      + arcSquare * (startZ - endZ)
+    ) / determinant;
+    const centerZ: number = (
+      startSquare * (arcX - endX)
+      + endSquare * (startX - arcX)
+      + arcSquare * (endX - startX)
+    ) / determinant;
 
-    return Math.max(-2, Math.min(2, bulge));
+    const startAngle: number = Math.atan2(startZ - centerZ, startX - centerX);
+    const endAngle: number = Math.atan2(endZ - centerZ, endX - centerX);
+    const arcAngle: number = Math.atan2(arcZ - centerZ, arcX - centerX);
+    const counterClockwiseAngle: number = this._normalizePositiveAngle(endAngle - startAngle);
+    const counterClockwiseArcPointAngle: number = this._normalizePositiveAngle(arcAngle - startAngle);
+    const clockwiseAngle: number = Math.PI * 2 - counterClockwiseAngle;
+
+    /* 第三点在起点到终点的逆时针圆弧上时使用正 bulge，否则使用顺时针负 bulge。 */
+    const isCounterClockwiseArc: boolean = counterClockwiseArcPointAngle <= counterClockwiseAngle;
+    const includedAngle: number = isCounterClockwiseArc ? counterClockwiseAngle : clockwiseAngle;
+    const signedBulge: number = Math.tan(includedAngle / 4) * (isCounterClockwiseArc ? 1 : -1);
+
+    /* 保留大弧绘制能力，同时限制接近整圆时的极端 bulge，避免几何生成不稳定。 */
+    return Math.max(-10, Math.min(10, signedBulge));
+  }
+
+  /**
+   * 将任意角度归一化到 [0, 2π) 区间。
+   * @param angle - 原始弧度角
+   * @returns 归一化后的正向弧度角
+   */
+  private _normalizePositiveAngle(angle: number): number {
+    const fullCircle: number = Math.PI * 2;
+    let normalizedAngle: number = angle % fullCircle;
+    if (normalizedAngle < 0) {
+      normalizedAngle += fullCircle;
+    }
+    return normalizedAngle;
   }
 
   /* ========== 参数设置 ========== */
@@ -1185,6 +1981,16 @@ export class WallDrawTool {
    */
   public setAnnotationsVisible(visible: boolean): void {
     this._rectDimRenderer.setVisible(visible);
+    this._straightDimRenderer.setVisible(visible);
+    this._arcRadiusDimRenderer.setVisible(visible);
+  }
+
+  /**
+   * 同步当前选中的建筑对象 ID 集合，用于控制弧墙常驻半径/角度标注只在点选后显示。
+   * @param selectedWallIds - 当前选中的建筑对象 ID 只读集合
+   */
+  public setSelectedWallIds(selectedWallIds: ReadonlySet<string>): void {
+    this._arcRadiusDimRenderer.setSelectedWallIds(selectedWallIds);
   }
 
   /* ========== 销毁 ========== */
@@ -1196,6 +2002,8 @@ export class WallDrawTool {
     this._planarGuideRenderer.dispose();
     /* 释放矩形墙尺寸标注渲染器资源。 */
     this._rectDimRenderer.dispose();
+    this._straightDimRenderer.dispose();
+    this._arcRadiusDimRenderer.dispose();
     this._listeners.clear();
   }
 }

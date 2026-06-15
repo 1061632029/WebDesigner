@@ -1,0 +1,59 @@
+version: cline-v1
+workflow:
+  name: 批量文本任务调度器
+  config:
+    max_concurrent: 1
+  variables:
+    task_queue: [
+      {
+        "task_name": "增加布置墙体时可输入墙厚",
+        "cmd": "增加布置墙体时可输入墙厚"
+      }
+      ,
+      {
+        "task_name": "梁的拖拽逻辑补充",
+        "cmd": "补充梁的拖拽行为，参考墙的拖拽逻辑，可以进行法向拖拽和"
+      }
+    ]
+    
+  # 对外统一入口 new_task：接收多行文本批量生成任务
+  triggers:
+    new_task:
+      input_schema:
+        task_text: string # 传入多行文本，每行一条任务指令
+      handler: |
+        # 按换行分割文本，过滤空行
+        lines = split(input.task_text, "\n")
+        for line in lines {
+          trim_line = trim(line)
+          if length(trim_line) > 0 {
+            append(task_queue, {
+              "task_name": trim_line,
+              "cmd": trim_line
+            })
+          }
+        }
+    cline_task:
+      input_schema:
+        task_text: string 布置墙体时可输入墙厚
+      handler: |
+        append(task_queue, {
+          "task_name": input.task_text,
+          "cmd": "cline " + input.task_text
+        })
+  # 队列消费逻辑：逐条串行执行
+  steps:
+    - name: 循环消费任务队列
+      loop:
+        while: length(task_queue) > 0
+        steps:
+          - set: current_job
+            value: shift(task_queue)
+          - print: "===== 开始执行任务：${current_job.task_name} ====="
+          - run: ${current_job.cmd}
+            wait: true
+            timeout: 1200
+          - print: "===== 任务完成，剩余待执行：${length(task_queue)} ====="
+          on_failure:
+            print: "【警告】任务执行失败，继续下一条任务"
+            action: continue

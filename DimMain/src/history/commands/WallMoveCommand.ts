@@ -5,7 +5,7 @@
  */
 
 import type { ICommand } from '../ICommand';
-import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
+import type { BuildingObjectManager, StraightWallDragSnapshot } from '../../building/BuildingObjectManager';
 import type { Point2D } from '../../building/BuildingTypes';
 
 /** 墙体拖拽移动命令。 */
@@ -16,46 +16,49 @@ export class WallMoveCommand implements ICommand {
   /** 建筑对象管理器。 */
   private readonly _objectManager: BuildingObjectManager;
 
-  /** 被拖拽的直墙 ID。 */
-  private readonly _wallId: string;
+  /** 拖拽开始时的墙体、连接节点和吸附门窗快照。 */
+  private readonly _snapshot: StraightWallDragSnapshot;
 
   /** 本次拖拽的法向位移。 */
   private readonly _offset: Point2D;
 
   /**
    * @param objectManager - 建筑对象管理器
-   * @param wallId - 被拖拽的直墙 ID
+   * @param snapshot - 拖拽开始时的墙体、连接节点和吸附门窗快照
    * @param offset - 本次拖拽的 XZ 平面法向位移
    * @param label - 命令显示标签
    */
   public constructor(
     objectManager: BuildingObjectManager,
-    wallId: string,
+    snapshot: StraightWallDragSnapshot,
     offset: Point2D,
     label: string = '拖拽移动墙体'
   ) {
     this._objectManager = objectManager;
-    this._wallId = wallId;
+    this._snapshot = snapshot;
     this._offset = { x: offset.x, z: offset.z };
     this.label = label;
   }
 
   /** 执行或重做墙体移动，并通过对象管理器同步连接墙体方向约束和封闭区域表面。 */
   public execute(): void {
-    /* 拖拽流程完成后基于受影响墙体重新检测封闭区域，封闭时刷新楼板、天花板及其驱动标注。 */
-    const affectedWallIds: string[] = this._objectManager.moveStraightWallWithConnections(this._wallId, this._offset);
+    /* 执行流程使用拖拽开始快照 + 目标位移恢复绝对态，避免重复执行时继续累加同向偏移。 */
+    const affectedWallIds: string[] = this._objectManager.moveStraightWallWithConnectionsFromSnapshot(
+      this._snapshot,
+      this._offset
+    );
     if (affectedWallIds.length > 0) {
       this._objectManager.refreshClosedSurfacesForWalls(affectedWallIds);
     }
   }
 
-  /** 撤销墙体移动，使用反向法向位移恢复墙体、连接节点和封闭区域表面。 */
+  /** 撤销墙体移动，恢复拖拽开始快照中的墙体、连接节点和封闭区域表面。 */
   public undo(): void {
-    /* 撤销同样会改变封闭环轮廓，需要再次刷新楼板、天花板和楼板标注数据。 */
-    const affectedWallIds: string[] = this._objectManager.moveStraightWallWithConnections(this._wallId, {
-      x: -this._offset.x,
-      z: -this._offset.z,
-    });
+    /* 撤销流程恢复到快照原点，而不是基于当前状态叠加反向偏移，防止重复撤销造成墙体变形。 */
+    const affectedWallIds: string[] = this._objectManager.moveStraightWallWithConnectionsFromSnapshot(
+      this._snapshot,
+      { x: 0, z: 0 }
+    );
     if (affectedWallIds.length > 0) {
       this._objectManager.refreshClosedSurfacesForWalls(affectedWallIds);
     }

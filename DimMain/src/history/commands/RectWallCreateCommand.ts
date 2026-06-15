@@ -3,10 +3,12 @@
  * execute：添加四面子直墙、矩形墙父级数据；undo：移除矩形墙。
  */
 
+import * as THREE from 'three/webgpu';
 import type { ICommand } from '../ICommand';
 import type { BuildingObject, RectWallData, StraightWallData } from '../../building/BuildingTypes';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
 import type { GeneratedSurfaceSignatureSnapshot } from '../../building/BuildingObjectManager';
+import { WallCascadeDeleteCommand } from './WallCascadeDeleteCommand';
 
 /** 矩形墙子墙数据元组 */
 type RectWallChildren = [StraightWallData, StraightWallData, StraightWallData, StraightWallData];
@@ -21,6 +23,9 @@ export class RectWallCreateCommand implements ICommand {
 
   /** 建筑对象管理器引用 */
   private readonly _manager: BuildingObjectManager;
+
+  /** Three.js 场景引用，用于撤销创建时检测并移除墙体依赖的门窗 STL。 */
+  private readonly _scene: THREE.Scene;
 
   /** 矩形墙父级数据快照 */
   private readonly _rectData: RectWallData;
@@ -40,17 +45,23 @@ export class RectWallCreateCommand implements ICommand {
   /** 本命令创建的完整对象快照，包含子墙、父级矩形墙以及自动楼板/天花板 */
   private _createdObjectSnapshots: BuildingObject[] | null = null;
 
+  /** 最近一次撤销创建时生成的墙体级联删除命令。 */
+  private _cascadeDeleteCommand: WallCascadeDeleteCommand | null = null;
+
   /**
    * @param manager - 建筑对象管理器
+   * @param scene - Three.js 场景
    * @param rectData - 矩形墙父级数据
    * @param childrenData - 四面子直墙数据
    */
   public constructor(
     manager: BuildingObjectManager,
+    scene: THREE.Scene,
     rectData: RectWallData,
     childrenData: RectWallChildren
   ) {
     this._manager = manager;
+    this._scene = scene;
     this._rectData = RectWallCreateCommand._cloneRectWallData(rectData);
     this._childrenData = RectWallCreateCommand._cloneChildrenData(childrenData);
   }
@@ -60,6 +71,16 @@ export class RectWallCreateCommand implements ICommand {
    * 关键逻辑：先添加四面子直墙以建立墙体拓扑，再添加父级矩形墙数据。
    */
   public execute(): void {
+    if (this._cascadeDeleteCommand !== null) {
+      /* 重做创建时优先恢复撤销阶段级联删除的完整依赖快照，避免门窗等依赖对象丢失。 */
+      this._cascadeDeleteCommand.undo();
+      if (this._afterSignatureSnapshot !== null) {
+        this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._afterSignatureSnapshot);
+      }
+      this._cascadeDeleteCommand = null;
+      return;
+    }
+
     if (this._createdObjectSnapshots !== null && this._afterSignatureSnapshot !== null) {
       this._restoreCreatedObjectsFromSnapshots();
       return;
@@ -80,22 +101,93 @@ export class RectWallCreateCommand implements ICommand {
 
   /**
    * 撤销矩形墙创建流程
-   * 关键逻辑：移除父级矩形墙；管理器会级联删除四面子墙及其连接。
+   * 关键逻辑：通过墙体级联删除命令移除矩形墙相关墙体，确保依赖对象同步处理。
    */
   public undo(): void {
     if (this._createdObjectSnapshots !== null) {
-      /* 撤销矩形墙时必须同时移除自动生成的楼板与天花板，避免副作用对象残留。 */
-      for (let i: number = this._createdObjectSnapshots.length - 1; i >= 0; i--) {
-        const snapshot: BuildingObject = this._createdObjectSnapshots[i]!;
-        this._manager.removeObject(snapshot.id);
+      const wallIds: string[] = this._collectCreatedWallIds(this._createdObjectSnapshots);
+      if (wallIds.length > 0) {
+        /* 撤销矩形墙布置时必须检测墙体依赖，级联删除楼板、天花板和门窗 STL。 */
+        const cascadeDeleteCommand: WallCascadeDeleteCommand = new WallCascadeDeleteCommand(
+          this._manager,
+          this._scene,
+          wallIds
+        );
+        cascadeDeleteCommand.execute();
+        this._cascadeDeleteCommand = cascadeDeleteCommand;
       }
+
+      this._removeCreatedNonWallObjects(this._createdObjectSnapshots);
     } else {
-      this._manager.removeObject(this._rectData.id);
+      const fallbackWallIds: string[] = this._collectFallbackWallIds();
+      const cascadeDeleteCommand: WallCascadeDeleteCommand = new WallCascadeDeleteCommand(
+        this._manager,
+        this._scene,
+        fallbackWallIds
+      );
+      cascadeDeleteCommand.execute();
+      this._cascadeDeleteCommand = cascadeDeleteCommand;
     }
 
     if (this._beforeSignatureSnapshot !== null) {
       this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._beforeSignatureSnapshot);
     }
+  }
+
+  /**
+   * 释放撤销创建时被级联删除的门窗 STL 资源。
+   */
+  public dispose(): void {
+    if (this._cascadeDeleteCommand !== null) {
+      this._cascadeDeleteCommand.dispose();
+      this._cascadeDeleteCommand = null;
+    }
+  }
+
+  /**
+   * 从创建快照中收集墙体 ID。
+   * @param snapshots - 本命令创建的对象快照
+   * @returns 墙体 ID 数组
+   */
+  private _collectCreatedWallIds(snapshots: BuildingObject[]): string[] {
+    const wallIds: string[] = [];
+    for (const snapshot of snapshots) {
+      if (snapshot.category === 'wall') {
+        wallIds.push(snapshot.id);
+      }
+    }
+    return wallIds;
+  }
+
+  /**
+   * 移除本命令创建但未被墙体级联删除覆盖的非墙对象。
+   * @param snapshots - 本命令创建的对象快照
+   */
+  private _removeCreatedNonWallObjects(snapshots: BuildingObject[]): void {
+    for (let i: number = snapshots.length - 1; i >= 0; i--) {
+      const snapshot: BuildingObject = snapshots[i]!;
+      if (snapshot.category === 'wall') {
+        continue;
+      }
+
+      const currentObject: BuildingObject | undefined = this._manager.getById(snapshot.id);
+      if (currentObject !== undefined) {
+        this._manager.removeObject(snapshot.id);
+      }
+    }
+  }
+
+  /**
+   * 收集未捕获创建快照时的矩形墙相关墙体 ID。
+   * @returns 矩形墙父级与子墙 ID 数组
+   */
+  private _collectFallbackWallIds(): string[] {
+    const wallIds: string[] = [];
+    wallIds.push(this._rectData.id);
+    for (const childData of this._childrenData) {
+      wallIds.push(childData.id);
+    }
+    return wallIds;
   }
 
   /**

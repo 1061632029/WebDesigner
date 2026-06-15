@@ -42,6 +42,11 @@ export function useHistoryShortcuts(): void {
   useEffect((): (() => void) => {
     /* 键盘事件处理函数 */
     const handler = (event: KeyboardEvent): void => {
+      /* 快捷键长按会产生重复 keydown；忽略重复事件，避免一次按键连续撤销多条拖拽命令。 */
+      if (event.repeat) {
+        return;
+      }
+
       /* 焦点在可编辑元素上时跳过，保留浏览器默认撤销/重做 */
       if (isEditableElementFocused()) {
         return;

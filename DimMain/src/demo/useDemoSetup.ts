@@ -11,6 +11,7 @@ import { useDrawToolBridge } from '../react/context/DrawToolContext';
 import { useGizmoBridge } from '../react/context/GizmoContext';
 import { useFitSceneBridge } from '../react/context/FitSceneContext';
 import { useClearSceneBridge } from '../react/context/ClearSceneContext';
+import { useRoomScreenshotBridge } from '../react/context/RoomScreenshotContext';
 import { useStlPlaceBridge } from '../react/context/StlPlaceContext';
 import { useViewMode } from '../react/context/ViewModeContext';
 import { useHistoryContext } from '../react/context/HistoryContext';
@@ -20,7 +21,9 @@ import type { DrawToolBridge } from '../react/context/DrawToolContext';
 import type { GizmoBridge } from '../react/context/GizmoContext';
 import type { FitSceneBridge } from '../react/context/FitSceneContext';
 import type { ClearSceneBridge } from '../react/context/ClearSceneContext';
+import type { RoomScreenshotBridge } from '../react/context/RoomScreenshotContext';
 import type { StlPlaceBridge } from '../react/context/StlPlaceContext';
+import type { PhotoStorageItem } from '../panel/PanelTypes';
 import type { DrawToolMode } from '../building/BuildingTypes';
 import type { GizmoMode } from '../interaction/TransformGizmo';
 import type { CommandHistoryManager } from '../history/CommandHistoryManager';
@@ -46,6 +49,7 @@ export function useDemoSetup(): void {
   const gizmoBridge: GizmoBridge = useGizmoBridge();
   const fitSceneBridge: FitSceneBridge = useFitSceneBridge();
   const clearSceneBridge: ClearSceneBridge = useClearSceneBridge();
+  const roomScreenshotBridge: RoomScreenshotBridge = useRoomScreenshotBridge();
   const stlPlaceBridge: StlPlaceBridge = useStlPlaceBridge();
   const historyContext: { manager: CommandHistoryManager; state: HistoryState } = useHistoryContext();
   const historyManager: CommandHistoryManager = historyContext.manager;
@@ -102,6 +106,33 @@ export function useDemoSetup(): void {
     };
 
     /**
+     * 拍摄当前房间画面
+     * 关键流程：优先调用 Canvas 内部注册的房间裁剪拍摄能力，根据房间空间大小截取室内区域后写入照片存储栏。
+     */
+    const triggerScreenshot = (): void => {
+      if (roomScreenshotBridge.captureRoomScreenshotRef.current === null) {
+        console.warn('[拍摄] 房间拍摄工具尚未就绪');
+        return;
+      }
+
+      /* 将房间裁剪画面转为 Data URL 并写入 PanelManager，由照片存储栏订阅刷新。 */
+      const createdAt: Date = new Date();
+      const timestamp: string = createdAt.toISOString().replace(/[:.]/g, '-');
+      const filename: string = `房间照片-${timestamp}`;
+      const dataUrl: string = roomScreenshotBridge.captureRoomScreenshotRef.current();
+      const photoStorageItem: PhotoStorageItem = {
+        id: `photo-${timestamp}`,
+        name: filename,
+        dataUrl,
+        createdAt: createdAt.toISOString(),
+      };
+
+      panelManager.addPhotoStorageItem(photoStorageItem);
+      panelManager.setActiveNav('scene');
+      console.log(`📸 房间拍摄图片已加入照片存储栏：${filename}.png`);
+    };
+
+    /**
      * 通过 GizmoBridge 切换 Gizmo 模式，并同步更新工具栏高亮态
      * @param mode - 目标 Gizmo 模式
      */
@@ -119,39 +150,7 @@ export function useDemoSetup(): void {
     /* ========== 侧边导航项 ========== */
     panelManager.addNav({ id: 'model', icon: '📦', label: '模型', order: 1, panelId: 'panel-model' });
     panelManager.addNav({ id: 'scene', icon: '🌍', label: '场景', order: 2, panelId: 'panel-scene' });
-    /* 隐藏左侧菜单中的材质、灯光和工具入口；对应面板数据保留，避免影响后续功能恢复。 */
-    /* 截图按钮：即时操作，无关联面板，点击直接从 DOM canvas 截图并下载 */
-    panelManager.addNav({
-      id: 'screenshot',
-      icon: '📸',
-      label: '截图',
-      order: 99,
-      panelId: null,
-      action: (): void => {
-        /* 截图前向用户确认是否保存当前场景图片，取消时中断后续下载流程。 */
-        const shouldSaveScreenshot: boolean = window.confirm('是否保存当前场景图片');
-        if (!shouldSaveScreenshot) {
-          return;
-        }
-
-        /* 直接从 DOM 获取 canvas 元素，无需 EngineContext */
-        const canvas: HTMLCanvasElement | null = document.querySelector('canvas');
-        if (canvas === null) {
-          console.warn('[截图] 找不到 canvas 元素');
-          return;
-        }
-        const filename: string = `dim-screenshot-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-        const dataUrl: string = canvas.toDataURL('image/png');
-        const link: HTMLAnchorElement = document.createElement('a');
-        link.href = dataUrl;
-        link.download = `${filename}.png`;
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        console.log(`📸 截图已下载：${filename}.png`);
-      },
-    });
+    /* 隐藏左侧菜单中的材质、灯光、工具和独立截图入口；截图能力已移动到场景菜单内的“拍摄”。 */
 
     /* ========== 左侧功能面板 ========== */
     const noop = (): void => { console.log('操作触发'); };
@@ -180,17 +179,16 @@ export function useDemoSetup(): void {
 
     panelManager.addLeftPanel({
       id: 'panel-scene',
-      title: '场景树',
+      title: '场景',
       groups: [
+        /* 场景操作入口：拍摄从原独立截图菜单迁移到此处，避免侧边导航出现单独截图菜单。 */
         {
-          title: '当前场景',
+          title: '场景',
           items: [
-            // { id: 'scene-root', icon: '🌐', label: '根节点', action: noop },
-            { id: 'scene-camera', icon: '📷', label: '主相机', action: noop },
-            { id: 'scene-light', icon: '💡', label: '灯光组', action: noop },
-            { id: 'scene-mesh', icon: '📦', label: '几何组', action: noop },
+            { id: 'scene-capture', icon: '📸', label: '拍摄', action: (): void => triggerScreenshot() },
           ],
         },
+        /* 当前场景中的主相机、灯光组、几何组不在左侧菜单展示，仅保留视角自适应操作入口。 */
         {
           title: '自适应场景',
           items: [
@@ -198,6 +196,10 @@ export function useDemoSetup(): void {
             { id: 'fit-front',      icon: '🔄', label: '前景',       action: (): void => triggerFitScene(new THREE.Vector3(0, 0, 1)) },
             /* 后景：从 Z- 方向看向原点 */
             { id: 'fit-back',       icon: '🔄', label: '后景',       action: (): void => triggerFitScene(new THREE.Vector3(0, 0, -1)) },
+            /* 后景左侧 45°：从 X- Z- 方向看向原点 */
+            { id: 'fit-back-left',  icon: '🔄', label: '后景左侧45度', action: (): void => triggerFitScene(new THREE.Vector3(-1, 0, -1)) },
+            /* 后景右侧 45°：从 X+ Z- 方向看向原点 */
+            { id: 'fit-back-right', icon: '🔄', label: '后景右侧45度', action: (): void => triggerFitScene(new THREE.Vector3(1, 0, -1)) },
             /* 左景：从 X+ 方向看向原点 */
             { id: 'fit-left',       icon: '🔄', label: '左景',       action: (): void => triggerFitScene(new THREE.Vector3(1, 0, 0)) },
             /* 右景：从 X- 方向看向原点 */

@@ -12,11 +12,14 @@ import type { SelectionManager } from '../../interaction/SelectionManager';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
 import type { BuildingObject } from '../../building/BuildingTypes';
 import type { WallData, SlabData, CeilingData, BeamData, BeamPlacementReference, StraightWallData, WallOpening } from '../../building/BuildingTypes';
+import { WALL_DEFAULTS } from '../../building/BuildingTypes';
+import { FloorAreaCalculator } from '../../building/FloorAreaCalculator';
 import type { PropertyGroup, PropertyItem, NumberPropertyItem, ColorPropertyItem, SelectPropertyItem } from '../../panel/PanelTypes';
 import { PanelContext } from '../context/PanelContext';
 import type { PanelContextValue } from '../context/PanelContext';
 import type { CommandHistoryManager } from '../../history/CommandHistoryManager';
 import { PropertyChangeCommand } from '../../history/commands/PropertyChangeCommand';
+import { AllWallHeightChangeCommand } from '../../history/commands/AllWallHeightChangeCommand';
 import { WallThicknessChangeCommand } from '../../history/commands/WallThicknessChangeCommand';
 import { StlResizeCommand } from '../../history/commands/StlResizeCommand';
 import type { ScaleSnapshot } from '../../history/commands/StlResizeCommand';
@@ -31,6 +34,7 @@ import type { WallSnapResult } from '../../building/WallSnapHelper';
 import { DoorWindowCollisionDetector } from '../../model/DoorWindowCollisionDetector';
 import { DoorOpeningDirectionHelper } from '../../model/DoorOpeningDirectionHelper';
 import type { DoorOpeningDirection } from '../../model/DoorOpeningDirectionHelper';
+import { StlRotationAngleHelper, STL_ROTATION_ANGLE_MAX_DEGREES, STL_ROTATION_ANGLE_MIN_DEGREES } from '../../model/StlRotationAngleHelper';
 
 /**
  * 组件属性
@@ -52,6 +56,82 @@ interface SelectionPropertyBinderProps {
 export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): null {
   const { selectionManager, objectManager, historyManager } = props;
   const panelCtx: PanelContextValue | null = useContext(PanelContext);
+
+  /**
+   * 构建未选中任何对象时展示的全局房屋属性。
+   * 关键流程：读取全部建筑对象，墙体高度作为楼层高，所有楼板轮廓面积累加为套内面积。
+   * @returns 全局房屋属性分组数组
+   */
+  const buildGlobalPropertyGroups = useCallback((): Array<PropertyGroup> => {
+    if (panelCtx === null) {
+      return [];
+    }
+
+    const objects: BuildingObject[] = objectManager.getAll();
+    let floorHeight: number = WALL_DEFAULTS.height;
+    let hasWallHeight: boolean = false;
+    let totalIndoorArea: number = 0;
+
+    for (let objectIndex: number = 0; objectIndex < objects.length; objectIndex++) {
+      const objectData: BuildingObject = objects[objectIndex] as BuildingObject;
+      if (objectData.category === 'wall' && !hasWallHeight) {
+        const wallData: WallData = objectData as WallData;
+        floorHeight = wallData.height;
+        hasWallHeight = true;
+      }
+
+      if (objectData.category === 'slab') {
+        const slabData: SlabData = objectData as SlabData;
+        totalIndoorArea += FloorAreaCalculator.calculatePolygonArea(slabData.outline);
+      }
+    }
+
+    const floorHeightItem: NumberPropertyItem = {
+      id: 'global-floor-height',
+      type: 'number',
+      label: '楼层高',
+      unit: 'mm',
+      min: 500,
+      max: 20000,
+      step: 50,
+      value: Math.round(floorHeight * 1000),
+      onChange: (value: number): void => {
+        const floorHeightInMeters: number = value / 1000;
+        const cmd: AllWallHeightChangeCommand = new AllWallHeightChangeCommand(
+          objectManager,
+          floorHeightInMeters,
+          (): void => {
+            refreshProperties();
+          },
+          '修改楼层高'
+        );
+        historyManager.execute(cmd);
+      },
+    };
+
+    const indoorAreaItem: NumberPropertyItem = {
+      id: 'global-indoor-area',
+      type: 'number',
+      label: '套内面积',
+      unit: '㎡',
+      min: 0,
+      step: 0.01,
+      value: Number(totalIndoorArea.toFixed(2)),
+      readonly: true,
+      readonlyHint: '套内面积由所有楼板轮廓自动计算，不可手动编辑',
+      onChange: (_value: number): void => {
+        /* 只读派生属性：套内面积由楼板 outline 自动计算，此处保留空回调用于满足属性控件接口。 */
+      },
+    };
+
+    return [
+      {
+        title: '🏠 房屋属性',
+        expanded: true,
+        items: [floorHeightItem, indoorAreaItem],
+      },
+    ];
+  }, [objectManager, historyManager, panelCtx]);
 
   /**
    * 将建筑对象数据转换为属性面板分组
@@ -115,7 +195,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
         };
         wallItems.push(thicknessItem);
 
-        /* 墙高：直墙显示，绑定天花板时只读（由天花板 bottomOffset 控制） */
+        /* 墙高：面板使用毫米输入展示，内部仍以米保存；绑定天花板时只读（由天花板 bottomOffset 控制）。 */
         if (wallData.subType === 'straight') {
           const straightWall: StraightWallData = wallData as StraightWallData;
           /* 是否绑定了天花板 */
@@ -124,11 +204,11 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
             id: 'height',
             type: 'number',
             label: '墙高',
-            unit: 'm',
-            min: 0.5,
-            max: 20,
-            step: 0.05,
-            value: wallData.height,
+            unit: 'mm',
+            min: 500,
+            max: 20000,
+            step: 50,
+            value: Math.round(wallData.height * 1000),
             /* 绑定天花板时只读，置灰显示 */
             readonly: isBoundToCeiling,
             readonlyHint: isBoundToCeiling ? '由天花板房间高控制，请修改天花板属性' : undefined,
@@ -137,11 +217,12 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
               if (isBoundToCeiling) {
                 return;
               }
+              const heightInMeters: number = value / 1000;
               const cmd: PropertyChangeCommand<BuildingObject> = new PropertyChangeCommand<BuildingObject>({
                 target: obj,
                 propertyPath: 'height',
                 before: wallData.height,
-                after: value,
+                after: heightInMeters,
                 label: `修改墙高 ${wallData.name}`,
                 onApply: (_target: BuildingObject, _path: string, newValue: unknown): void => {
                   objectManager.updateObject(obj.id, { height: newValue as number });
@@ -333,23 +414,25 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
       const slabData: SlabData = obj as SlabData;
       const slabItems: Array<NumberPropertyItem> = [];
 
-      /* 顶部高度：控制楼板顶面 Y 位置，修改不影响厚度 */
+      /* 板底高：面板使用毫米输入展示；内部通过 topOffset - slabThickness 计算，修改时保持板厚不变并反算顶面高度。 */
       const topOffsetItem: NumberPropertyItem = {
         id: 'topOffset',
         type: 'number',
-        label: '顶部高度',
-        unit: 'm',
-        min: -10,
-        max: 100,
-        step: 0.05,
-        value: slabData.topOffset,
+        label: '板底高',
+        unit: 'mm',
+        min: -10000,
+        max: 100000,
+        step: 50,
+        value: Math.round((slabData.topOffset - slabData.slabThickness) * 1000),
         onChange: (value: number): void => {
+          const bottomHeightInMeters: number = value / 1000;
+          const topOffsetInMeters: number = bottomHeightInMeters + slabData.slabThickness;
           const cmd: PropertyChangeCommand<BuildingObject> = new PropertyChangeCommand<BuildingObject>({
             target: obj,
             propertyPath: 'topOffset',
             before: slabData.topOffset,
-            after: value,
-            label: `修改楼板顶部高度 ${slabData.name}`,
+            after: topOffsetInMeters,
+            label: `修改楼板板底高 ${slabData.name}`,
             onApply: (_target: BuildingObject, _path: string, newValue: unknown): void => {
               objectManager.updateObject(obj.id, { topOffset: newValue as number } as Partial<SlabData>);
               refreshProperties();
@@ -360,22 +443,23 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
       };
       slabItems.push(topOffsetItem);
 
-      /* 板厚：向下拉伸，修改厚度不影响顶面高度 */
+      /* 板厚：面板使用毫米输入展示，内部仍以米保存；向下拉伸，修改厚度不影响顶面高度。 */
       const slabThicknessItem: NumberPropertyItem = {
         id: 'slabThickness',
         type: 'number',
         label: '板厚',
-        unit: 'm',
-        min: 0.05,
-        max: 2,
-        step: 0.01,
-        value: slabData.slabThickness,
+        unit: 'mm',
+        min: 50,
+        max: 2000,
+        step: 10,
+        value: Math.round(slabData.slabThickness * 1000),
         onChange: (value: number): void => {
+          const slabThicknessInMeters: number = value / 1000;
           const cmd: PropertyChangeCommand<BuildingObject> = new PropertyChangeCommand<BuildingObject>({
             target: obj,
             propertyPath: 'slabThickness',
             before: slabData.slabThickness,
-            after: value,
+            after: slabThicknessInMeters,
             label: `修改板厚 ${slabData.name}`,
             onApply: (_target: BuildingObject, _path: string, newValue: unknown): void => {
               objectManager.updateObject(obj.id, { slabThickness: newValue as number } as Partial<SlabData>);
@@ -556,9 +640,12 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
       return;
     }
 
+    const propertyPanelController = panelCtx.propertyPanelController;
     const selectedIds: ReadonlySet<string> = selectionManager.selectedIds;
     if (selectedIds.size === 0) {
-      panelCtx.panelManager.setPropertyGroups([]);
+      /* 未选中任何对象时展示全局房屋属性，便于统一编辑楼层高并查看套内面积。 */
+      propertyPanelController.bindBuilder((): Array<PropertyGroup> => buildGlobalPropertyGroups());
+      propertyPanelController.refresh();
       return;
     }
 
@@ -566,13 +653,14 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
     const firstId: string = selectedIds.values().next().value as string;
     const obj: BuildingObject | undefined = objectManager.getById(firstId);
     if (obj === undefined) {
-      panelCtx.panelManager.setPropertyGroups([]);
+      propertyPanelController.clear();
       return;
     }
 
-    const groups: Array<PropertyGroup> = buildPropertyGroups(obj);
-    panelCtx.panelManager.setPropertyGroups(groups);
-  }, [selectionManager, objectManager, panelCtx, buildPropertyGroups]);
+    /* 建筑对象属性面板刷新入口：绑定当前对象构建器，后续属性变更统一调用 refresh。 */
+    propertyPanelController.bindBuilder((): Array<PropertyGroup> => buildPropertyGroups(obj));
+    propertyPanelController.refresh();
+  }, [selectionManager, objectManager, panelCtx, buildPropertyGroups, buildGlobalPropertyGroups]);
 
   /* ===== 订阅建筑对象选中变更 ===== */
   useEffect((): (() => void) => {
@@ -585,6 +673,39 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
     return unsubscribe;
   }, [selectionManager, refreshProperties]);
 
+  /* ===== 订阅建筑对象数据变更 ===== */
+  useEffect((): (() => void) => {
+    const unsubscribe: () => void = objectManager.onChange(
+      (objectId: string, action: 'add' | 'remove' | 'update'): void => {
+        const selectedStlMesh: THREE.Mesh | null = selectionManager.selectedStlMesh;
+        if (selectedStlMesh !== null) {
+          return;
+        }
+
+        const selectedIds: ReadonlySet<string> = selectionManager.selectedIds;
+        if (selectedIds.size === 0) {
+          /* 全局房屋属性依赖所有楼板面积；楼板新增、修改、删除以及撤销/重做触发的对象变更都需要重新计算套内面积。 */
+          refreshProperties();
+          return;
+        }
+
+        const changedObject: BuildingObject | undefined = objectManager.getById(objectId);
+        if (changedObject !== undefined && changedObject.category === 'slab') {
+          /* 已选中建筑对象时，若楼板仍可反查，说明楼板轮廓或属性发生变化，需要刷新当前面板中的派生数据。 */
+          refreshProperties();
+          return;
+        }
+
+        if (action === 'remove' && selectedIds.has(objectId)) {
+          /* 删除当前选中的建筑对象时，对象可能已无法反查；刷新面板可清理失效属性并避免显示旧数据。 */
+          refreshProperties();
+        }
+      }
+    );
+
+    return unsubscribe;
+  }, [objectManager, selectionManager, refreshProperties]);
+
   /* ===== 订阅 STL 模型选中变更 ===== */
   useEffect((): (() => void) => {
     const unsubscribe: () => void = selectionManager.onStlChange(
@@ -592,6 +713,8 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
         if (panelCtx === null) {
           return;
         }
+
+        const propertyPanelController = panelCtx.propertyPanelController;
 
         if (mesh === null) {
           /* STL 取消选中时也刷新一下建筑对象属性 */
@@ -784,7 +907,6 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
 
         /* 窗户类型：显示窗台高度属性，支持编辑并联动模型位置和洞口 */
         if (category === 'window') {
-          const currentSillHeight: number = (mesh.userData['sillHeight'] as number) ?? 0;
           const originalSizeX: number = (mesh.userData['originalSizeX'] as number) ?? 1;
           const originalSizeY: number = (mesh.userData['originalSizeY'] as number) ?? 1;
           const originalSizeZ: number = (mesh.userData['originalSizeZ'] as number) ?? 1;
@@ -796,15 +918,16 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
            * 2. 更新 userData['sillHeight']
            * 3. 若有关联墙体，重新计算洞口 bottomElevation 并更新墙体
            */
-          const onSillHeightChange = (newSillHeight: number): void => {
+          const onSillHeightChange = (newSillHeightInMillimeters: number): void => {
+            const newSillHeightInMeters: number = newSillHeightInMillimeters / 1000;
             executeDoorWindowOpeningTransform(
               `修改窗台高度 ${stlName}`,
               (): void => {
-                mesh.position.setY(newSillHeight);
-                mesh.userData['sillHeight'] = newSillHeight;
+                mesh.position.setY(newSillHeightInMeters);
+                mesh.userData['sillHeight'] = newSillHeightInMeters;
               },
               (): void => {
-                panelCtx.panelManager.setPropertyGroups(buildWindowPropertyGroups(mesh.userData['sillHeight'] as number));
+                propertyPanelController.refresh();
               }
             );
           };
@@ -865,7 +988,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                     }
                   },
                   (): void => {
-                    panelCtx.panelManager.setPropertyGroups(buildWindowPropertyGroups(mesh.userData['sillHeight'] as number));
+                    propertyPanelController.refresh();
                   }
                 );
               },
@@ -875,11 +998,11 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
               id: 'sillHeight',
               type: 'number',
               label: '窗台高度',
-              unit: 'm',
+              unit: 'mm',
               min: 0,
-              max: 5,
-              step: 0.05,
-              value: sillHeight,
+              max: 5000,
+              step: 10,
+              value: Math.round(sillHeight * 1000),
               onChange: onSillHeightChange,
             };
 
@@ -888,16 +1011,19 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                 title: `🪟 窗户: ${stlName}`,
                 expanded: true,
                 items: [
-                  makeWindowSizeItem('x', '宽（X）', currentSizeXmm, originalSizeX),
-                  makeWindowSizeItem('y', '高（Y）', currentSizeYmm, originalSizeY),
-                  makeWindowSizeItem('z', '厚（Z）', currentSizeZmm, originalSizeZ),
+                  makeWindowSizeItem('x', '宽', currentSizeXmm, originalSizeX),
+                  makeWindowSizeItem('y', '高', currentSizeYmm, originalSizeY),
+                  makeWindowSizeItem('z', '厚', currentSizeZmm, originalSizeZ),
                   sillHeightItem,
                 ],
               },
             ];
           };
 
-          panelCtx.panelManager.setPropertyGroups(buildWindowPropertyGroups(currentSillHeight));
+          propertyPanelController.bindBuilder(
+            (): Array<PropertyGroup> => buildWindowPropertyGroups(mesh.userData['sillHeight'] as number)
+          );
+          propertyPanelController.refresh();
           return;
         }
 
@@ -973,12 +1099,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                     }
                   },
                   (): void => {
-                    panelCtx.panelManager.setPropertyGroups(
-                      buildDoorPropertyGroups(
-                        mesh.userData['doorBottomHeight'] as number,
-                        DoorOpeningDirectionHelper.getDirection(mesh)
-                      )
-                    );
+                    propertyPanelController.refresh();
                   }
                 );
               },
@@ -992,25 +1113,21 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
               id: 'doorBottomHeight',
               type: 'number',
               label: '门底高度',
-              unit: 'm',
-              min: -10,
-              max: 10,
-              step: 0.01,
-              value: doorBottomHeight,
-              onChange: (newHeight: number): void => {
+              unit: 'mm',
+              min: -10000,
+              max: 10000,
+              step: 10,
+              value: Math.round(doorBottomHeight * 1000),
+              onChange: (newHeightInMillimeters: number): void => {
+                const newHeightInMeters: number = newHeightInMillimeters / 1000;
                 executeDoorWindowOpeningTransform(
                   `修改门底高度 ${stlName}`,
                   (): void => {
-                    mesh.position.setY(newHeight);
-                    mesh.userData['doorBottomHeight'] = newHeight;
+                    mesh.position.setY(newHeightInMeters);
+                    mesh.userData['doorBottomHeight'] = newHeightInMeters;
                   },
                   (): void => {
-                    panelCtx.panelManager.setPropertyGroups(
-                      buildDoorPropertyGroups(
-                        mesh.userData['doorBottomHeight'] as number,
-                        DoorOpeningDirectionHelper.getDirection(mesh)
-                      )
-                    );
+                    propertyPanelController.refresh();
                   }
                 );
               },
@@ -1035,9 +1152,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                 }
                 const nextDirection: DoorOpeningDirection = value;
                 DoorOpeningDirectionHelper.setDirectionAndRefreshSymbol(mesh, nextDirection, true);
-                panelCtx.panelManager.setPropertyGroups(
-                  buildDoorPropertyGroups(mesh.userData['doorBottomHeight'] as number, nextDirection)
-                );
+                propertyPanelController.refresh();
               },
             };
 
@@ -1046,9 +1161,9 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                 title: `🚪 门: ${stlName}`,
                 expanded: true,
                 items: [
-                  makeDoorSizeItem('x', '宽（X）', currentSizeXmm, originalSizeX),
-                  makeDoorSizeItem('y', '高（Y）', currentSizeYmm, originalSizeY),
-                  makeDoorSizeItem('z', '厚（Z）', currentSizeZmm, originalSizeZ),
+                  makeDoorSizeItem('x', '宽', currentSizeXmm, originalSizeX),
+                  makeDoorSizeItem('y', '高', currentSizeYmm, originalSizeY),
+                  makeDoorSizeItem('z', '厚', currentSizeZmm, originalSizeZ),
                   doorBottomHeightItem,
                   doorOpeningDirectionItem,
                 ],
@@ -1056,9 +1171,13 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
             ];
           };
 
-          panelCtx.panelManager.setPropertyGroups(
-            buildDoorPropertyGroups(currentDoorBottomHeight, currentDoorOpeningDirection)
+          propertyPanelController.bindBuilder(
+            (): Array<PropertyGroup> => buildDoorPropertyGroups(
+              mesh.userData['doorBottomHeight'] as number,
+              DoorOpeningDirectionHelper.getDirection(mesh)
+            )
           );
+          propertyPanelController.show(buildDoorPropertyGroups(currentDoorBottomHeight, currentDoorOpeningDirection));
           return;
         }
 
@@ -1077,10 +1196,12 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
            * 当前尺寸 = 原始尺寸 × 当前缩放，单位 mm
            * @param currentScale - 当前缩放值（三轴）
            * @param currentFloorHeight - 当前底部高度（m）
+           * @param currentRotationAngleDegrees - 当前绕 Y 轴逆时针旋转角度（度）
            */
           const buildModelPropertyGroups = (
             currentScale: THREE.Vector3,
-            currentFloorHeight: number
+            currentFloorHeight: number,
+            currentRotationAngleDegrees: number
           ): Array<PropertyGroup> => {
             /* 当前显示尺寸（mm）
              * 普通模型也固定按模型局部坐标轴计算：局部 X=长，局部 Z=宽，局部 Y=高。
@@ -1137,9 +1258,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                   afterSnapshot,
                   (): void => {
                     /* 刷新属性面板显示最新尺寸 */
-                    panelCtx.panelManager.setPropertyGroups(
-                      buildModelPropertyGroups(mesh.scale.clone(), mesh.userData['floorHeight'] as number ?? DEFAULT_FLOOR_HEIGHT)
-                    );
+                    propertyPanelController.refresh();
                   },
                   `修改模型${label} ${stlName}`
                 );
@@ -1186,9 +1305,48 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                 historyManager.execute(cmd);
 
                 /* 刷新属性面板显示最新值 */
-                panelCtx.panelManager.setPropertyGroups(
-                  buildModelPropertyGroups(mesh.scale.clone(), newHeight)
+                mesh.userData['floorHeight'] = newHeight;
+                propertyPanelController.refresh();
+              },
+            };
+
+            /**
+             * 旋转角度属性项
+             * 修改时把 0-359 度逆时针角度换算为 Mesh 绕 Y 轴旋转，并通过 TransformCommand 入栈支持撤销/重做。
+             */
+            const rotationAngleItem: NumberPropertyItem = {
+              id: 'rotationAngle',
+              type: 'number',
+              label: '旋转角度',
+              unit: '°',
+              min: STL_ROTATION_ANGLE_MIN_DEGREES,
+              max: STL_ROTATION_ANGLE_MAX_DEGREES,
+              step: 1,
+              value: currentRotationAngleDegrees,
+              onChange: (newAngleInDegrees: number): void => {
+                const nextAngleInDegrees: number = StlRotationAngleHelper.clampCounterClockwiseDegrees(newAngleInDegrees);
+                const beforeSnapshot: TransformSnapshot = TransformCommand.capture(mesh);
+
+                /* 属性编辑流程：先按合法角度更新 Mesh，捕获 after 快照后还原，再交由历史命令执行，确保撤销/重做一致。 */
+                StlRotationAngleHelper.applyCounterClockwiseYDegrees(mesh, nextAngleInDegrees);
+                const afterSnapshot: TransformSnapshot = TransformCommand.capture(mesh);
+                mesh.position.set(beforeSnapshot.position.x, beforeSnapshot.position.y, beforeSnapshot.position.z);
+                mesh.rotation.set(beforeSnapshot.rotation.x, beforeSnapshot.rotation.y, beforeSnapshot.rotation.z);
+                mesh.scale.set(beforeSnapshot.scale.x, beforeSnapshot.scale.y, beforeSnapshot.scale.z);
+                StlRotationAngleHelper.syncUserDataFromMesh(mesh);
+                mesh.updateMatrixWorld(true);
+
+                const cmd: TransformCommand = new TransformCommand(
+                  mesh,
+                  beforeSnapshot,
+                  afterSnapshot,
+                  `修改模型旋转角度 ${stlName}`
                 );
+                historyManager.execute(cmd);
+
+                StlRotationAngleHelper.syncUserDataFromMesh(mesh);
+                selectionManager.refreshSelectedStlHighlight();
+                propertyPanelController.refresh();
               },
             };
 
@@ -1197,17 +1355,26 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                 title: `📦 模型: ${stlName}`,
                 expanded: true,
                 items: [
-                  makeSizeItem('x', '长（X）', currentSizeXmm, originalSizeX),
-                  makeSizeItem('z', '宽（Z）', currentSizeZmm, originalSizeZ),
-                  makeSizeItem('y', '高（Y）', currentSizeYmm, originalSizeY),
+                  makeSizeItem('x', '长', currentSizeXmm, originalSizeX),
+                  makeSizeItem('z', '宽', currentSizeZmm, originalSizeZ),
+                  makeSizeItem('y', '高', currentSizeYmm, originalSizeY),
                   floorHeightItem,
+                  rotationAngleItem,
                 ],
               },
             ];
           };
 
           const initFloorHeight: number = (mesh.userData['floorHeight'] as number) ?? DEFAULT_FLOOR_HEIGHT;
-          panelCtx.panelManager.setPropertyGroups(buildModelPropertyGroups(mesh.scale.clone(), initFloorHeight));
+          const initRotationAngleDegrees: number = StlRotationAngleHelper.syncUserDataFromMesh(mesh);
+          propertyPanelController.bindBuilder(
+            (): Array<PropertyGroup> => buildModelPropertyGroups(
+              mesh.scale.clone(),
+              (mesh.userData['floorHeight'] as number) ?? DEFAULT_FLOOR_HEIGHT,
+              StlRotationAngleHelper.syncUserDataFromMesh(mesh)
+            )
+          );
+          propertyPanelController.show(buildModelPropertyGroups(mesh.scale.clone(), initFloorHeight, initRotationAngleDegrees));
           return;
         }
 
@@ -1217,7 +1384,8 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           expanded: true,
           items: [],
         };
-        panelCtx.panelManager.setPropertyGroups([infoGroup]);
+        propertyPanelController.bindBuilder((): Array<PropertyGroup> => [infoGroup]);
+        propertyPanelController.show([infoGroup]);
       }
     );
 

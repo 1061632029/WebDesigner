@@ -24,6 +24,15 @@ export interface EngineOptions {
 }
 
 /**
+ * WebGPU 渲染器截图配置选项。
+ * Three.js 当前类型定义未暴露 preserveDrawingBuffer，但运行时支持该 Canvas 上下文配置。
+ */
+type WebGPURendererOptionsWithScreenshotBuffer = ConstructorParameters<typeof WebGPURenderer>[0] & {
+  /** 是否保留绘制缓冲，开启后可稳定读取 Canvas 截图数据 */
+  preserveDrawingBuffer: boolean;
+};
+
+/**
  * 三维引擎核心类
  * 负责 WebGPURenderer 的初始化、渲染循环管理、尺寸自适应和资源释放
  */
@@ -98,10 +107,13 @@ export class Engine {
       );
     }
 
-    /* 创建 WebGPURenderer 实例 */
-    this._renderer = new WebGPURenderer({
+    /* 创建 WebGPURenderer 实例：保留绘制缓冲用于拍摄/截图读取。 */
+    const rendererOptions: WebGPURendererOptionsWithScreenshotBuffer = {
       antialias: true,
-    });
+      /* 截图读取流程需要保留绘制缓冲，避免 WebGPU 默认清空帧缓冲导致 toDataURL 得到黑图。 */
+      preserveDrawingBuffer: true,
+    };
+    this._renderer = new WebGPURenderer(rendererOptions);
 
     /* 等待渲染器初始化完成 */
     await this._renderer.init();

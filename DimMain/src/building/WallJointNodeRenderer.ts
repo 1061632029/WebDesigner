@@ -9,6 +9,9 @@ import type { WallJoint } from './BuildingTypes';
 /** 墙衔接节点拾取用户数据标记。 */
 export const WALL_JOINT_NODE_USER_DATA_KEY: string = 'isWallJointNode';
 
+/** 衔接节点所属对象类型。 */
+export type JointNodeOwnerType = 'wall' | 'beam';
+
 /** 墙衔接节点圆片所在分组名称。 */
 const WALL_JOINT_NODE_GROUP_NAME: string = 'wall-joint-node-renderer-group';
 
@@ -80,6 +83,7 @@ export class WallJointNodeRenderer {
       mesh.renderOrder = 141;
       mesh.userData[WALL_JOINT_NODE_USER_DATA_KEY] = true;
       mesh.userData['wallJointId'] = joint.id;
+      mesh.userData['jointNodeOwnerType'] = this._resolveJointNodeOwnerType(joint.id);
       this._group.add(mesh);
     }
   }
@@ -160,5 +164,17 @@ export class WallJointNodeRenderer {
         child.geometry.dispose();
       }
     }
+  }
+
+  /**
+   * 根据节点 ID 解析圆片所属对象类型。
+   * @param jointId - 衔接节点 ID
+   * @returns 梁节点返回 beam，否则保持墙节点类型 wall
+   */
+  private _resolveJointNodeOwnerType(jointId: string): JointNodeOwnerType {
+    if (jointId.startsWith('beam-joint-')) {
+      return 'beam';
+    }
+    return 'wall';
   }
 }

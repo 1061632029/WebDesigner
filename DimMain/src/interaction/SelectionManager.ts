@@ -11,6 +11,7 @@ import { DeleteCommand } from '../history/commands/DeleteCommand';
 import { StlDeleteCommand } from '../history/commands/StlDeleteCommand';
 import { StlDeleteWithOpeningCommand } from '../history/commands/StlDeleteWithOpeningCommand';
 import { SlabCascadeDeleteCommand } from '../history/commands/SlabCascadeDeleteCommand';
+import { WallCascadeDeleteCommand } from '../history/commands/WallCascadeDeleteCommand';
 import { BoundingBoxHelper } from './BoundingBoxHelper';
 import type { ViewMode } from '../react/context/ViewModeContext';
 import type { BuildingObject, CeilingData, WallData, StraightWallData, WallOpening } from '../building/BuildingTypes';
@@ -180,9 +181,9 @@ export class SelectionManager {
   }
 
   /**
-   * 删除所有选中的建筑对象，楼板使用房间级联删除命令。
+   * 删除所有选中的建筑对象，楼板和墙体使用级联删除命令。
    * @param historyManager - 命令历史管理器
-   * @param scene - Three.js 场景，级联删除楼板时用于同步移除门窗 STL
+   * @param scene - Three.js 场景，级联删除楼板或墙体时用于同步移除门窗 STL
    * @returns 被请求删除的对象 ID 数组
    */
   public deleteSelectedWithCascade(historyManager: CommandHistoryManager, scene: THREE.Scene): Array<string> {
@@ -192,6 +193,7 @@ export class SelectionManager {
     }
 
     const selectedSlabIds: Set<string> = this._collectSelectedSlabIds(idsToDelete);
+    const selectedWallIds: Set<string> = this._collectSelectedWallIds(idsToDelete);
 
     /* 先清空选择集合，避免删除楼板后高亮逻辑访问已被级联删除的 Mesh。 */
     this._selectedIds.clear();
@@ -207,8 +209,34 @@ export class SelectionManager {
       }
     });
 
+    const wallIdsForCascade: Array<string> = [];
+    selectedWallIds.forEach((wallId: string): void => {
+      if (!this._isCoveredBySelectedSlab(wallId, selectedSlabIds)) {
+        wallIdsForCascade.push(wallId);
+      }
+    });
+
+    /* 墙体删除需要同步删除依赖楼板、天花板与门窗，并作为一个历史命令整体撤销/重做。 */
+    if (wallIdsForCascade.length > 0) {
+      try {
+        const wallCascadeCommand: WallCascadeDeleteCommand = new WallCascadeDeleteCommand(
+          this._objectManager,
+          scene,
+          wallIdsForCascade
+        );
+        historyManager.execute(wallCascadeCommand);
+      } catch (err: unknown) {
+        console.warn('[SelectionManager] 级联删除墙体失败:', err);
+      }
+    }
+
     for (const id of idsToDelete) {
-      if (selectedSlabIds.has(id) || this._isCoveredBySelectedSlab(id, selectedSlabIds)) {
+      if (
+        selectedSlabIds.has(id) ||
+        selectedWallIds.has(id) ||
+        this._isCoveredBySelectedSlab(id, selectedSlabIds) ||
+        this._isCoveredBySelectedWall(id, selectedWallIds)
+      ) {
         continue;
       }
 
@@ -232,6 +260,22 @@ export class SelectionManager {
     for (const id of idsToCheck) {
       const object: BuildingObject | undefined = this._objectManager.getById(id);
       if (object !== undefined && object.category === 'slab') {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 判断当前选择中是否包含墙体。
+   * @returns 包含墙体时返回 true
+   */
+  public hasSelectedWall(): boolean {
+    const idsToCheck: Array<string> = Array.from(this._selectedIds);
+    for (const id of idsToCheck) {
+      const object: BuildingObject | undefined = this._objectManager.getById(id);
+      if (object !== undefined && object.category === 'wall') {
         return true;
       }
     }
@@ -417,6 +461,71 @@ export class SelectionManager {
     }
 
     return slabIds;
+  }
+
+  /**
+   * 收集当前待删除 ID 中的墙体 ID。
+   * @param idsToCheck - 待检查对象 ID 数组
+   * @returns 墙体 ID 集合
+   */
+  private _collectSelectedWallIds(idsToCheck: Array<string>): Set<string> {
+    const selectedWallIds: Set<string> = new Set<string>();
+    for (const id of idsToCheck) {
+      const object: BuildingObject | undefined = this._objectManager.getById(id);
+      if (object !== undefined && object.category === 'wall') {
+        selectedWallIds.add(id);
+      }
+    }
+
+    return selectedWallIds;
+  }
+
+  /**
+   * 判断对象是否已被选中墙体的级联删除覆盖。
+   * @param objectId - 待判断对象 ID
+   * @param selectedWallIds - 已选墙体 ID 集合
+   * @returns 若对象为依赖楼板、天花板或墙上门窗则返回 true
+   */
+  private _isCoveredBySelectedWall(objectId: string, selectedWallIds: Set<string>): boolean {
+    if (selectedWallIds.size === 0) {
+      return false;
+    }
+
+    const object: BuildingObject | undefined = this._objectManager.getById(objectId);
+    if (object === undefined) {
+      return false;
+    }
+
+    if (object.category === 'slab') {
+      for (const wallId of selectedWallIds) {
+        const wallObject: BuildingObject | undefined = this._objectManager.getById(wallId);
+        if (wallObject !== undefined && wallObject.category === 'wall') {
+          const wallData: WallData = wallObject as WallData;
+          if (wallData.subType === 'straight' && (wallData as StraightWallData).slabId === objectId) {
+            return true;
+          }
+        }
+      }
+    }
+
+    if (object.category === 'ceiling') {
+      const ceilingData: CeilingData = object as CeilingData;
+      for (const wallId of selectedWallIds) {
+        if (ceilingData.wallIds.includes(wallId)) {
+          return true;
+        }
+
+        const wallObject: BuildingObject | undefined = this._objectManager.getById(wallId);
+        if (wallObject !== undefined && wallObject.category === 'wall') {
+          const wallData: WallData = wallObject as WallData;
+          if (wallData.subType === 'straight' && (wallData as StraightWallData).ceilingId === objectId) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   /**

@@ -270,9 +270,10 @@ export function useSelection(): UseSelectionResult {
       return;
     }
 
-    /* 优先删除建筑对象 */
+    /* 优先删除建筑对象：统一走级联删除入口，确保选中墙体时触发 WallCascadeDeleteCommand。 */
     if (selectionManager.hasSelection) {
-      selectionManager.deleteSelected(historyManager);
+      const scene: THREE.Scene = engine.sceneManager.getScene();
+      selectionManager.deleteSelectedWithCascade(historyManager, scene);
       return;
     }
 

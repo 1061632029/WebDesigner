@@ -15,6 +15,7 @@ import {
 } from './LayoutStyles';
 import { MaterialPanel } from './MaterialPanel';
 import { StlModelPanel } from './StlModelPanel';
+import { DoorWindowModelPanel } from './DoorWindowModelPanel';
 
 /**
  * 左侧功能面板
@@ -72,6 +73,9 @@ export function LeftPanel(): React.ReactElement | null {
                   )}
                 </button>
               ))}
+
+              {/* 门窗 STL 模型归入基础几何体分组，并使用名称小图标展示，不渲染 STL 预览图。 */}
+              <DoorWindowModelPanel />
             </div>
           </div>
         ))}

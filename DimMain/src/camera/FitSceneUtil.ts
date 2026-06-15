@@ -17,6 +17,12 @@ import type { OrbitControlsWrapper } from './OrbitControlsWrapper';
 const HELPER_NAME_PREFIX: string = '__';
 
 /**
+ * 自适应场景视图留白系数
+ * 数值越小，相机越靠近场景中心，模型在视图中显示越大；仍会受最小安全距离保护约束。
+ */
+const FIT_SCENE_VIEW_PADDING_FACTOR: number = 0.6;
+
+/**
  * 计算场景内所有可见 Mesh 的合并包围盒
  * 跳过辅助对象（名称以 __ 开头）、GridHelper、AxesHelper、不可见对象
  *
@@ -118,23 +124,23 @@ export function fitSceneToView(
   if (camera instanceof THREE.PerspectiveCamera) {
     /* 透视相机：根据 FOV 计算距离，使包围盒铺满视口
      * halfFov = fov / 2（弧度）
-     * distance = radius / tan(halfFov) * 1.2（留 20% 余量）
+     * distance = radius / tan(halfFov) * FIT_SCENE_VIEW_PADDING_FACTOR（控制视图留白）
      */
     const halfFovRad: number = (camera.fov / 2) * (Math.PI / 180);
     /* 同时考虑宽高比：取水平和垂直方向中较小的 FOV */
     const halfFovRadH: number = Math.atan(Math.tan(halfFovRad) * camera.aspect);
     const effectiveHalfFov: number = Math.min(halfFovRad, halfFovRadH);
-    distance = (radius / Math.tan(effectiveHalfFov)) * 1.2;
+    distance = (radius / Math.tan(effectiveHalfFov)) * FIT_SCENE_VIEW_PADDING_FACTOR;
   } else if (camera instanceof THREE.OrthographicCamera) {
     /* 正交相机：调整 zoom 使包围盒铺满视口
      * 视口高度 = (top - bottom) / zoom
-     * 目标：视口高度 = radius * 2 * 1.2
-     * zoom = (top - bottom) / (radius * 2 * 1.2)
+     * 目标：视口高度 = radius * 2 * FIT_SCENE_VIEW_PADDING_FACTOR
+     * zoom = (top - bottom) / (radius * 2 * FIT_SCENE_VIEW_PADDING_FACTOR)
      */
     const viewHeight: number = camera.top - camera.bottom;
     const viewWidth: number = camera.right - camera.left;
-    const targetHeight: number = radius * 2 * 1.2;
-    const targetWidth: number = radius * 2 * 1.2;
+    const targetHeight: number = radius * 2 * FIT_SCENE_VIEW_PADDING_FACTOR;
+    const targetWidth: number = radius * 2 * FIT_SCENE_VIEW_PADDING_FACTOR;
     const zoomH: number = viewHeight / targetHeight;
     const zoomW: number = viewWidth / targetWidth;
     camera.zoom = Math.min(zoomH, zoomW);

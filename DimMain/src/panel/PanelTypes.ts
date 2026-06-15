@@ -95,6 +95,12 @@ export interface ToolbarItem {
 export type PropertyControlType = 'number' | 'slider' | 'toggle' | 'color' | 'select' | 'button' | 'text';
 
 /**
+ * 属性面板可通过统一入口修改的值类型
+ * 仅覆盖当前属性控件真实支持的数据类型，便于外部场景按属性 ID 触发修改。
+ */
+export type PropertyPanelValue = number | string | boolean;
+
+/**
  * 属性控件基础接口
  */
 export interface PropertyItemBase {
@@ -218,6 +224,23 @@ export interface PropertyGroup {
   expanded: boolean;
   /** 属性控件列表 */
   items: Array<PropertyItem>;
+}
+
+/* ========== 照片存储栏 ========== */
+
+/**
+ * 照片存储项
+ * 用于承载拍摄功能生成的图片数据，仅保存在当前前端运行内存中，不触发本地下载。
+ */
+export interface PhotoStorageItem {
+  /** 唯一标识 */
+  id: string;
+  /** 照片名称 */
+  name: string;
+  /** 图片 Data URL 数据 */
+  dataUrl: string;
+  /** 创建时间 ISO 字符串 */
+  createdAt: string;
 }
 
 /* ========== 布局状态 ========== */

@@ -15,7 +15,7 @@ import { useEngine } from '../hooks/useEngine';
 import { useBuildingContext } from '../context/BuildingContext';
 import type { BuildingObject } from '../../building/BuildingTypes';
 import type { Point2D } from '../../building/BuildingTypes';
-import type { SlabData } from '../../building/BuildingTypes';
+import type { SlabBoundaryDimensionSegment, SlabData } from '../../building/BuildingTypes';
 import { computePolygonArea, computePolygonCentroid } from '../../building/AreaCalculator';
 import type { Engine } from '../../core/Engine';
 
@@ -235,10 +235,15 @@ function computeFloorBoundarySegments(slab: SlabData): FloorBoundarySegmentInfo[
   }
 
   const centroid: Point2D = computePolygonCentroid(outline);
-  for (let index: number = 0; index < outline.length; index++) {
-    const start: Point2D = outline[index]!;
-    const endIndex: number = (index + 1) % outline.length;
-    const end: Point2D = outline[endIndex]!;
+  const sourceSegments: SlabBoundaryDimensionSegment[] =
+    slab.boundaryDimensionSegments !== undefined && slab.boundaryDimensionSegments.length > 0
+      ? slab.boundaryDimensionSegments
+      : createFallbackBoundaryDimensionSegments(outline);
+
+  for (let index: number = 0; index < sourceSegments.length; index++) {
+    const sourceSegment: SlabBoundaryDimensionSegment = sourceSegments[index]!;
+    const start: Point2D = sourceSegment.start;
+    const end: Point2D = sourceSegment.end;
     const deltaX: number = end.x - start.x;
     const deltaZ: number = end.z - start.z;
     const lengthMeters: number = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
@@ -270,6 +275,27 @@ function computeFloorBoundarySegments(slab: SlabData): FloorBoundarySegmentInfo[
     });
   }
 
+  return segments;
+}
+
+/**
+ * 根据楼板轮廓创建逐边兜底标注段。
+ * @param outline - 楼板轮廓点，首尾不重复
+ * @returns 与轮廓边对应的标注段
+ */
+function createFallbackBoundaryDimensionSegments(outline: Point2D[]): SlabBoundaryDimensionSegment[] {
+  const segments: SlabBoundaryDimensionSegment[] = [];
+  const pointCount: number = outline.length;
+  for (let index: number = 0; index < pointCount; index += 1) {
+    const start: Point2D = outline[index]!;
+    const end: Point2D = outline[(index + 1) % pointCount]!;
+    segments.push({
+      start: { x: start.x, z: start.z },
+      end: { x: end.x, z: end.z },
+      wallId: null,
+      sourceType: 'fallback',
+    });
+  }
   return segments;
 }
 

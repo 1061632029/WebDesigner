@@ -208,6 +208,18 @@ export interface ColumnData extends BuildingObjectBase {
 
 /* ========== 楼板类型 ========== */
 
+/** 楼板边界长度标注段。 */
+export interface SlabBoundaryDimensionSegment {
+  /** 标注段起点（XZ 平面，单位：米）。 */
+  start: Point2D;
+  /** 标注段终点（XZ 平面，单位：米）。 */
+  end: Point2D;
+  /** 来源墙体 ID；手动楼板或历史数据可能为空。 */
+  wallId: string | null;
+  /** 来源边界类型，弧形边界按起点到终点的弦长标注。 */
+  sourceType: 'straight' | 'arc' | 'fallback';
+}
+
 /**
  * 楼板数据
  * 由封闭墙体围合的多边形轮廓向下挤压生成
@@ -216,6 +228,8 @@ export interface SlabData extends BuildingObjectBase {
   category: 'slab';
   /** 楼板轮廓（XZ 平面多边形顶点，按顺序闭合，单位：米） */
   outline: Point2D[];
+  /** 楼板边界长度标注段；弧形边界会合并为起点到终点的一条标注。 */
+  boundaryDimensionSegments?: SlabBoundaryDimensionSegment[];
   /** 楼板厚度（米），默认 0.1（100mm），向下拉伸，修改厚度不影响顶面高度 */
   slabThickness: number;
   /**
@@ -302,11 +316,11 @@ export const WALL_DEFAULTS = {
   /** 默认墙体高度（米，对应 2800mm） */
   height: 2.8,
   /** 默认墙体厚度（米，对应 240mm） */
-  thickness: 0.1,
+  thickness: 0.24,
   /** 默认底部标高 */
   elevation: 0,
-  /** 弧形墙默认分段数 */
-  arcSegments: 32,
+  /** 弧形墙默认分段数：提高采样密度，让弧形面显示更平滑 */
+  arcSegments: 64,
 } as const;
 
 /** 天花板默认参数 */
@@ -493,6 +507,17 @@ export interface WallSubtractionRect {
    */
   wallDirX: number;
   wallDirZ: number;
+}
+
+/**
+ * 墙体端点方向参数
+ * 用于连接裁剪时描述指定端点从连接节点指向墙体内部的切向方向。
+ */
+export interface WallEndpointDirection {
+  /** 起点端从节点指向墙体内部的单位方向 */
+  startInwardDir: Point2D;
+  /** 终点端从节点指向墙体内部的单位方向 */
+  endInwardDir: Point2D;
 }
 
 /* ========== 绘制工具相关 ========== */
