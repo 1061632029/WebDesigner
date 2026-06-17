@@ -1,11 +1,13 @@
 /**
  * STL 模型包围盒边界吸附辅助器
- * 在布置普通 STL 模型（category='model'）时，检测预览模型的 AABB 包围盒
- * 与场景中已放置的其他 STL 模型及墙体包围盒的边界距离
+ * 在布置普通 STL 模型（category='model'）时，检测预览模型的 OBB 有向包围盒
+ * 与场景中已放置的其他 STL 模型及墙体 OBB 边界距离
  * 在吸附阈值范围内自动计算偏移量，使边界重合
  */
 
 import * as THREE from 'three/webgpu';
+import { StlObbHelper } from './StlObbHelper';
+import type { StlObb2D, StlObbEdge2D, StlProjectionRange } from './StlObbHelper';
 
 /**
  * 吸附结果
@@ -29,17 +31,28 @@ export interface BBoxSnapResult {
    * 即虚线应绘制的 Z 位置，snappedZ=false 时此值无意义
    */
   snapEdgeZ: number;
+  /** OBB 吸附虚线起点；存在时优先按有向边绘制虚线。 */
+  snapGuideStartPoint?: THREE.Vector3;
+  /** OBB 吸附虚线终点；存在时优先按有向边绘制虚线。 */
+  snapGuideEndPoint?: THREE.Vector3;
 }
 
 /**
- * XZ 平面包围盒（忽略 Y 轴）
+ * OBB 吸附候选结果。
  */
-interface FlatBox {
-  minX: number;
-  maxX: number;
-  minZ: number;
-  maxZ: number;
+interface ObbSnapCandidate {
+  /** 预览模型需要叠加的平移向量。 */
+  offset: THREE.Vector3;
+  /** 吸附距离绝对值。 */
+  distance: number;
+  /** 吸附后的预览 OBB 边起点。 */
+  guideStartPoint: THREE.Vector3;
+  /** 吸附后的预览 OBB 边终点。 */
+  guideEndPoint: THREE.Vector3;
 }
+
+/** 平行边判断阈值，值越接近 1 越严格。 */
+const PARALLEL_DOT_THRESHOLD: number = 0.985;
 
 /**
  * STL 模型包围盒边界吸附辅助器
@@ -67,34 +80,22 @@ export class StlBBoxSnapHelper {
     targetMeshes: Array<THREE.Mesh>,
     threshold: number = StlBBoxSnapHelper.DEFAULT_THRESHOLD
   ): BBoxSnapResult {
-    /* 计算预览 Mesh 的世界空间 AABB（含旋转/缩放） */
+    /* OBB 吸附流程：将预览模型四条有向边与目标模型/墙体的平行有向边做法向距离匹配。 */
     previewMesh.updateMatrixWorld(true);
-    const previewBox3: THREE.Box3 = new THREE.Box3().setFromObject(previewMesh);
-    const previewFlat: FlatBox = {
-      minX: previewBox3.min.x,
-      maxX: previewBox3.max.x,
-      minZ: previewBox3.min.z,
-      maxZ: previewBox3.max.z,
-    };
+    const previewObb: StlObb2D = StlObbHelper.computeObb2D(previewMesh);
 
-    /* 收集所有目标的 XZ 平面包围盒 */
-    const targetBoxes: Array<FlatBox> = [];
+    /* 收集所有目标的 XZ 平面 OBB。 */
+    const targetObbs: Array<StlObb2D> = [];
     for (const mesh of targetMeshes) {
       /* 跳过预览 Mesh 自身（uuid 相同） */
       if (mesh.uuid === previewMesh.uuid) {
         continue;
       }
       mesh.updateMatrixWorld(true);
-      const box3: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-      targetBoxes.push({
-        minX: box3.min.x,
-        maxX: box3.max.x,
-        minZ: box3.min.z,
-        maxZ: box3.max.z,
-      });
+      targetObbs.push(StlObbHelper.computeObb2D(mesh));
     }
 
-    if (targetBoxes.length === 0) {
+    if (targetObbs.length === 0) {
       return {
         offsetX: 0, offsetZ: 0,
         snappedX: false, snappedZ: false,
@@ -102,104 +103,128 @@ export class StlBBoxSnapHelper {
       };
     }
 
-    /* ===== X 轴方向吸附 ===== */
-    let bestOffsetX: number = 0;
-    let bestDistX: number = threshold;
-    let snappedX: boolean = false;
-    /**
-     * 记录发生吸附的预览模型边界 X 坐标（吸附前的原始值）
-     * 吸附后的坐标 = snapEdgeXRaw + bestOffsetX
-     */
-    let snapEdgeXRaw: number = 0;
-
-    for (const target of targetBoxes) {
-      /* 预览 minX 对齐目标 minX */
-      const d1: number = Math.abs(previewFlat.minX - target.minX);
-      if (d1 < bestDistX) {
-        bestDistX = d1;
-        bestOffsetX = target.minX - previewFlat.minX;
-        snapEdgeXRaw = previewFlat.minX;
-        snappedX = true;
-      }
-      /* 预览 minX 对齐目标 maxX */
-      const d2: number = Math.abs(previewFlat.minX - target.maxX);
-      if (d2 < bestDistX) {
-        bestDistX = d2;
-        bestOffsetX = target.maxX - previewFlat.minX;
-        snapEdgeXRaw = previewFlat.minX;
-        snappedX = true;
-      }
-      /* 预览 maxX 对齐目标 minX */
-      const d3: number = Math.abs(previewFlat.maxX - target.minX);
-      if (d3 < bestDistX) {
-        bestDistX = d3;
-        bestOffsetX = target.minX - previewFlat.maxX;
-        snapEdgeXRaw = previewFlat.maxX;
-        snappedX = true;
-      }
-      /* 预览 maxX 对齐目标 maxX */
-      const d4: number = Math.abs(previewFlat.maxX - target.maxX);
-      if (d4 < bestDistX) {
-        bestDistX = d4;
-        bestOffsetX = target.maxX - previewFlat.maxX;
-        snapEdgeXRaw = previewFlat.maxX;
-        snappedX = true;
-      }
+    const bestCandidate: ObbSnapCandidate | null = StlBBoxSnapHelper.findBestObbCandidate(previewObb, targetObbs, threshold);
+    if (bestCandidate === null) {
+      return {
+        offsetX: 0,
+        offsetZ: 0,
+        snappedX: false,
+        snappedZ: false,
+        snapEdgeX: 0,
+        snapEdgeZ: 0,
+      };
     }
 
-    /* ===== Z 轴方向吸附 ===== */
-    let bestOffsetZ: number = 0;
-    let bestDistZ: number = threshold;
-    let snappedZ: boolean = false;
-    /**
-     * 记录发生吸附的预览模型边界 Z 坐标（吸附前的原始值）
-     * 吸附后的坐标 = snapEdgeZRaw + bestOffsetZ
-     */
-    let snapEdgeZRaw: number = 0;
-
-    for (const target of targetBoxes) {
-      /* 预览 minZ 对齐目标 minZ */
-      const d1: number = Math.abs(previewFlat.minZ - target.minZ);
-      if (d1 < bestDistZ) {
-        bestDistZ = d1;
-        bestOffsetZ = target.minZ - previewFlat.minZ;
-        snapEdgeZRaw = previewFlat.minZ;
-        snappedZ = true;
-      }
-      /* 预览 minZ 对齐目标 maxZ */
-      const d2: number = Math.abs(previewFlat.minZ - target.maxZ);
-      if (d2 < bestDistZ) {
-        bestDistZ = d2;
-        bestOffsetZ = target.maxZ - previewFlat.minZ;
-        snapEdgeZRaw = previewFlat.minZ;
-        snappedZ = true;
-      }
-      /* 预览 maxZ 对齐目标 minZ */
-      const d3: number = Math.abs(previewFlat.maxZ - target.minZ);
-      if (d3 < bestDistZ) {
-        bestDistZ = d3;
-        bestOffsetZ = target.minZ - previewFlat.maxZ;
-        snapEdgeZRaw = previewFlat.maxZ;
-        snappedZ = true;
-      }
-      /* 预览 maxZ 对齐目标 maxZ */
-      const d4: number = Math.abs(previewFlat.maxZ - target.maxZ);
-      if (d4 < bestDistZ) {
-        bestDistZ = d4;
-        bestOffsetZ = target.maxZ - previewFlat.maxZ;
-        snapEdgeZRaw = previewFlat.maxZ;
-        snappedZ = true;
-      }
-    }
+    const offsetX: number = bestCandidate.offset.x;
+    const offsetZ: number = bestCandidate.offset.z;
+    const snappedX: boolean = Math.abs(offsetX) > 0.000001;
+    const snappedZ: boolean = Math.abs(offsetZ) > 0.000001;
+    const guideCenter: THREE.Vector3 = bestCandidate.guideStartPoint.clone().add(bestCandidate.guideEndPoint).multiplyScalar(0.5);
 
     return {
-      offsetX: bestOffsetX,
-      offsetZ: bestOffsetZ,
+      offsetX: offsetX,
+      offsetZ: offsetZ,
       snappedX: snappedX,
       snappedZ: snappedZ,
-      /* 吸附后的边界坐标 = 吸附前的边界坐标 + 偏移量 */
-      snapEdgeX: snapEdgeXRaw + bestOffsetX,
-      snapEdgeZ: snapEdgeZRaw + bestOffsetZ,
+      /* 兼容旧虚线字段：OBB 模式下取吸附边中心坐标，实际绘制优先使用下方有向线段。 */
+      snapEdgeX: guideCenter.x,
+      snapEdgeZ: guideCenter.z,
+      snapGuideStartPoint: bestCandidate.guideStartPoint,
+      snapGuideEndPoint: bestCandidate.guideEndPoint,
     };
+  }
+
+  /**
+   * 查找最近的 OBB 平行边吸附候选。
+   * @param previewObb - 预览模型 OBB
+   * @param targetObbs - 目标 OBB 列表
+   * @param threshold - 吸附阈值
+   * @returns 最近候选；无符合条件候选时返回 null
+   */
+  private static findBestObbCandidate(
+    previewObb: StlObb2D,
+    targetObbs: Array<StlObb2D>,
+    threshold: number
+  ): ObbSnapCandidate | null {
+    let bestCandidate: ObbSnapCandidate | null = null;
+    for (let previewEdgeIndex: number = 0; previewEdgeIndex < previewObb.edges.length; previewEdgeIndex += 1) {
+      const previewEdge: StlObbEdge2D | undefined = previewObb.edges[previewEdgeIndex];
+      if (previewEdge === undefined) {
+        continue;
+      }
+      for (let targetObbIndex: number = 0; targetObbIndex < targetObbs.length; targetObbIndex += 1) {
+        const targetObb: StlObb2D | undefined = targetObbs[targetObbIndex];
+        if (targetObb === undefined) {
+          continue;
+        }
+        const candidate: ObbSnapCandidate | null = StlBBoxSnapHelper.findEdgeCandidate(previewEdge, targetObb.edges, threshold);
+        if (candidate === null) {
+          continue;
+        }
+        if (bestCandidate === null || candidate.distance < bestCandidate.distance) {
+          bestCandidate = candidate;
+        }
+      }
+    }
+    return bestCandidate;
+  }
+
+  /**
+   * 查找单条预览边与目标边集合之间的吸附候选。
+   * @param previewEdge - 预览 OBB 边
+   * @param targetEdges - 目标 OBB 边集合
+   * @param threshold - 吸附阈值
+   * @returns 最近候选；无符合条件候选时返回 null
+   */
+  private static findEdgeCandidate(
+    previewEdge: StlObbEdge2D,
+    targetEdges: StlObbEdge2D[],
+    threshold: number
+  ): ObbSnapCandidate | null {
+    let bestCandidate: ObbSnapCandidate | null = null;
+    const previewRange: StlProjectionRange = StlObbHelper.computeProjectionRange(
+      StlObbHelper.createSegmentPoints(previewEdge.startPoint, previewEdge.endPoint),
+      previewEdge.direction
+    );
+
+    for (let targetEdgeIndex: number = 0; targetEdgeIndex < targetEdges.length; targetEdgeIndex += 1) {
+      const targetEdge: StlObbEdge2D | undefined = targetEdges[targetEdgeIndex];
+      if (targetEdge === undefined) {
+        continue;
+      }
+      const parallelDot: number = Math.abs(StlObbHelper.dotXZ(previewEdge.direction, targetEdge.direction));
+      if (parallelDot < PARALLEL_DOT_THRESHOLD) {
+        continue;
+      }
+      const targetRange: StlProjectionRange = StlObbHelper.computeProjectionRange(
+        StlObbHelper.createSegmentPoints(targetEdge.startPoint, targetEdge.endPoint),
+        previewEdge.direction
+      );
+      if (!StlObbHelper.rangesOverlap(previewRange, targetRange, threshold)) {
+        continue;
+      }
+
+      /* 候选计算：沿预览边外法线平移预览模型，使预览边线与目标边线重合。 */
+      const signedDistance: number = StlObbHelper.dotXZ(
+        targetEdge.startPoint.clone().sub(previewEdge.startPoint),
+        previewEdge.normal
+      );
+      const distance: number = Math.abs(signedDistance);
+      if (distance >= threshold) {
+        continue;
+      }
+      const offset: THREE.Vector3 = previewEdge.normal.clone().multiplyScalar(signedDistance);
+      const candidate: ObbSnapCandidate = {
+        offset: offset,
+        distance: distance,
+        guideStartPoint: previewEdge.startPoint.clone().add(offset),
+        guideEndPoint: previewEdge.endPoint.clone().add(offset),
+      };
+      if (bestCandidate === null || candidate.distance < bestCandidate.distance) {
+        bestCandidate = candidate;
+      }
+    }
+
+    return bestCandidate;
   }
 }

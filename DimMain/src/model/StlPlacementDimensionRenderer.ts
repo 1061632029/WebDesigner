@@ -1,22 +1,12 @@
 /**
  * STL 常规模型布置距离标注渲染器。
- * 在普通 STL 模型布置预览时，显示预览模型四条 XZ 包围盒边界到最近目标包围平面的水平/垂直距离。
+ * 在普通 STL 模型布置预览时，按当前 OBB 朝向显示到最近目标 OBB 的上下左右距离。
  */
 
 import * as THREE from 'three/webgpu';
 import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
-
-/** XZ 平面包围盒数据，单位为米。 */
-interface StlPlacementFlatBox {
-  /** X 轴最小边界 */
-  minX: number;
-  /** X 轴最大边界 */
-  maxX: number;
-  /** Z 轴最小边界 */
-  minZ: number;
-  /** Z 轴最大边界 */
-  maxZ: number;
-}
+import { StlObbHelper } from './StlObbHelper';
+import type { StlObb2D, StlProjectionRange } from './StlObbHelper';
 
 /** STL 布置标注方向。 */
 export type StlPlacementDimensionSide = 'minX' | 'maxX' | 'minZ' | 'maxZ';
@@ -38,6 +28,30 @@ interface StlPlacementDimensionSegment {
   /** 两端界线方向单位向量 */
   extensionDir: THREE.Vector3;
   /** 标注距离，单位米 */
+  distance: number;
+}
+
+/** 世界坐标四方向标注配置。 */
+interface StlPlacementWorldDirection {
+  /** 标注方向。 */
+  side: StlPlacementDimensionSide;
+  /** 从预览对象指向目标方向的世界单位向量。 */
+  direction: THREE.Vector3;
+  /** 两端界线方向单位向量。 */
+  extensionDir: THREE.Vector3;
+}
+
+/** 指定世界方向的 OBB 距离结果。 */
+interface DirectionalObbDistance {
+  /** 标注方向。 */
+  side: StlPlacementDimensionSide;
+  /** 标注起点。 */
+  startPoint: THREE.Vector3;
+  /** 标注终点。 */
+  endPoint: THREE.Vector3;
+  /** 两端界线方向单位向量。 */
+  extensionDir: THREE.Vector3;
+  /** 沿当前方向的距离，单位米。 */
   distance: number;
 }
 
@@ -75,6 +89,33 @@ interface RenderedStlPlacementDimensionSegment {
 
 /** 投影和显示容差，单位米。 */
 const RANGE_EPSILON: number = 0.001;
+
+/** OBB 主轴水平/竖直判断阈值，值越接近 1 越严格。 */
+const AXIS_ALIGNED_DOT_THRESHOLD: number = 0.985;
+
+/** 世界 XZ 平面四方向，用于动态距离标注稳定输出上下左右距离。 */
+const WORLD_DIRECTIONS: StlPlacementWorldDirection[] = [
+  {
+    side: 'maxX',
+    direction: new THREE.Vector3(1, 0, 0),
+    extensionDir: new THREE.Vector3(0, 0, 1),
+  },
+  {
+    side: 'minX',
+    direction: new THREE.Vector3(-1, 0, 0),
+    extensionDir: new THREE.Vector3(0, 0, 1),
+  },
+  {
+    side: 'maxZ',
+    direction: new THREE.Vector3(0, 0, 1),
+    extensionDir: new THREE.Vector3(1, 0, 0),
+  },
+  {
+    side: 'minZ',
+    direction: new THREE.Vector3(0, 0, -1),
+    extensionDir: new THREE.Vector3(1, 0, 0),
+  },
+];
 
 /** 标注所在高度，略高于地面与普通吸附虚线，避免闪烁。 */
 const DIMENSION_Y: number = 0.13;
@@ -155,7 +196,7 @@ export class StlPlacementDimensionRenderer {
     activeSide: StlPlacementDimensionSide | null = null,
     activeInputText: string | null = null
   ): void {
-    /* 标注刷新流程：基于预览 AABB 四条边，分别查找对应方向最近的目标 AABB 平面并原地更新对象池。 */
+    /* 标注刷新流程：基于预览 OBB 朝向计算四方向距离，并原地更新对象池。 */
     const group: THREE.Group | null = this._group;
     if (group === null || group.parent !== scene) {
       return;
@@ -168,16 +209,16 @@ export class StlPlacementDimensionRenderer {
     }
 
     previewMesh.updateMatrixWorld(true);
-    const previewBox: StlPlacementFlatBox = StlPlacementDimensionRenderer.computeFlatBox(previewMesh);
-    const targetBoxes: StlPlacementFlatBox[] = StlPlacementDimensionRenderer.collectTargetBoxes(previewMesh, targetMeshes);
-    if (targetBoxes.length === 0) {
+    const previewObb: StlObb2D = StlObbHelper.computeObb2D(previewMesh);
+    const targetObbs: StlObb2D[] = StlPlacementDimensionRenderer.collectTargetObbs(previewMesh, targetMeshes);
+    if (targetObbs.length === 0) {
       this.hide();
       return;
     }
 
     const segments: StlPlacementDimensionSegment[] = StlPlacementDimensionRenderer.computeDimensionSegments(
-      previewBox,
-      targetBoxes
+      previewObb,
+      targetObbs
     );
     if (segments.length === 0) {
       this.hide();
@@ -402,28 +443,13 @@ export class StlPlacementDimensionRenderer {
   }
 
   /**
-   * 计算 Mesh 的 XZ 世界空间 AABB。
-   * @param mesh - 待计算 Mesh
-   * @returns XZ 平面包围盒数据
-   */
-  private static computeFlatBox(mesh: THREE.Mesh): StlPlacementFlatBox {
-    const box3: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-    return {
-      minX: box3.min.x,
-      maxX: box3.max.x,
-      minZ: box3.min.z,
-      maxZ: box3.max.z,
-    };
-  }
-
-  /**
-   * 收集目标 Mesh 的 XZ 世界空间 AABB。
+   * 收集目标 Mesh 的 XZ 平面 OBB。
    * @param previewMesh - 当前预览 Mesh，用于排除自身
    * @param targetMeshes - 候选目标 Mesh 列表
-   * @returns 目标 XZ 平面包围盒数组
+   * @returns 目标 XZ 平面 OBB 数组
    */
-  private static collectTargetBoxes(previewMesh: THREE.Mesh, targetMeshes: THREE.Mesh[]): StlPlacementFlatBox[] {
-    const targetBoxes: StlPlacementFlatBox[] = [];
+  private static collectTargetObbs(previewMesh: THREE.Mesh, targetMeshes: THREE.Mesh[]): StlObb2D[] {
+    const targetObbs: StlObb2D[] = [];
     for (let targetIndex: number = 0; targetIndex < targetMeshes.length; targetIndex += 1) {
       const targetMesh: THREE.Mesh | undefined = targetMeshes[targetIndex];
       if (targetMesh === undefined || targetMesh.uuid === previewMesh.uuid || !targetMesh.visible) {
@@ -434,205 +460,202 @@ export class StlPlacementDimensionRenderer {
       }
 
       targetMesh.updateMatrixWorld(true);
-      targetBoxes.push(StlPlacementDimensionRenderer.computeFlatBox(targetMesh));
+      targetObbs.push(StlObbHelper.computeObb2D(targetMesh));
     }
-    return targetBoxes;
+    return targetObbs;
   }
 
   /**
-   * 计算预览包围盒四条边界到最近目标包围平面的标注段。
-   * @param previewBox - 预览 Mesh 的 XZ 平面包围盒
-   * @param targetBoxes - 目标 XZ 平面包围盒数组
+   * 计算预览 OBB 上下左右四方向到最近目标 OBB 的标注段。
+   * @param previewObb - 预览 Mesh 的 XZ 平面 OBB
+   * @param targetObbs - 目标 XZ 平面 OBB 数组
    * @returns 需要绘制的标注段数组
    */
   private static computeDimensionSegments(
-    previewBox: StlPlacementFlatBox,
-    targetBoxes: StlPlacementFlatBox[]
+    previewObb: StlObb2D,
+    targetObbs: StlObb2D[]
   ): StlPlacementDimensionSegment[] {
     const segments: StlPlacementDimensionSegment[] = [];
-    const centerX: number = (previewBox.minX + previewBox.maxX) * 0.5;
-    const centerZ: number = (previewBox.minZ + previewBox.maxZ) * 0.5;
-
-    const nearestLeftPlane: number | null = StlPlacementDimensionRenderer.findNearestLowerPlane(
-      previewBox.minX,
-      targetBoxes,
-      'x'
-    );
-    if (nearestLeftPlane !== null) {
-      segments.push(StlPlacementDimensionRenderer.createXSegment('minX', nearestLeftPlane, previewBox.minX, centerZ));
-    }
-
-    const nearestRightPlane: number | null = StlPlacementDimensionRenderer.findNearestUpperPlane(
-      previewBox.maxX,
-      targetBoxes,
-      'x'
-    );
-    if (nearestRightPlane !== null) {
-      segments.push(StlPlacementDimensionRenderer.createXSegment('maxX', previewBox.maxX, nearestRightPlane, centerZ));
-    }
-
-    const nearestBottomPlane: number | null = StlPlacementDimensionRenderer.findNearestLowerPlane(
-      previewBox.minZ,
-      targetBoxes,
-      'z'
-    );
-    if (nearestBottomPlane !== null) {
-      segments.push(StlPlacementDimensionRenderer.createZSegment('minZ', centerX, nearestBottomPlane, previewBox.minZ));
-    }
-
-    const nearestTopPlane: number | null = StlPlacementDimensionRenderer.findNearestUpperPlane(
-      previewBox.maxZ,
-      targetBoxes,
-      'z'
-    );
-    if (nearestTopPlane !== null) {
-      segments.push(StlPlacementDimensionRenderer.createZSegment('maxZ', centerX, previewBox.maxZ, nearestTopPlane));
+    for (let directionIndex: number = 0; directionIndex < WORLD_DIRECTIONS.length; directionIndex += 1) {
+      const worldDirection: StlPlacementWorldDirection | undefined = WORLD_DIRECTIONS[directionIndex];
+      if (worldDirection === undefined) {
+        continue;
+      }
+      /* 标注目标选择流程：每个世界方向独立查找最近目标 OBB 边界，符合上下左右分别取最近边的动态标注规则。 */
+      const directionalDistance: DirectionalObbDistance | null = StlPlacementDimensionRenderer.findNearestDirectionalObbDistance(
+        previewObb,
+        targetObbs,
+        worldDirection
+      );
+      if (directionalDistance === null) {
+        continue;
+      }
+      segments.push(StlPlacementDimensionRenderer.createDirectionalSegment(directionalDistance));
     }
 
     return segments;
   }
 
   /**
-   * 查找指定边界下侧/左侧最近的目标包围平面。
-   * @param boundary - 当前预览边界坐标
-   * @param targetBoxes - 目标包围盒数组
-   * @param axis - 查找轴向
-   * @returns 最近平面坐标；不存在时返回 null
+   * 查找当前方向与预览 OBB 最近的目标实体 OBB 边界距离。
+   * @param previewObb - 预览 Mesh 的 XZ 平面 OBB
+   * @param targetObbs - 目标 XZ 平面 OBB 数组
+   * @param worldDirection - 世界方向配置
+   * @returns 当前方向最近 OBB 距离结果；不存在有效目标时返回 null
    */
-  private static findNearestLowerPlane(
-    boundary: number,
-    targetBoxes: StlPlacementFlatBox[],
-    axis: 'x' | 'z'
-  ): number | null {
-    let nearestPlane: number | null = null;
-    for (let targetIndex: number = 0; targetIndex < targetBoxes.length; targetIndex += 1) {
-      const targetBox: StlPlacementFlatBox | undefined = targetBoxes[targetIndex];
-      if (targetBox === undefined) {
+  private static findNearestDirectionalObbDistance(
+    previewObb: StlObb2D,
+    targetObbs: StlObb2D[],
+    worldDirection: StlPlacementWorldDirection
+  ): DirectionalObbDistance | null {
+    let nearestDistance: DirectionalObbDistance | null = null;
+    for (let targetObbIndex: number = 0; targetObbIndex < targetObbs.length; targetObbIndex += 1) {
+      const targetObb: StlObb2D | undefined = targetObbs[targetObbIndex];
+      if (targetObb === undefined) {
         continue;
       }
-      const planeA: number = axis === 'x' ? targetBox.minX : targetBox.minZ;
-      const planeB: number = axis === 'x' ? targetBox.maxX : targetBox.maxZ;
-      nearestPlane = StlPlacementDimensionRenderer.pickNearestLowerPlane(boundary, nearestPlane, planeA);
-      nearestPlane = StlPlacementDimensionRenderer.pickNearestLowerPlane(boundary, nearestPlane, planeB);
-    }
-    return nearestPlane;
-  }
-
-  /**
-   * 查找指定边界上侧/右侧最近的目标包围平面。
-   * @param boundary - 当前预览边界坐标
-   * @param targetBoxes - 目标包围盒数组
-   * @param axis - 查找轴向
-   * @returns 最近平面坐标；不存在时返回 null
-   */
-  private static findNearestUpperPlane(
-    boundary: number,
-    targetBoxes: StlPlacementFlatBox[],
-    axis: 'x' | 'z'
-  ): number | null {
-    let nearestPlane: number | null = null;
-    for (let targetIndex: number = 0; targetIndex < targetBoxes.length; targetIndex += 1) {
-      const targetBox: StlPlacementFlatBox | undefined = targetBoxes[targetIndex];
-      if (targetBox === undefined) {
+      const directionalDistance: DirectionalObbDistance | null = StlPlacementDimensionRenderer.computeDirectionalObbDistance(
+        previewObb,
+        targetObb,
+        worldDirection
+      );
+      if (directionalDistance === null) {
         continue;
       }
-      const planeA: number = axis === 'x' ? targetBox.minX : targetBox.minZ;
-      const planeB: number = axis === 'x' ? targetBox.maxX : targetBox.maxZ;
-      nearestPlane = StlPlacementDimensionRenderer.pickNearestUpperPlane(boundary, nearestPlane, planeA);
-      nearestPlane = StlPlacementDimensionRenderer.pickNearestUpperPlane(boundary, nearestPlane, planeB);
+      if (nearestDistance === null || directionalDistance.distance < nearestDistance.distance) {
+        nearestDistance = directionalDistance;
+      }
     }
-    return nearestPlane;
+    return nearestDistance;
   }
 
   /**
-   * 在下侧/左侧候选平面中挑选最近值。
-   * @param boundary - 当前预览边界坐标
-   * @param currentPlane - 当前已选最近平面
-   * @param candidatePlane - 候选平面坐标
-   * @returns 更新后的最近平面
+   * 计算单个世界方向的预览 OBB 到目标 OBB 距离。
+   * 当前 OBB 水平/竖直时，从对应方向边中点到目标最近边界计算水平/竖直距离；
+   * 当前 OBB 非水平/竖直时，从对应方向角点到目标最近边界计算水平/竖直距离。
+   * @param previewObb - 预览 OBB
+   * @param targetObb - 目标 OBB
+   * @param worldDirection - 世界方向配置
+   * @returns 当前方向可标注距离；目标不在该方向时返回 null
    */
-  private static pickNearestLowerPlane(
-    boundary: number,
-    currentPlane: number | null,
-    candidatePlane: number
-  ): number | null {
-    if (candidatePlane > boundary + RANGE_EPSILON) {
-      return currentPlane;
-    }
-    if (currentPlane === null || candidatePlane > currentPlane) {
-      return candidatePlane;
-    }
-    return currentPlane;
-  }
+  private static computeDirectionalObbDistance(
+    previewObb: StlObb2D,
+    targetObb: StlObb2D,
+    worldDirection: StlPlacementWorldDirection
+  ): DirectionalObbDistance | null {
+    const direction: THREE.Vector3 = worldDirection.direction;
+    const previewCenterProjection: number = StlObbHelper.dotXZ(previewObb.center, direction);
+    const targetRange: StlProjectionRange = StlObbHelper.computeProjectionRange(targetObb.corners, direction);
+    const startPoint: THREE.Vector3 = StlPlacementDimensionRenderer.resolveDirectionalStartPoint(previewObb, worldDirection);
+    const startProjection: number = StlObbHelper.dotXZ(startPoint, direction);
+    const targetProjection: number = targetRange.min;
 
-  /**
-   * 在上侧/右侧候选平面中挑选最近值。
-   * @param boundary - 当前预览边界坐标
-   * @param currentPlane - 当前已选最近平面
-   * @param candidatePlane - 候选平面坐标
-   * @returns 更新后的最近平面
-   */
-  private static pickNearestUpperPlane(
-    boundary: number,
-    currentPlane: number | null,
-    candidatePlane: number
-  ): number | null {
-    if (candidatePlane < boundary - RANGE_EPSILON) {
-      return currentPlane;
+    /* 方向筛选流程：必须确保目标最近边界位于预览形心当前方向一侧，防止反向 OBB 生成错误标注。 */
+    if (targetProjection <= previewCenterProjection + RANGE_EPSILON) {
+      return null;
     }
-    if (currentPlane === null || candidatePlane < currentPlane) {
-      return candidatePlane;
-    }
-    return currentPlane;
-  }
 
-  /**
-   * 创建 X 轴方向距离标注段。
-   * @param side - 预览边界方向
-   * @param startX - 起点 X 坐标
-   * @param endX - 终点 X 坐标
-   * @param z - 标注线 Z 坐标
-   * @returns 距离标注段
-   */
-  private static createXSegment(
-    side: StlPlacementDimensionSide,
-    startX: number,
-    endX: number,
-    z: number
-  ): StlPlacementDimensionSegment {
-    const startPoint: THREE.Vector3 = new THREE.Vector3(startX, DIMENSION_Y, z);
-    const endPoint: THREE.Vector3 = new THREE.Vector3(endX, DIMENSION_Y, z);
+    const distance: number = targetProjection - startProjection;
+    if (distance <= RANGE_EPSILON) {
+      return null;
+    }
+
+    startPoint.y = DIMENSION_Y;
+    const endPoint: THREE.Vector3 = startPoint.clone().add(direction.clone().multiplyScalar(distance));
+    endPoint.y = DIMENSION_Y;
     return {
-      side: side,
+      side: worldDirection.side,
       startPoint: startPoint,
       endPoint: endPoint,
-      extensionDir: new THREE.Vector3(0, 0, 1),
-      distance: Math.abs(endX - startX),
+      extensionDir: worldDirection.extensionDir.clone(),
+      distance: distance,
     };
   }
 
   /**
-   * 创建 Z 轴方向距离标注段。
-   * @param side - 预览边界方向
-   * @param x - 标注线 X 坐标
-   * @param startZ - 起点 Z 坐标
-   * @param endZ - 终点 Z 坐标
+   * 根据当前 OBB 朝向解析当前方向的距离起点。
+   * @param previewObb - 当前预览或选中 OBB
+   * @param worldDirection - 世界方向配置
+   * @returns 当前方向距离起点
+   */
+  private static resolveDirectionalStartPoint(
+    previewObb: StlObb2D,
+    worldDirection: StlPlacementWorldDirection
+  ): THREE.Vector3 {
+    if (StlPlacementDimensionRenderer.isWorldAxisAlignedObb(previewObb)) {
+      return StlPlacementDimensionRenderer.createAxisAlignedDirectionalEdgeMidpoint(previewObb, worldDirection.direction);
+    }
+    return StlPlacementDimensionRenderer.findFarthestDirectionalCorner(previewObb, worldDirection.direction);
+  }
+
+  /**
+   * 判断 OBB 是否为世界水平/竖直长方形。
+   * @param obb - 待判断 OBB
+   * @returns 主轴接近世界 X/Z 轴时返回 true
+   */
+  private static isWorldAxisAlignedObb(obb: StlObb2D): boolean {
+    const axisUX: number = Math.abs(obb.axisU.x);
+    const axisUZ: number = Math.abs(obb.axisU.z);
+    const axisVX: number = Math.abs(obb.axisV.x);
+    const axisVZ: number = Math.abs(obb.axisV.z);
+    const axisUAligned: boolean = Math.max(axisUX, axisUZ) >= AXIS_ALIGNED_DOT_THRESHOLD;
+    const axisVAligned: boolean = Math.max(axisVX, axisVZ) >= AXIS_ALIGNED_DOT_THRESHOLD;
+    return axisUAligned && axisVAligned;
+  }
+
+  /**
+   * 创建水平/竖直 OBB 在当前方向上的边中点。
+   * @param previewObb - 当前预览或选中 OBB
+   * @param direction - 世界方向单位向量
+   * @returns 当前方向边中点
+   */
+  private static createAxisAlignedDirectionalEdgeMidpoint(previewObb: StlObb2D, direction: THREE.Vector3): THREE.Vector3 {
+    const previewCenterProjection: number = StlObbHelper.dotXZ(previewObb.center, direction);
+    const previewRange: StlProjectionRange = StlObbHelper.computeProjectionRange(previewObb.corners, direction);
+    const edgeProjection: number = previewRange.max;
+    const edgeMidpoint: THREE.Vector3 = previewObb.center.clone().add(
+      direction.clone().multiplyScalar(edgeProjection - previewCenterProjection)
+    );
+    edgeMidpoint.y = DIMENSION_Y;
+    return edgeMidpoint;
+  }
+
+  /**
+   * 查找 OBB 在当前世界方向上最远的角点。
+   * @param obb - 待查询 OBB
+   * @param direction - 世界方向单位向量
+   * @returns 当前方向最远角点
+   */
+  private static findFarthestDirectionalCorner(obb: StlObb2D, direction: THREE.Vector3): THREE.Vector3 {
+    let farthestCorner: THREE.Vector3 = obb.center;
+    let maxProjection: number = Number.NEGATIVE_INFINITY;
+    for (let cornerIndex: number = 0; cornerIndex < obb.corners.length; cornerIndex += 1) {
+      const corner: THREE.Vector3 | undefined = obb.corners[cornerIndex];
+      if (corner === undefined) {
+        continue;
+      }
+      const projection: number = StlObbHelper.dotXZ(corner, direction);
+      if (projection > maxProjection) {
+        maxProjection = projection;
+        farthestCorner = corner;
+      }
+    }
+    return farthestCorner.clone();
+  }
+
+  /**
+   * 创建世界方向距离标注段。
+   * @param directionalDistance - 当前方向距离结果
    * @returns 距离标注段
    */
-  private static createZSegment(
-    side: StlPlacementDimensionSide,
-    x: number,
-    startZ: number,
-    endZ: number
-  ): StlPlacementDimensionSegment {
-    const startPoint: THREE.Vector3 = new THREE.Vector3(x, DIMENSION_Y, startZ);
-    const endPoint: THREE.Vector3 = new THREE.Vector3(x, DIMENSION_Y, endZ);
+  private static createDirectionalSegment(directionalDistance: DirectionalObbDistance): StlPlacementDimensionSegment {
+    /* 标注生成流程：保留 minX/maxX/minZ/maxZ 方向，尺寸线始终沿世界上下左右方向连接目标点。 */
     return {
-      side: side,
-      startPoint: startPoint,
-      endPoint: endPoint,
-      extensionDir: new THREE.Vector3(1, 0, 0),
-      distance: Math.abs(endZ - startZ),
+      side: directionalDistance.side,
+      startPoint: directionalDistance.startPoint,
+      endPoint: directionalDistance.endPoint,
+      extensionDir: directionalDistance.extensionDir,
+      distance: directionalDistance.distance,
     };
   }
 

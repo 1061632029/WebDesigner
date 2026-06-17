@@ -1,6 +1,6 @@
 /**
  * 2D 平面投影包围盒辅助工具
- * 将 STL 模型的 3D AABB 投影到 XZ 平面，绘制矩形边线和控制点。
+ * 将 STL 模型的 2D OBB 投影到 XZ 平面，绘制有向矩形边线和控制点。
  *
  * 提供两种模式：
  * - attachOutline：仅绘制 4 条边线（用于布置预览）
@@ -11,6 +11,8 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { StlObbHelper } from '../model/StlObbHelper';
+import type { StlObb2D } from '../model/StlObbHelper';
 
 /** 包围盒 Group 在 userData 中的 ownerUuid 键名 */
 const BBOX_OWNER_UUID_KEY: string = '__bboxOwnerUuid__';
@@ -158,23 +160,18 @@ export class BoundingBoxHelper {
     /* 先移除旧的包围盒 */
     BoundingBoxHelper.detach(mesh, scene);
 
-    /* 计算 Mesh 在世界坐标系中的 AABB */
-    const worldBox: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-    if (worldBox.isEmpty()) {
+    /* 计算 Mesh 在世界坐标系 XZ 平面的 OBB，保证旋转模型的选中框跟随模型朝向。 */
+    const obb: StlObb2D | null = BoundingBoxHelper._computeMeshObb(mesh);
+    if (obb === null) {
       return;
     }
-
-    const minX: number = worldBox.min.x;
-    const maxX: number = worldBox.max.x;
-    const minZ: number = worldBox.min.z;
-    const maxZ: number = worldBox.max.z;
     const y: number = BBOX_Y;
 
-    /* ========== 4 个角点坐标（世界坐标 XZ 平面投影） ========== */
-    const p1: THREE.Vector3 = new THREE.Vector3(minX, y, minZ);
-    const p2: THREE.Vector3 = new THREE.Vector3(maxX, y, minZ);
-    const p3: THREE.Vector3 = new THREE.Vector3(maxX, y, maxZ);
-    const p4: THREE.Vector3 = new THREE.Vector3(minX, y, maxZ);
+    /* ========== 4 个 OBB 角点坐标（世界坐标 XZ 平面投影） ========== */
+    const p1: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[0], y);
+    const p2: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[1], y);
+    const p3: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[2], y);
+    const p4: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[3], y);
 
     /* ========== 创建 Group 容器 ========== */
     const group: THREE.Group = new THREE.Group();
@@ -198,29 +195,24 @@ export class BoundingBoxHelper {
     /* 先移除旧的包围盒 */
     BoundingBoxHelper.detach(mesh, scene);
 
-    /* 计算 Mesh 在世界坐标系中的 AABB */
-    const worldBox: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-    if (worldBox.isEmpty()) {
+    /* 计算 Mesh 在世界坐标系 XZ 平面的 OBB，保证旋转模型的控制点跟随模型朝向。 */
+    const obb: StlObb2D | null = BoundingBoxHelper._computeMeshObb(mesh);
+    if (obb === null) {
       return;
     }
-
-    const minX: number = worldBox.min.x;
-    const maxX: number = worldBox.max.x;
-    const minZ: number = worldBox.min.z;
-    const maxZ: number = worldBox.max.z;
     const y: number = BBOX_Y;
 
-    /* ========== 4 个角点坐标（世界坐标 XZ 平面投影） ========== */
-    const p1: THREE.Vector3 = new THREE.Vector3(minX, y, minZ); // 左前
-    const p2: THREE.Vector3 = new THREE.Vector3(maxX, y, minZ); // 右前
-    const p3: THREE.Vector3 = new THREE.Vector3(maxX, y, maxZ); // 右后
-    const p4: THREE.Vector3 = new THREE.Vector3(minX, y, maxZ); // 左后
+    /* ========== 4 个 OBB 角点坐标（世界坐标 XZ 平面投影） ========== */
+    const p1: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[0], y); // 左前
+    const p2: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[1], y); // 右前
+    const p3: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[2], y); // 右后
+    const p4: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[3], y); // 左后
 
     /* ========== 4 个边线中点坐标 ========== */
-    const mp12: THREE.Vector3 = new THREE.Vector3((minX + maxX) / 2, y, minZ); // 前边中点
-    const mp23: THREE.Vector3 = new THREE.Vector3(maxX, y, (minZ + maxZ) / 2); // 右边中点
-    const mp34: THREE.Vector3 = new THREE.Vector3((minX + maxX) / 2, y, maxZ); // 后边中点
-    const mp41: THREE.Vector3 = new THREE.Vector3(minX, y, (minZ + maxZ) / 2); // 左边中点
+    const mp12: THREE.Vector3 = p1.clone().add(p2).multiplyScalar(0.5); // 前边中点
+    const mp23: THREE.Vector3 = p2.clone().add(p3).multiplyScalar(0.5); // 右边中点
+    const mp34: THREE.Vector3 = p3.clone().add(p4).multiplyScalar(0.5); // 后边中点
+    const mp41: THREE.Vector3 = p4.clone().add(p1).multiplyScalar(0.5); // 左边中点
 
     /* ========== 创建 Group 容器 ========== */
     const group: THREE.Group = new THREE.Group();
@@ -253,7 +245,7 @@ export class BoundingBoxHelper {
 
     /* 普通 STL 模型选中时，在下方追加固定屏幕尺寸的旋转标注。 */
     if (BoundingBoxHelper._shouldShowRotateAnnotation(mesh)) {
-      const rotateAnnotationAnchor: THREE.Vector3 = BoundingBoxHelper._getRotateAnnotationAnchor(mesh, worldBox);
+      const rotateAnnotationAnchor: THREE.Vector3 = BoundingBoxHelper._getRotateAnnotationAnchor(mesh, obb);
       const rotateAnnotationRotationY: number = BoundingBoxHelper._getObjectWorldRotationY(mesh);
       const rotateAnnotation: THREE.Group = BoundingBoxHelper._createRotateAnnotationGroup(
         rotateAnnotationAnchor.x,
@@ -284,28 +276,23 @@ export class BoundingBoxHelper {
     /* 先移除旧包围盒，保证拖拽态轮盘与包围盒同步刷新且不会残留普通旋转箭头。 */
     BoundingBoxHelper.detach(mesh, scene);
 
-    const worldBox: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-    if (worldBox.isEmpty()) {
+    const obb: StlObb2D | null = BoundingBoxHelper._computeMeshObb(mesh);
+    if (obb === null) {
       return;
     }
-
-    const minX: number = worldBox.min.x;
-    const maxX: number = worldBox.max.x;
-    const minZ: number = worldBox.min.z;
-    const maxZ: number = worldBox.max.z;
     const y: number = BBOX_Y;
 
-    const p1: THREE.Vector3 = new THREE.Vector3(minX, y, minZ);
-    const p2: THREE.Vector3 = new THREE.Vector3(maxX, y, minZ);
-    const p3: THREE.Vector3 = new THREE.Vector3(maxX, y, maxZ);
-    const p4: THREE.Vector3 = new THREE.Vector3(minX, y, maxZ);
+    const p1: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[0], y);
+    const p2: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[1], y);
+    const p3: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[2], y);
+    const p4: THREE.Vector3 = BoundingBoxHelper._createGroundPoint(obb.corners[3], y);
 
     const group: THREE.Group = new THREE.Group();
     group.userData[BBOX_OWNER_UUID_KEY] = mesh.uuid;
     group.add(BoundingBoxHelper._createLineSegments(p1, p2, p3, p4));
 
     if (BoundingBoxHelper._shouldShowRotateAnnotation(mesh)) {
-      const wheelCenter: THREE.Vector3 = BoundingBoxHelper._getObjectWorldCenter(mesh, worldBox);
+      const wheelCenter: THREE.Vector3 = BoundingBoxHelper._getObjectWorldCenter(mesh, obb);
       const wheelActiveCenterAngle: number = BoundingBoxHelper._getRotateDirectionAngle(rotationY);
       const wheelGroup: THREE.Group = BoundingBoxHelper._createRotateWheelGroup(
         wheelCenter.x,
@@ -343,6 +330,38 @@ export class BoundingBoxHelper {
   }
 
   /* ========== 内部辅助方法 ========== */
+
+  /**
+   * 计算 STL Mesh 的 XZ 平面 OBB。
+   * @param mesh - 目标对象
+   * @returns Mesh 对象的 OBB；非 Mesh 或退化模型返回 null
+   */
+  private static _computeMeshObb(mesh: THREE.Object3D): StlObb2D | null {
+    if (!(mesh instanceof THREE.Mesh)) {
+      return null;
+    }
+
+    const obb: StlObb2D = StlObbHelper.computeObb2D(mesh);
+    if (obb.halfU <= 0 && obb.halfV <= 0) {
+      return null;
+    }
+
+    return obb;
+  }
+
+  /**
+   * 将 OBB 角点转换为包围盒绘制高度上的世界坐标。
+   * @param point - OBB 角点
+   * @param y - 绘制高度
+   * @returns 固定高度后的角点坐标
+   */
+  private static _createGroundPoint(point: THREE.Vector3 | undefined, y: number): THREE.Vector3 {
+    if (point === undefined) {
+      return new THREE.Vector3(0, y, 0);
+    }
+
+    return new THREE.Vector3(point.x, y, point.z);
+  }
 
   /**
    * 创建 4 条边线的 LineSegments 对象
@@ -633,41 +652,39 @@ export class BoundingBoxHelper {
   }
 
   /**
-   * 获取对象世界中心，优先使用对象自身世界坐标，缺失时退回 AABB 中心。
+   * 获取对象世界中心，优先使用对象自身世界坐标，缺失时退回 OBB 中心。
    * @param mesh - 目标对象
-   * @param worldBox - 目标对象世界包围盒
+   * @param obb - 目标对象 OBB
    * @returns 世界坐标中心点
    */
-  private static _getObjectWorldCenter(mesh: THREE.Object3D, worldBox: THREE.Box3): THREE.Vector3 {
+  private static _getObjectWorldCenter(mesh: THREE.Object3D, obb: StlObb2D): THREE.Vector3 {
     const center: THREE.Vector3 = new THREE.Vector3();
     mesh.getWorldPosition(center);
     if (Number.isFinite(center.x) && Number.isFinite(center.z)) {
       return center;
     }
 
-    worldBox.getCenter(center);
-    return center;
+    return obb.center.clone();
   }
 
   /**
    * 计算普通选中态旋转箭头的世界锚点。
-   * 关键流程：先将 Mesh 的 Y 轴旋转转换为 XZ 平面方向，再按该方向投影 AABB 半尺寸，确保箭头位置随模型角度绕中心旋转。
+   * 关键流程：先将 Mesh 的 Y 轴旋转转换为 XZ 平面方向，再按该方向投影 OBB 半尺寸，确保箭头位置随模型角度绕中心旋转。
    * @param mesh - 目标 STL 对象
-   * @param worldBox - 目标对象世界包围盒
+   * @param obb - 目标对象 OBB
    * @returns 旋转箭头锚点世界坐标
    */
-  private static _getRotateAnnotationAnchor(mesh: THREE.Object3D, worldBox: THREE.Box3): THREE.Vector3 {
-    const center: THREE.Vector3 = BoundingBoxHelper._getObjectWorldCenter(mesh, worldBox);
+  private static _getRotateAnnotationAnchor(mesh: THREE.Object3D, obb: StlObb2D): THREE.Vector3 {
+    const center: THREE.Vector3 = BoundingBoxHelper._getObjectWorldCenter(mesh, obb);
     const rotationY: number = BoundingBoxHelper._getObjectWorldRotationY(mesh);
     const directionAngle: number = BoundingBoxHelper._getRotateDirectionAngle(rotationY);
     const outwardDirection: THREE.Vector2 = new THREE.Vector2(
       Math.cos(directionAngle),
       Math.sin(directionAngle)
     ).normalize();
-    const halfSizeX: number = Math.max(0, (worldBox.max.x - worldBox.min.x) / 2);
-    const halfSizeZ: number = Math.max(0, (worldBox.max.z - worldBox.min.z) / 2);
-    const projectedHalfExtent: number = Math.abs(outwardDirection.x) * halfSizeX +
-      Math.abs(outwardDirection.y) * halfSizeZ;
+    const outwardDirection3D: THREE.Vector3 = new THREE.Vector3(outwardDirection.x, 0, outwardDirection.y);
+    const projectedHalfExtent: number = Math.abs(StlObbHelper.dotXZ(outwardDirection3D, obb.axisU)) * obb.halfU +
+      Math.abs(StlObbHelper.dotXZ(outwardDirection3D, obb.axisV)) * obb.halfV;
 
     /* 沿模型当前朝向移动到包围盒外侧，保证默认位置与拖拽态蓝色轮盘方向一致。 */
     return new THREE.Vector3(

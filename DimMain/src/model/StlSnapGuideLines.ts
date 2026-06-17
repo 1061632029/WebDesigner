@@ -1,8 +1,8 @@
 /**
  * STL 模型包围盒吸附虚线提示
  * 当预览模型发生包围盒边界吸附时，在吸附边界处绘制虚线提示
- * X 轴吸附：在吸附的 X 边界处绘制沿 Z 轴方向延伸的虚线
- * Z 轴吸附：在吸附的 Z 边界处绘制沿 X 轴方向延伸的虚线
+ * OBB 吸附：优先沿吸附到的有向边绘制虚线
+ * 兼容旧字段：未提供 OBB 有向边时仍按 X/Z 轴向虚线绘制
  */
 
 import * as THREE from 'three/webgpu';
@@ -66,6 +66,22 @@ export class StlSnapGuideLines {
 
     /* previewMesh 参数保留供未来扩展使用（如限制虚线延伸范围） */
     void previewMesh;
+
+    if (snapResult.snapGuideStartPoint !== undefined && snapResult.snapGuideEndPoint !== undefined) {
+      /* OBB 虚线绘制流程：吸附结果已提供有向边线段，直接按该线段更新一条虚线并隐藏旧轴向辅助线。 */
+      if (this._lineX !== null) {
+        const startPoint: THREE.Vector3 = snapResult.snapGuideStartPoint.clone();
+        const endPoint: THREE.Vector3 = snapResult.snapGuideEndPoint.clone();
+        startPoint.y = GUIDE_Y;
+        endPoint.y = GUIDE_Y;
+        this._updateLineGeometry(this._lineX, startPoint, endPoint);
+        this._lineX.visible = true;
+      }
+      if (this._lineZ !== null) {
+        this._lineZ.visible = false;
+      }
+      return;
+    }
 
     /* X 轴吸附：在吸附的 X 边界处绘制沿 Z 轴方向的虚线
      * 直接使用 snapResult.snapEdgeX（吸附后的精确边界坐标），避免从包围盒推断出错 */

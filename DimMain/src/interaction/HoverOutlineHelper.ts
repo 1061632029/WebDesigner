@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { StlObbHelper, type StlObb2D } from '../model/StlObbHelper';
 
 /** 悬停轮廓线颜色（橙黄色）。 */
 const HOVER_OUTLINE_COLOR: number = 0xffcc33;
@@ -104,14 +105,14 @@ export class HoverOutlineHelper {
 
   /**
    * 根据目标对象创建悬停轮廓几何体。
-   * 关键流程：STL 常规模型直接使用包围盒；非 STL Mesh 优先提取真实折角边；几何体无法提取有效边时回退到世界包围盒。
+   * 关键流程：STL 常规模型直接使用 OBB；非 STL Mesh 优先提取真实折角边；几何体无法提取有效边时回退到世界包围盒。
    * @param target - 当前鼠标命中的目标对象
    * @returns 轮廓几何体；目标无有效空间范围时返回 null
    */
   private static _createOutlineGeometry(target: THREE.Object3D): THREE.BufferGeometry | null {
     /* STL 模型通常三角面数量较多，悬停时不计算实际边线，避免性能开销和复杂边线干扰观察。 */
     if (HoverOutlineHelper._isStlModel(target)) {
-      return HoverOutlineHelper._createBoxOutlineGeometry(target);
+      return HoverOutlineHelper._createStlObbOutlineGeometry(target);
     }
 
     if (target instanceof THREE.Mesh) {
@@ -182,6 +183,37 @@ export class HoverOutlineHelper {
   }
 
   /**
+   * 根据 STL Mesh 的 XZ 平面 OBB 创建悬停轮廓几何体。
+   * 关键流程：水平四角使用模型朝向 OBB，竖向高度沿用世界包围盒，避免旋转 STL 的悬停框退回 AABB。
+   * @param target - 当前鼠标命中的 STL 对象
+   * @returns OBB 轮廓几何体；目标不是 Mesh 或无有效高度范围时返回 null
+   */
+  private static _createStlObbOutlineGeometry(target: THREE.Object3D): THREE.BufferGeometry | null {
+    if (!(target instanceof THREE.Mesh)) {
+      return HoverOutlineHelper._createBoxOutlineGeometry(target);
+    }
+
+    const worldBox: THREE.Box3 = new THREE.Box3().setFromObject(target);
+    if (worldBox.isEmpty()) {
+      return null;
+    }
+
+    HoverOutlineHelper._ensureBoxVisible(worldBox);
+
+    const obb: StlObb2D = StlObbHelper.computeObb2D(target);
+    const visibleCorners: THREE.Vector3[] = HoverOutlineHelper._createVisibleObbCorners(obb);
+    const geometry: THREE.BufferGeometry = new THREE.BufferGeometry();
+    const positions: Float32Array = HoverOutlineHelper._createObbLinePositions(
+      visibleCorners,
+      worldBox.min.y,
+      worldBox.max.y
+    );
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
+
+  /**
    * 创建指定几何体对应的 LineSegments。
    * @param geometry - 已经转换到世界坐标的轮廓几何体
    * @returns 轮廓线对象
@@ -239,6 +271,81 @@ export class HoverOutlineHelper {
       maxX, minY, maxZ, maxX, maxY, maxZ,
       minX, minY, maxZ, minX, maxY, maxZ,
     ]);
+  }
+
+  /**
+   * 生成 OBB 12 条边的顶点坐标数组。
+   * @param corners - OBB 水平四角，顺序为 minU/minV、maxU/minV、maxU/maxV、minU/maxV
+   * @param minY - 轮廓底部世界高度
+   * @param maxY - 轮廓顶部世界高度
+   * @returns 线段顶点坐标数组
+   */
+  private static _createObbLinePositions(corners: THREE.Vector3[], minY: number, maxY: number): Float32Array {
+    const firstCorner: THREE.Vector3 = corners[0]!;
+    const secondCorner: THREE.Vector3 = corners[1]!;
+    const thirdCorner: THREE.Vector3 = corners[2]!;
+    const fourthCorner: THREE.Vector3 = corners[3]!;
+
+    return new Float32Array([
+      firstCorner.x, minY, firstCorner.z, secondCorner.x, minY, secondCorner.z,
+      secondCorner.x, minY, secondCorner.z, thirdCorner.x, minY, thirdCorner.z,
+      thirdCorner.x, minY, thirdCorner.z, fourthCorner.x, minY, fourthCorner.z,
+      fourthCorner.x, minY, fourthCorner.z, firstCorner.x, minY, firstCorner.z,
+
+      firstCorner.x, maxY, firstCorner.z, secondCorner.x, maxY, secondCorner.z,
+      secondCorner.x, maxY, secondCorner.z, thirdCorner.x, maxY, thirdCorner.z,
+      thirdCorner.x, maxY, thirdCorner.z, fourthCorner.x, maxY, fourthCorner.z,
+      fourthCorner.x, maxY, fourthCorner.z, firstCorner.x, maxY, firstCorner.z,
+
+      firstCorner.x, minY, firstCorner.z, firstCorner.x, maxY, firstCorner.z,
+      secondCorner.x, minY, secondCorner.z, secondCorner.x, maxY, secondCorner.z,
+      thirdCorner.x, minY, thirdCorner.z, thirdCorner.x, maxY, thirdCorner.z,
+      fourthCorner.x, minY, fourthCorner.z, fourthCorner.x, maxY, fourthCorner.z,
+    ]);
+  }
+
+  /**
+   * 创建具备最小可见尺寸的 OBB 四角。
+   * @param obb - STL XZ 平面 OBB 数据
+   * @returns 修正退化尺寸后的 OBB 四角
+   */
+  private static _createVisibleObbCorners(obb: StlObb2D): THREE.Vector3[] {
+    const halfU: number = obb.halfU < MIN_BOX_SIZE ? DEGENERATE_BOX_EXPAND_SIZE : obb.halfU;
+    const halfV: number = obb.halfV < MIN_BOX_SIZE ? DEGENERATE_BOX_EXPAND_SIZE : obb.halfV;
+
+    /* 非退化 OBB 直接复用计算结果，避免重复计算带来浮点误差。 */
+    if (halfU === obb.halfU && halfV === obb.halfV) {
+      return obb.corners.map((corner: THREE.Vector3): THREE.Vector3 => corner.clone());
+    }
+
+    return [
+      HoverOutlineHelper._createObbCorner(obb.center, obb.axisU, obb.axisV, -halfU, -halfV),
+      HoverOutlineHelper._createObbCorner(obb.center, obb.axisU, obb.axisV, halfU, -halfV),
+      HoverOutlineHelper._createObbCorner(obb.center, obb.axisU, obb.axisV, halfU, halfV),
+      HoverOutlineHelper._createObbCorner(obb.center, obb.axisU, obb.axisV, -halfU, halfV),
+    ];
+  }
+
+  /**
+   * 按 OBB 中心、轴向与半尺寸创建角点。
+   * @param center - OBB 中心点
+   * @param axisU - OBB U 轴方向
+   * @param axisV - OBB V 轴方向
+   * @param offsetU - U 轴偏移量
+   * @param offsetV - V 轴偏移量
+   * @returns OBB 角点
+   */
+  private static _createObbCorner(
+    center: THREE.Vector3,
+    axisU: THREE.Vector3,
+    axisV: THREE.Vector3,
+    offsetU: number,
+    offsetV: number
+  ): THREE.Vector3 {
+    const corner: THREE.Vector3 = center.clone();
+    corner.add(axisU.clone().multiplyScalar(offsetU));
+    corner.add(axisV.clone().multiplyScalar(offsetV));
+    return corner;
   }
 
   /**

@@ -33,6 +33,7 @@ import type { DoorWindowCollisionResult } from './DoorWindowCollisionDetector';
 import { DoorWindowPlacementDimensionRenderer } from './DoorWindowPlacementDimensionRenderer';
 import { DoorOpeningDirectionHelper } from './DoorOpeningDirectionHelper';
 import { StlPlacementDimensionRenderer } from './StlPlacementDimensionRenderer';
+import { StlObbHelper } from './StlObbHelper';
 
 /** 门窗类别集合，用于判断是否启用墙体吸附模式 */
 const DOOR_WINDOW_CATEGORIES: Set<string> = new Set<string>(['door', 'window']);
@@ -1011,7 +1012,7 @@ export class StlPlaceTool {
   }
 
   /**
-   * 计算 Mesh 世界包围盒在墙方向上的投影区间。
+   * 计算 Mesh OBB 在墙方向上的投影区间。
    * @param mesh - 目标 Mesh
    * @param wallOrigin - 墙起点世界坐标
    * @param wallDir - 墙方向单位向量
@@ -1022,34 +1023,7 @@ export class StlPlaceTool {
     wallOrigin: THREE.Vector3,
     wallDir: THREE.Vector3
   ): { min: number; max: number } {
-    const box: THREE.Box3 = new THREE.Box3().setFromObject(mesh);
-    const corners: THREE.Vector3[] = [
-      new THREE.Vector3(box.min.x, box.min.y, box.min.z),
-      new THREE.Vector3(box.min.x, box.min.y, box.max.z),
-      new THREE.Vector3(box.min.x, box.max.y, box.min.z),
-      new THREE.Vector3(box.min.x, box.max.y, box.max.z),
-      new THREE.Vector3(box.max.x, box.min.y, box.min.z),
-      new THREE.Vector3(box.max.x, box.min.y, box.max.z),
-      new THREE.Vector3(box.max.x, box.max.y, box.min.z),
-      new THREE.Vector3(box.max.x, box.max.y, box.max.z),
-    ];
-
-    let minProjection: number = Number.POSITIVE_INFINITY;
-    let maxProjection: number = Number.NEGATIVE_INFINITY;
-    for (let cornerIndex: number = 0; cornerIndex < corners.length; cornerIndex += 1) {
-      const corner: THREE.Vector3 | undefined = corners[cornerIndex];
-      if (corner === undefined) {
-        continue;
-      }
-      const projection: number = corner.clone().sub(wallOrigin).dot(wallDir);
-      minProjection = Math.min(minProjection, projection);
-      maxProjection = Math.max(maxProjection, projection);
-    }
-
-    return {
-      min: minProjection,
-      max: maxProjection,
-    };
+    return StlObbHelper.computeObbProjectionRange(mesh, wallOrigin, wallDir);
   }
 
   /**
@@ -1340,18 +1314,8 @@ export class StlPlaceTool {
     /* 更新世界矩阵（确保默认门窗宽高和普通模型长宽高缩放已生效，后续包围盒、碰撞检测和扣洞都使用最终尺寸） */
     placedMesh.updateMatrixWorld(true);
 
-    /* 计算并存储 AABB 包围盒到 userData */
-    const bbox: THREE.Box3 = new THREE.Box3().setFromObject(placedMesh);
-    placedMesh.userData['boundingBox'] = {
-      min: { x: bbox.min.x, z: bbox.min.z },
-      max: { x: bbox.max.x, z: bbox.max.z },
-      center: { x: (bbox.min.x + bbox.max.x) / 2, z: (bbox.min.z + bbox.max.z) / 2 },
-      size: {
-        x: bbox.max.x - bbox.min.x,
-        y: bbox.max.y - bbox.min.y,
-        z: bbox.max.z - bbox.min.z,
-      },
-    };
+    /* 计算并存储 OBB 包围盒到 userData，避免旋转 STL 继续使用世界轴 AABB。 */
+    StlObbHelper.refreshObbCache(placedMesh);
 
     if (this._activeModel.category === 'model') {
       /* 底部高度：模型底部距地面的 Y 轴偏移，默认 0.05m（5cm 离地） */
