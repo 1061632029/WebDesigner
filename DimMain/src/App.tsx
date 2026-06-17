@@ -17,6 +17,7 @@ import { ViewModeProvider } from './react/context/ViewModeContext';
 import { FitSceneProvider } from './react/context/FitSceneContext';
 import { ClearSceneProvider } from './react/context/ClearSceneContext';
 import { RoomScreenshotProvider } from './react/context/RoomScreenshotContext';
+import { BuildingSnapSettingsProvider } from './react/context/BuildingSnapSettingsContext';
 import { WallDrawScene } from './demo/WallDrawScene';
 import { useDemoSetup } from './demo/useDemoSetup';
 import { useGizmoShortcuts } from './react/hooks/useGizmoShortcuts';
@@ -44,6 +45,7 @@ function DemoSetup(): null {
  *   FitSceneProvider         → 自适应场景桥接（跨 Canvas 边界）
  *   ClearSceneProvider       → 清空场景桥接（跨 Canvas 边界）
  *   RoomScreenshotProvider   → 房间拍摄桥接（跨 Canvas 边界）
+ *   BuildingSnapSettingsProvider → 建筑捕获设置（跨工具栏与 Canvas 边界）
  *   AppShell                 → 五区域布局（含 PanelProvider）
  *     DemoSetup              → 注册面板数据 + 快捷键
  *     Canvas                 → WebGPU 渲染视口
@@ -69,21 +71,24 @@ export function App(): React.ReactElement {
                 <ClearSceneProvider>
                   {/* RoomScreenshotProvider：房间拍摄桥接，需在 AppShell 外层以便工具栏访问 */}
                   <RoomScreenshotProvider>
-                    {/* ViewModeProvider：管理 2D/3D 视图模式，需在 AppShell 外层以便 TopToolbar 访问 */}
-                    <ViewModeProvider>
-                      <AppShell>
-                        {/* 注册 demo 面板数据 + Gizmo/历史快捷键 */}
-                        <DemoSetup />
+                    {/* BuildingSnapSettingsProvider：统一管理顶部捕获选择状态，需跨 AppShell 与 Canvas 共享。 */}
+                    <BuildingSnapSettingsProvider>
+                      {/* ViewModeProvider：管理 2D/3D 视图模式，需在 AppShell 外层以便 TopToolbar 访问 */}
+                      <ViewModeProvider>
+                        <AppShell>
+                          {/* 注册 demo 面板数据 + Gizmo/历史快捷键 */}
+                          <DemoSetup />
 
-                        {/* 3D 视口 */}
-                        <Canvas
-                          style={{ width: '100%', height: '100%' }}
-                          onError={handleError}
-                        >
-                          <WallDrawScene />
-                        </Canvas>
-                      </AppShell>
-                    </ViewModeProvider>
+                          {/* 3D 视口 */}
+                          <Canvas
+                            style={{ width: '100%', height: '100%' }}
+                            onError={handleError}
+                          >
+                            <WallDrawScene />
+                          </Canvas>
+                        </AppShell>
+                      </ViewModeProvider>
+                    </BuildingSnapSettingsProvider>
                   </RoomScreenshotProvider>
                 </ClearSceneProvider>
               </FitSceneProvider>

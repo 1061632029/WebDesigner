@@ -19,7 +19,8 @@ import { PlanarPlacementSnapService } from './PlanarPlacementSnapService';
 import { PlanarPlacementGuideRenderer } from './PlanarPlacementGuideRenderer';
 import { WallPlacementLineConverter } from './WallPlacementLineConverter';
 import type { ClockwiseRectInnerEdges, WallCenterLine } from './WallPlacementLineConverter';
-import type { PlanarPlacementSnapResult } from './PlanarPlacementSnapTypes';
+import type { PlanarPlacementSnapResult, PlanarPlacementSnapType } from './PlanarPlacementSnapTypes';
+import type { BuildingSnapTypeEnabledReader } from './BuildingSnapSettingTypes';
 import type { SceneManager } from '../scene/SceneManager';
 import type { CommandHistoryManager } from '../history/CommandHistoryManager';
 import { StraightWallCreateCommand } from '../history/commands/StraightWallCreateCommand';
@@ -179,6 +180,9 @@ export class WallDrawTool {
   /** 平面线式布置捕获辅助虚线渲染器 */
   private _planarGuideRenderer: PlanarPlacementGuideRenderer;
 
+  /** 捕获类型启用状态读取器；由 React 捕获设置上下文注入。 */
+  private _snapTypeEnabledReader: BuildingSnapTypeEnabledReader | null = null;
+
   /** 命令历史管理器；存在时墙体创建进入撤销/重做栈 */
   private _historyManager: CommandHistoryManager | null;
 
@@ -224,6 +228,14 @@ export class WallDrawTool {
   public get endPoint(): Point2D | null { return this._endPoint; }
   public get thickness(): number { return this._thickness; }
   public get height(): number { return this._height; }
+
+  /**
+   * 设置捕获类型启用状态读取器。
+   * @param reader - 捕获类型启用判断函数；传入 null 时恢复全部捕获类型启用
+   */
+  public setSnapTypeEnabledReader(reader: BuildingSnapTypeEnabledReader | null): void {
+    this._snapTypeEnabledReader = reader;
+  }
 
   /**
    * 计算当前预览墙体的长度（米）
@@ -1597,7 +1609,9 @@ export class WallDrawTool {
       rawPoint,
       SNAP_THRESHOLD,
       orthogonalAnchor,
-      guideHalfLength
+      guideHalfLength,
+      null,
+      (snapType: PlanarPlacementSnapType): boolean => this._isSnapTypeEnabled(snapType)
     );
     this._planarGuideRenderer.update(result.guideLines.length > 0 ? result.guideLines : (result.guideLine === null ? [] : [result.guideLine]));
 
@@ -1618,6 +1632,19 @@ export class WallDrawTool {
     }
 
     return result;
+  }
+
+  /**
+   * 判断指定平面捕获类型是否启用。
+   * @param snapType - 平面捕获类型
+   * @returns 启用时返回 true
+   */
+  private _isSnapTypeEnabled(snapType: PlanarPlacementSnapType): boolean {
+    if (this._snapTypeEnabledReader === null) {
+      return true;
+    }
+
+    return this._snapTypeEnabledReader(snapType);
   }
 
   /**

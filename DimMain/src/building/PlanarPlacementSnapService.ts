@@ -17,10 +17,14 @@ import type {
   PlanarPlacementLineTarget,
   PlanarPlacementPointTarget,
   PlanarPlacementSnapResult,
+  PlanarPlacementSnapType,
 } from './PlanarPlacementSnapTypes';
 
 /** 平面布置内部线捕获目标类型，额外包含绘制过程中的临时正交线 */
 type PlanarPlacementInternalLineTargetType = 'extension-line' | 'endpoint-normal-line' | 'orthogonal';
+
+/** 平面捕获类型启用状态读取器。 */
+type PlanarPlacementSnapTypeEnabledReader = (snapType: PlanarPlacementSnapType) => boolean;
 
 /** 平面布置内部线捕获目标，统一描述实体捕获线和临时正交捕获线 */
 interface PlanarPlacementInternalLineTarget {
@@ -96,9 +100,15 @@ export class PlanarPlacementSnapService {
     threshold: number,
     orthogonalAnchor: Point2D | null,
     guideHalfLength: number = GUIDE_HALF_LENGTH,
-    excludedObjectIds: Set<string> | null = null
+    excludedObjectIds: Set<string> | null = null,
+    isSnapTypeEnabled: PlanarPlacementSnapTypeEnabledReader | null = null
   ): PlanarPlacementSnapResult {
-    const pointSnapResult: PlanarPlacementSnapResult | null = this._snapToPointTargets(rawPoint, threshold, excludedObjectIds);
+    const pointSnapResult: PlanarPlacementSnapResult | null = this._snapToPointTargets(
+      rawPoint,
+      threshold,
+      excludedObjectIds,
+      isSnapTypeEnabled
+    );
     if (pointSnapResult !== null) {
       return pointSnapResult;
     }
@@ -108,7 +118,8 @@ export class PlanarPlacementSnapService {
       threshold,
       guideHalfLength,
       excludedObjectIds,
-      orthogonalAnchor
+      orthogonalAnchor,
+      isSnapTypeEnabled
     );
     if (lineSnapResult !== null) {
       return lineSnapResult;
@@ -304,12 +315,21 @@ export class PlanarPlacementSnapService {
    * @param threshold - 捕获阈值
    * @returns 点捕获结果或 null
    */
-  private _snapToPointTargets(rawPoint: Point2D, threshold: number, excludedObjectIds: Set<string> | null): PlanarPlacementSnapResult | null {
+  private _snapToPointTargets(
+    rawPoint: Point2D,
+    threshold: number,
+    excludedObjectIds: Set<string> | null,
+    isSnapTypeEnabled: PlanarPlacementSnapTypeEnabledReader | null
+  ): PlanarPlacementSnapResult | null {
     const targets: PlanarPlacementPointTarget[] = this._collectPointTargets(excludedObjectIds);
     let nearestTarget: PlanarPlacementPointTarget | null = null;
     let nearestDistance: number = Number.POSITIVE_INFINITY;
 
     for (const target of targets) {
+      if (!this._isSnapTypeEnabled(target.type, isSnapTypeEnabled)) {
+        /* 捕获设置过滤流程：未勾选的点捕获类型不参与最近目标计算。 */
+        continue;
+      }
       const distance: number = this._distance(rawPoint, target.position);
       if (distance <= threshold && distance < nearestDistance) {
         nearestDistance = distance;
@@ -344,13 +364,18 @@ export class PlanarPlacementSnapService {
     threshold: number,
     guideHalfLength: number,
     excludedObjectIds: Set<string> | null,
-    orthogonalAnchor: Point2D | null
+    orthogonalAnchor: Point2D | null,
+    isSnapTypeEnabled: PlanarPlacementSnapTypeEnabledReader | null
   ): PlanarPlacementSnapResult | null {
     const targets: PlanarPlacementLineTarget[] = this._collectLineTargets(excludedObjectIds);
     const candidates: PlanarPlacementLineSnapCandidate[] = [];
 
     /* 线捕获关键流程：先收集阈值内所有实体捕获线，随后追加可触发的正交线，单线返回投影点，双线返回交点。 */
     for (const target of targets) {
+      if (!this._isSnapTypeEnabled(target.type, isSnapTypeEnabled)) {
+        /* 捕获设置过滤流程：未勾选的实体线类型不参与线候选计算。 */
+        continue;
+      }
       const projectedPoint: Point2D | null = this._projectToInfiniteLine(rawPoint, target.start, target.end);
       if (projectedPoint === null) {
         continue;
@@ -381,13 +406,15 @@ export class PlanarPlacementSnapService {
       });
     }
 
-    this._appendOrthogonalLineCandidate(
-      candidates,
-      rawPoint,
-      threshold,
-      guideHalfLength,
-      orthogonalAnchor
-    );
+    if (this._isSnapTypeEnabled('orthogonal', isSnapTypeEnabled)) {
+      this._appendOrthogonalLineCandidate(
+        candidates,
+        rawPoint,
+        threshold,
+        guideHalfLength,
+        orthogonalAnchor
+      );
+    }
 
     if (candidates.length === 0) {
       return null;
@@ -405,7 +432,7 @@ export class PlanarPlacementSnapService {
       nearestCandidate,
       candidates
     );
-    if (intersectionCandidate !== null) {
+    if (intersectionCandidate !== null && this._isSnapTypeEnabled('line-intersection', isSnapTypeEnabled)) {
       const intersectionPoint: Point2D | null = this._computeInfiniteLineIntersection(
         nearestCandidate.target.start,
         nearestCandidate.target.end,
@@ -439,6 +466,23 @@ export class PlanarPlacementSnapService {
       guideLine: nearestCandidate.guideLine,
       guideLines: singleGuideLines,
     };
+  }
+
+  /**
+   * 判断指定平面捕获类型是否启用。
+   * @param snapType - 平面捕获类型
+   * @param isSnapTypeEnabled - 外部注入的启用状态读取器；为空时默认全部启用
+   * @returns 启用时返回 true
+   */
+  private _isSnapTypeEnabled(
+    snapType: PlanarPlacementSnapType,
+    isSnapTypeEnabled: PlanarPlacementSnapTypeEnabledReader | null
+  ): boolean {
+    if (isSnapTypeEnabled === null) {
+      return true;
+    }
+
+    return isSnapTypeEnabled(snapType);
   }
 
   /**

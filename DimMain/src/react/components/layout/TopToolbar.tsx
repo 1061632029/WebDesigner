@@ -11,6 +11,7 @@ import type { ToolbarItem } from '../../../panel/PanelTypes';
 import { topToolbarStyle, toolbarButtonStyle } from './LayoutStyles';
 import { useViewMode } from '../../context/ViewModeContext';
 import type { ViewMode } from '../../context/ViewModeContext';
+import { BuildingSnapSelector } from './BuildingSnapSelector';
 
 /**
  * 顶部工具栏
@@ -72,6 +73,9 @@ export function TopToolbar(): React.ReactElement {
           </button>
         );
       })}
+
+      {/* 捕获选择按钮：集中控制当前建筑捕获类型是否参与检测。 */}
+      <BuildingSnapSelector />
 
       {/* 2D/3D 视图模式切换按钮，固定在工具栏最右侧 */}
       <button

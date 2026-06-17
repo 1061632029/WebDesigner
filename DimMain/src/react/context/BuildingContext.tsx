@@ -17,8 +17,10 @@ import { DoorWindowPlacementDimensionRenderer } from '../../model/DoorWindowPlac
 import { StlPlacementDimensionRenderer } from '../../model/StlPlacementDimensionRenderer';
 import { useEngine } from '../hooks/useEngine';
 import { useHistoryManager } from './HistoryContext';
+import { useBuildingSnapSettings } from './BuildingSnapSettingsContext';
 import type { Engine } from '../../core/Engine';
 import type { CommandHistoryManager } from '../../history/CommandHistoryManager';
+import type { BuildingSnapSettingsContextValue } from './BuildingSnapSettingsContext';
 
 /**
  * 全局交互模式。
@@ -72,6 +74,7 @@ const BuildingCtx: React.Context<BuildingContextValue | null> = createContext<Bu
 export function BuildingProvider(props: { children: React.ReactNode }): React.ReactElement {
   const engine: Engine = useEngine();
   const historyManager: CommandHistoryManager = useHistoryManager();
+  const snapSettings: BuildingSnapSettingsContextValue = useBuildingSnapSettings();
 
   /** 持久化的管理器和工具实例 */
   const [objectManager, setObjectManager] = useState<BuildingObjectManager | null>(null);
@@ -174,6 +177,15 @@ export function BuildingProvider(props: { children: React.ReactNode }): React.Re
       objMgr.dispose();
     };
   }, [engine, historyManager]);
+
+  /** 捕获设置变更时只更新现有绘制工具读取器，避免重建建筑对象管理器导致场景状态丢失。 */
+  useEffect((): void => {
+    if (drawTool === null) {
+      return;
+    }
+
+    drawTool.setSnapTypeEnabledReader(snapSettings.isSnapTypeEnabled);
+  }, [drawTool, snapSettings.isSnapTypeEnabled]);
 
   /** Context 值 */
   const value: BuildingContextValue = {
