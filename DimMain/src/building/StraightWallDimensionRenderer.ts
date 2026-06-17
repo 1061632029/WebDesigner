@@ -11,6 +11,9 @@ import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler
 /** 当前可编辑尺寸颜色，匹配矩形墙动态标注蓝色。 */
 const ACTIVE_DIM_LINE_COLOR: number = 0x2f8df6;
 
+/** 非当前编辑尺寸线颜色，匹配门窗距离动态标注灰色。 */
+const INACTIVE_DIM_LINE_COLOR: number = 0x8f8f8f;
+
 /** 动态标注所在高度，避免与地面和墙体预览闪烁。 */
 const PREVIEW_DIMENSION_Y: number = 0.13;
 
@@ -30,8 +33,11 @@ const LABEL_SPRITE_H: number = 0.288;
 
 /** 动态标注标签样式。 */
 const PREVIEW_BLUE: string = '#2f8df6';
-const PREVIEW_PANEL_BG: string = PREVIEW_BLUE;
-const PREVIEW_LABEL_TEXT_COLOR: string = '#ffffff';
+const PREVIEW_ACTIVE_PANEL_BG: string = PREVIEW_BLUE;
+const PREVIEW_PANEL_BG: string = 'rgba(255,255,255,0.94)';
+const PREVIEW_LABEL_BORDER_COLOR: string = '#b8b8b8';
+const PREVIEW_LABEL_TEXT_COLOR: string = '#333333';
+const PREVIEW_ACTIVE_LABEL_TEXT_COLOR: string = '#ffffff';
 const PREVIEW_LABEL_FONT_SIZE: number = 44;
 
 /** 动态标注渲染层级。 */
@@ -82,9 +88,10 @@ function drawRoundRectPath(
  * @param valueText - 显示的毫米尺寸文本
  * @param x - 世界坐标 X
  * @param z - 世界坐标 Z
+ * @param active - 是否为当前 Tab 选中的编辑标注
  * @returns 标签 Sprite
  */
-function createDistanceLabelSprite(valueText: string, x: number, z: number): THREE.Sprite {
+function createDistanceLabelSprite(valueText: string, x: number, z: number, active: boolean = true): THREE.Sprite {
   const canvas: HTMLCanvasElement = document.createElement('canvas');
   canvas.width = LABEL_CANVAS_W;
   canvas.height = LABEL_CANVAS_H;
@@ -97,18 +104,18 @@ function createDistanceLabelSprite(valueText: string, x: number, z: number): THR
   const panelW: number = LABEL_CANVAS_W - panelX * 2;
   const panelH: number = LABEL_CANVAS_H - panelY * 2;
 
-  /* 标签绘制流程：直墙布置尺寸始终可编辑，使用蓝底白字提示可直接输入长度。 */
+  /* 标签绘制流程：当前编辑标签使用蓝底白字，非编辑标签使用白底灰框，遵循 Tab 切换标记规则。 */
   drawRoundRectPath(ctx, panelX, panelY, panelW, panelH, 10);
-  ctx.fillStyle = PREVIEW_PANEL_BG;
+  ctx.fillStyle = active ? PREVIEW_ACTIVE_PANEL_BG : PREVIEW_PANEL_BG;
   ctx.fill();
-  ctx.lineWidth = 4;
-  ctx.strokeStyle = PREVIEW_BLUE;
+  ctx.lineWidth = active ? 4 : 2;
+  ctx.strokeStyle = active ? PREVIEW_BLUE : PREVIEW_LABEL_BORDER_COLOR;
   ctx.stroke();
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.font = `900 ${PREVIEW_LABEL_FONT_SIZE}px Arial, Microsoft YaHei, sans-serif`;
-  ctx.fillStyle = PREVIEW_LABEL_TEXT_COLOR;
+  ctx.fillStyle = active ? PREVIEW_ACTIVE_LABEL_TEXT_COLOR : PREVIEW_LABEL_TEXT_COLOR;
   ctx.fillText(valueText, LABEL_CANVAS_W / 2, LABEL_CANVAS_H / 2);
 
   const texture: THREE.CanvasTexture = new THREE.CanvasTexture(canvas);
@@ -134,13 +141,15 @@ function createDistanceLabelSprite(valueText: string, x: number, z: number): THR
  * @param end - 尺寸线终点
  * @param normalX - 端部界线方向 X
  * @param normalZ - 端部界线方向 Z
+ * @param active - 是否为当前 Tab 选中的编辑标注
  * @returns LineSegments
  */
 function createStraightDimLine(
   start: Point2D,
   end: Point2D,
   normalX: number,
-  normalZ: number
+  normalZ: number,
+  active: boolean = true
 ): THREE.LineSegments {
   const halfTick: number = TICK_HEIGHT / 2;
   const startTickA: Point2D = { x: start.x - normalX * halfTick, z: start.z - normalZ * halfTick };
@@ -159,7 +168,7 @@ function createStraightDimLine(
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
 
   const material: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-    color: ACTIVE_DIM_LINE_COLOR,
+    color: active ? ACTIVE_DIM_LINE_COLOR : INACTIVE_DIM_LINE_COLOR,
     depthTest: false,
     depthWrite: false,
     transparent: true,
@@ -216,8 +225,9 @@ export class StraightWallDimensionRenderer {
    * @param start - 直墙绘制起点（内侧线起点）
    * @param end - 直墙当前终点（内侧线终点）
    * @param inputText - 键盘输入文本；为空时显示真实长度毫米值
+   * @param active - 是否为当前 Tab 选中的编辑标注
    */
-  public updatePreview(start: Point2D, end: Point2D, inputText: string | null = null): void {
+  public updatePreview(start: Point2D, end: Point2D, inputText: string | null = null, active: boolean = true): void {
     this.clearPreview();
 
     const dx: number = end.x - start.x;
@@ -241,8 +251,8 @@ export class StraightWallDimensionRenderer {
     const labelText: string = inputText !== null ? inputText : `${lengthMillimeters}`;
 
     /* 标注创建流程：先创建尺寸线，再创建蓝底可编辑标签，二者作为同一预览句柄管理。 */
-    const lines: THREE.LineSegments = createStraightDimLine(lineStart, lineEnd, normalX, normalZ);
-    const sprite: THREE.Sprite = createDistanceLabelSprite(labelText, labelX, labelZ);
+    const lines: THREE.LineSegments = createStraightDimLine(lineStart, lineEnd, normalX, normalZ, active);
+    const sprite: THREE.Sprite = createDistanceLabelSprite(labelText, labelX, labelZ, active);
     lines.visible = this._visible;
     sprite.visible = this._visible;
     this._sceneManager.add(lines);

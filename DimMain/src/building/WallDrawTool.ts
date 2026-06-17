@@ -13,6 +13,7 @@ import { BuildingObjectManager } from './BuildingObjectManager';
 import { RaycastHelper } from '../interaction/RaycastHelper';
 import { RectDimensionRenderer, type RectPreviewEditAxis } from './RectDimensionRenderer';
 import { StraightWallDimensionRenderer } from './StraightWallDimensionRenderer';
+import { LinearPlacementAngleRenderer } from './LinearPlacementAngleRenderer';
 import { ArcWallRadiusDimensionRenderer, type ArcWallPreviewEditTarget, type ArcWallDimensionPickResult } from './ArcWallRadiusDimensionRenderer';
 import { PlanarPlacementSnapService } from './PlanarPlacementSnapService';
 import { PlanarPlacementGuideRenderer } from './PlanarPlacementGuideRenderer';
@@ -37,6 +38,9 @@ export type DrawToolChangeCallback = () => void;
 
 /** 捕获点标记最高渲染顺序，确保绿色圆圈显示在所有辅助标注和 2D 符号之上。 */
 const SNAP_MARKER_RENDER_ORDER: number = 20000;
+
+/** 线性布置预览当前键盘编辑目标，Tab 在长度与角度之间切换。 */
+type LinearPreviewEditTarget = 'length' | 'angle';
 
 /**
  * 墙体绘制工具
@@ -127,6 +131,9 @@ export class WallDrawTool {
   /** 直墙动态尺寸标注渲染器，用于直墙布置过程中的长度标注。 */
   private _straightDimRenderer: StraightWallDimensionRenderer;
 
+  /** 线性布置角度标注渲染器，用于直墙、梁预览时显示与水平线的夹角。 */
+  private _linearAngleRenderer: LinearPlacementAngleRenderer;
+
   /** 弧形墙半径动态标注渲染器，用于弧度布置阶段显示毫米半径。 */
   private _arcRadiusDimRenderer: ArcWallRadiusDimensionRenderer;
 
@@ -139,10 +146,16 @@ export class WallDrawTool {
   /** 矩形墙预览是否刚由键盘尺寸驱动，用于鼠标移动时恢复鼠标驱动。 */
   private _rectPreviewKeyboardSized: boolean = false;
 
-  /** 直墙预览尺寸输入缓冲，单位为毫米。 */
+  /** 线性布置预览当前键盘编辑目标，默认编辑长度标注。 */
+  private _linearPreviewEditTarget: LinearPreviewEditTarget = 'length';
+
+  /** 线性布置预览长度输入缓冲，单位为毫米。 */
   private _straightPreviewDimensionInput: string = '';
 
-  /** 直墙预览是否已由键盘尺寸输入驱动。 */
+  /** 线性布置预览角度输入缓冲，单位为度。 */
+  private _linearPreviewAngleInput: string = '';
+
+  /** 线性布置预览是否已由键盘尺寸/角度输入驱动。 */
   private _straightPreviewKeyboardSized: boolean = false;
 
   /** 弧形墙预览当前键盘编辑目标，Tab 在半径与角度之间切换。 */
@@ -186,6 +199,7 @@ export class WallDrawTool {
     /* 创建矩形墙尺寸标注渲染器：仅用于矩形墙绘制过程中的临时预览。 */
     this._rectDimRenderer = new RectDimensionRenderer(sceneManager);
     this._straightDimRenderer = new StraightWallDimensionRenderer(sceneManager);
+    this._linearAngleRenderer = new LinearPlacementAngleRenderer(sceneManager);
     this._arcRadiusDimRenderer = new ArcWallRadiusDimensionRenderer(sceneManager);
 
     /* 创建墙/梁线式布置统一捕获服务和虚线渲染器 */
@@ -240,7 +254,7 @@ export class WallDrawTool {
 
     if (mode === 'rect-wall') {
       this._resetRectPreviewDimensionEdit(true);
-    } else if (mode === 'straight-wall') {
+    } else if (mode === 'straight-wall' || mode === 'beam') {
       this._resetStraightPreviewDimensionEdit();
     } else if (mode === 'arc-wall') {
       this._resetArcPreviewDimensionEdit(true);
@@ -278,6 +292,7 @@ export class WallDrawTool {
     this._planarGuideRenderer.hide();
     this._rectDimRenderer.clearPreview();
     this._straightDimRenderer.clearPreview();
+    this._linearAngleRenderer.clearPreview();
     this._arcRadiusDimRenderer.clearPreview();
     
     this._mode = 'none';
@@ -383,8 +398,8 @@ export class WallDrawTool {
       if (this._mode === 'rect-wall') {
         /* 鼠标移动恢复实时拖拽驱动：清空键盘输入缓冲，后续尺寸重新按鼠标位置计算。 */
         this._resetRectPreviewDimensionEdit(false);
-      } else if (this._mode === 'straight-wall') {
-        /* 鼠标移动恢复实时拖拽驱动：清空直墙键盘输入缓冲，后续长度重新按鼠标位置计算。 */
+      } else if (this._mode === 'straight-wall' || this._mode === 'beam') {
+        /* 鼠标移动恢复实时拖拽驱动：清空墙/梁线性键盘输入缓冲，后续标注重新按鼠标位置计算。 */
         this._resetStraightPreviewDimensionEdit();
       }
       this._endPoint = point;
@@ -449,7 +464,7 @@ export class WallDrawTool {
     }
 
     if (this._state === 'picking-end') {
-      /* 允许用户输入尺寸后直接点击确认，确认前先尝试应用当前输入。 */
+      /* 允许用户输入长度/角度后直接点击确认，确认前先尝试应用当前输入。 */
       this._applyStraightPreviewDimensionInput();
       /* 确认流程：键盘尺寸驱动后保留已编辑终点；鼠标驱动时使用当前点击点。 */
       const confirmedEndPoint: Point2D = this._straightPreviewKeyboardSized && this._endPoint !== null ? this._endPoint : point;
@@ -614,24 +629,43 @@ export class WallDrawTool {
     }
 
     if (this._state === 'picking-end') {
-      /* 第二次点击确定梁中心线终点并创建梁。 */
-      this._endPoint = point;
-      this._createBeamByHistory(this._startPoint!, this._endPoint);
-      this._clearPreview();
-
-      if (this._continuous) {
-        this._startPoint = point;
-        this._clearStartMarker();
-        this._showStartMarker(point);
-      } else {
-        this._startPoint = null;
-        this._endPoint = null;
-        this._state = 'picking-start';
-        this._clearStartMarker();
-      }
-
-      this._notify();
+      /* 第二次点击确定梁中心线终点并创建梁；键盘驱动时保留已编辑终点。 */
+      this._applyStraightPreviewDimensionInput();
+      const confirmedEndPoint: Point2D = this._straightPreviewKeyboardSized && this._endPoint !== null ? this._endPoint : point;
+      this._endPoint = confirmedEndPoint;
+      this._confirmBeamPreview();
     }
+  }
+
+  /**
+   * 按当前梁预览完成梁布置。
+   * 关键流程：先应用尚未提交的长度/角度输入，再创建梁并按连续绘制规则重置起终点。
+   */
+  private _confirmBeamPreview(): void {
+    if (this._startPoint === null || this._endPoint === null) {
+      return;
+    }
+
+    this._applyStraightPreviewDimensionInput();
+    const confirmedEndPoint: Point2D = { x: this._endPoint.x, z: this._endPoint.z };
+    this._createBeamByHistory(this._startPoint, confirmedEndPoint);
+    this._straightDimRenderer.clearPreview();
+    this._resetStraightPreviewDimensionEdit();
+    this._clearPreview();
+
+    if (this._continuous) {
+      this._startPoint = confirmedEndPoint;
+      this._endPoint = null;
+      this._clearStartMarker();
+      this._showStartMarker(confirmedEndPoint);
+    } else {
+      this._startPoint = null;
+      this._endPoint = null;
+      this._state = 'picking-start';
+      this._clearStartMarker();
+    }
+
+    this._notify();
   }
 
   /* ========== 弧形墙绘制逻辑 ========== */
@@ -757,11 +791,32 @@ export class WallDrawTool {
         this._getRectPreviewDimensionInputText()
       );
     } else if (this._mode === 'straight-wall') {
-      /* 直墙模式：同步更新长度动态标注，支持键盘输入覆盖显示。 */
+      /* 直墙模式同步更新长度与水平夹角动态标注，便于斜向布置时确认方向。 */
       this._straightDimRenderer.updatePreview(
         this._startPoint,
         this._endPoint,
-        this._getStraightPreviewDimensionInputText()
+        this._getStraightPreviewDimensionInputText(),
+        this._linearPreviewEditTarget === 'length'
+      );
+      this._linearAngleRenderer.updatePreview(
+        this._startPoint,
+        this._endPoint,
+        this._getLinearPreviewAngleInputText(),
+        this._linearPreviewEditTarget === 'angle'
+      );
+    } else if (this._mode === 'beam') {
+      /* 梁模式为线性布置，同步显示长度与水平夹角动态标注，规则与直墙保持一致。 */
+      this._straightDimRenderer.updatePreview(
+        this._startPoint,
+        this._endPoint,
+        this._getStraightPreviewDimensionInputText(),
+        this._linearPreviewEditTarget === 'length'
+      );
+      this._linearAngleRenderer.updatePreview(
+        this._startPoint,
+        this._endPoint,
+        this._getLinearPreviewAngleInputText(),
+        this._linearPreviewEditTarget === 'angle'
       );
     } else if (this._mode === 'arc-wall' && this._state === 'picking-bulge') {
       /* 弧形墙模式：新建时显示临时预览标注；编辑已有墙时复用常驻标注并高亮当前编辑项，避免重复显示。 */
@@ -789,49 +844,60 @@ export class WallDrawTool {
       }
     } else {
       this._arcRadiusDimRenderer.clearPreview();
+      this._linearAngleRenderer.clearPreview();
     }
   }
 
   /**
-   * 处理直墙预览尺寸键盘编辑。
-   * 关键流程：数字键更新长度输入，Enter 应用当前输入并完成布置，退格/删除修正输入文本。
+   * 处理墙/梁线性布置预览长度与角度键盘编辑。
+   * 关键流程：Tab 在长度与角度标注之间切换，数字键写入当前标注，Enter 应用输入并确认创建。
    * @param event - 键盘事件
-   * @returns true 表示事件已被直墙尺寸编辑消费
+   * @returns true 表示事件已被线性布置标注编辑消费
    */
   private _handleStraightPreviewDimensionKeyDown(event: KeyboardEvent): boolean {
     if (!this._canEditStraightPreviewDimension()) {
       return false;
     }
 
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      this._applyStraightPreviewDimensionInput();
+      this._toggleLinearPreviewEditTarget();
+      this._updatePreview();
+      this._notify();
+      return true;
+    }
+
     if (event.key === 'Enter') {
       event.preventDefault();
-      this._confirmStraightWallPreview();
+      this._applyStraightPreviewDimensionInput();
+      if (this._mode === 'beam') {
+        this._confirmBeamPreview();
+      } else {
+        this._confirmStraightWallPreview();
+      }
       return true;
     }
 
     if (event.key === 'Backspace') {
       event.preventDefault();
-      if (this._straightPreviewDimensionInput.length > 0) {
-        this._straightPreviewDimensionInput = this._straightPreviewDimensionInput.slice(0, -1);
-        this._updatePreview();
-        this._notify();
-      }
+      this._removeLinearPreviewInputLastChar();
       return true;
     }
 
     if (event.key === 'Delete') {
       event.preventDefault();
-      if (this._straightPreviewDimensionInput.length > 0) {
-        this._straightPreviewDimensionInput = '';
-        this._updatePreview();
-        this._notify();
-      }
+      this._clearLinearPreviewActiveInput();
       return true;
     }
 
     if (/^[0-9]$/.test(event.key)) {
       event.preventDefault();
-      this._straightPreviewDimensionInput = `${this._straightPreviewDimensionInput}${event.key}`;
+      if (this._linearPreviewEditTarget === 'length') {
+        this._straightPreviewDimensionInput = `${this._straightPreviewDimensionInput}${event.key}`;
+      } else {
+        this._linearPreviewAngleInput = `${this._linearPreviewAngleInput}${event.key}`;
+      }
       this._straightPreviewKeyboardSized = true;
       this._updatePreview();
       this._notify();
@@ -842,11 +908,11 @@ export class WallDrawTool {
   }
 
   /**
-   * 判断当前是否允许编辑直墙预览尺寸。
-   * @returns true 表示当前处于直墙第二点布置阶段，且预览端点有效
+   * 判断当前是否允许编辑墙/梁线性布置预览标注。
+   * @returns true 表示当前处于墙/梁第二点布置阶段，且预览端点有效
    */
   private _canEditStraightPreviewDimension(): boolean {
-    return this._mode === 'straight-wall'
+    return (this._mode === 'straight-wall' || this._mode === 'beam')
       && this._state === 'picking-end'
       && this._startPoint !== null
       && this._endPoint !== null;
@@ -858,6 +924,19 @@ export class WallDrawTool {
    * @returns true 表示已成功应用输入尺寸
    */
   private _applyStraightPreviewDimensionInput(): boolean {
+    if (this._linearPreviewEditTarget === 'angle') {
+      return this._applyLinearPreviewAngleInput();
+    }
+
+    return this._applyLinearPreviewLengthInput();
+  }
+
+  /**
+   * 应用当前长度输入缓冲到墙/梁线性预览终点。
+   * 关键流程：输入值按毫米解析，并沿当前预览方向重算终点，保持构件朝向不变。
+   * @returns true 表示已成功应用输入长度
+   */
+  private _applyLinearPreviewLengthInput(): boolean {
     if (this._startPoint === null || this._endPoint === null || this._straightPreviewDimensionInput.length === 0) {
       return false;
     }
@@ -891,10 +970,79 @@ export class WallDrawTool {
   }
 
   /**
+   * 应用当前角度输入缓冲到墙/梁线性预览终点。
+   * 关键流程：输入角度按度解析，保持当前长度不变，并以起点为中心旋转终点到相对水平方向。
+   * @returns true 表示已成功应用输入角度
+   */
+  private _applyLinearPreviewAngleInput(): boolean {
+    if (this._startPoint === null || this._endPoint === null || this._linearPreviewAngleInput.length === 0) {
+      return false;
+    }
+
+    const angleDegrees: number = Number.parseFloat(this._linearPreviewAngleInput);
+    if (!Number.isFinite(angleDegrees)) {
+      return false;
+    }
+
+    const dx: number = this._endPoint.x - this._startPoint.x;
+    const dz: number = this._endPoint.z - this._startPoint.z;
+    const currentLength: number = Math.sqrt(dx * dx + dz * dz);
+    if (currentLength < 0.001) {
+      return false;
+    }
+
+    const useNegativeXAxisReference: boolean = dx < 0;
+    const referenceAngle: number = useNegativeXAxisReference ? Math.PI : 0;
+    const verticalDirectionSign: number = useNegativeXAxisReference
+      ? (dz < 0 ? 1 : -1)
+      : (dz < 0 ? -1 : 1);
+    const angleRadians: number = angleDegrees * Math.PI / 180;
+    const targetAngle: number = referenceAngle + angleRadians * verticalDirectionSign;
+
+    /* 角度输入应用流程：1/4 象限以 +X 为基准，2/3 象限以 -X 为基准，并保留当前末端节点位于参考水平轴上方或下方的方向。 */
+    this._endPoint = {
+      x: this._startPoint.x + Math.cos(targetAngle) * currentLength,
+      z: this._startPoint.z + Math.sin(targetAngle) * currentLength,
+    };
+    this._linearPreviewAngleInput = '';
+    this._straightPreviewKeyboardSized = true;
+    return true;
+  }
+
+  /** 切换墙/梁线性布置当前编辑标注。 */
+  private _toggleLinearPreviewEditTarget(): void {
+    this._linearPreviewEditTarget = this._linearPreviewEditTarget === 'length' ? 'angle' : 'length';
+  }
+
+  /** 删除墙/梁线性布置当前输入缓冲的最后一位。 */
+  private _removeLinearPreviewInputLastChar(): void {
+    if (this._linearPreviewEditTarget === 'length' && this._straightPreviewDimensionInput.length > 0) {
+      this._straightPreviewDimensionInput = this._straightPreviewDimensionInput.slice(0, -1);
+    } else if (this._linearPreviewEditTarget === 'angle' && this._linearPreviewAngleInput.length > 0) {
+      this._linearPreviewAngleInput = this._linearPreviewAngleInput.slice(0, -1);
+    }
+    this._updatePreview();
+    this._notify();
+  }
+
+  /** 清空墙/梁线性布置当前编辑标注的输入缓冲。 */
+  private _clearLinearPreviewActiveInput(): void {
+    if (this._linearPreviewEditTarget === 'length') {
+      this._straightPreviewDimensionInput = '';
+    } else {
+      this._linearPreviewAngleInput = '';
+    }
+    this._updatePreview();
+    this._notify();
+  }
+
+  /**
    * 重置直墙预览尺寸编辑状态。
    */
   private _resetStraightPreviewDimensionEdit(): void {
+    this._linearPreviewEditTarget = 'length';
     this._straightPreviewDimensionInput = '';
+    this._linearPreviewAngleInput = '';
     this._straightPreviewKeyboardSized = false;
   }
 
@@ -908,6 +1056,11 @@ export class WallDrawTool {
     }
 
     return this._straightPreviewDimensionInput;
+  }
+
+  /** @returns 墙/梁线性布置角度输入显示文本。 */
+  private _getLinearPreviewAngleInputText(): string | null {
+    return this._linearPreviewAngleInput.length > 0 ? this._linearPreviewAngleInput : null;
   }
 
   /**
@@ -1394,6 +1547,8 @@ export class WallDrawTool {
    * 清除预览 Mesh
    */
   private _clearPreview(): void {
+    /* 清理预览流程：预览 Mesh 与线性角度标注保持同生命周期，避免切换模式后残留角度文本。 */
+    this._linearAngleRenderer.clearPreview();
     if (this._previewMesh !== null) {
       this._sceneManager.remove(this._previewMesh);
       this._previewMesh.geometry.dispose();
@@ -2006,6 +2161,7 @@ export class WallDrawTool {
   public setAnnotationsVisible(visible: boolean): void {
     this._rectDimRenderer.setVisible(visible);
     this._straightDimRenderer.setVisible(visible);
+    this._linearAngleRenderer.setVisible(visible);
     this._arcRadiusDimRenderer.setVisible(visible);
   }
 
@@ -2027,6 +2183,7 @@ export class WallDrawTool {
     /* 释放矩形墙尺寸标注渲染器资源。 */
     this._rectDimRenderer.dispose();
     this._straightDimRenderer.dispose();
+    this._linearAngleRenderer.dispose();
     this._arcRadiusDimRenderer.dispose();
     this._listeners.clear();
   }
