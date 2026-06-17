@@ -23,6 +23,8 @@ export interface FixedPixelLineSegmentsOptions {
   depthWrite: boolean;
   /** 透明度，范围 0-1。 */
   opacity: number;
+  /** NDC 深度偏移量，正数表示向相机方向轻微前移，用于缓解线段与实体共面时的 z-buffer 遮挡。 */
+  depthOffsetNdc?: number;
 }
 
 /**
@@ -51,6 +53,7 @@ export class FixedPixelLineSegmentsFactory {
       depthTest: options.depthTest,
       depthWrite: options.depthWrite,
       lineWidthPixels: options.lineWidthPixels,
+      depthOffsetNdc: options.depthOffsetNdc,
     });
     return fixedPixelLines;
   }

@@ -19,6 +19,8 @@ export interface ScreenSpaceLineSegmentsMeshOptions {
   depthWrite: boolean;
   /** 透明度，范围 0-1。 */
   opacity: number;
+  /** NDC 深度偏移量，正数表示向相机方向轻微前移，用于缓解线框与实体共面时的 z-buffer 遮挡。 */
+  depthOffsetNdc?: number;
 }
 
 /**
@@ -47,6 +49,9 @@ export class ScreenSpaceLineSegmentsMeshFactory {
 
   /** 线段端点在 userData 中的存储键。 */
   private static readonly LOCAL_SEGMENTS_KEY: string = 'screenSpaceLineLocalSegments';
+
+  /** NDC 深度偏移量在 userData 中的存储键。 */
+  private static readonly DEPTH_OFFSET_NDC_KEY: string = 'screenSpaceLineDepthOffsetNdc';
 
   /** 复用的渲染器尺寸对象，避免每帧分配临时对象。 */
   private static readonly RENDERER_SIZE: THREE.Vector2 = new THREE.Vector2();
@@ -105,17 +110,21 @@ export class ScreenSpaceLineSegmentsMeshFactory {
       opacity: options.opacity,
       depthTest: options.depthTest,
       depthWrite: options.depthWrite,
-      side: THREE.DoubleSide,
+      side: THREE.FrontSide,
     };
     const material: THREE.MeshBasicMaterial = new THREE.MeshBasicMaterial(materialParameters);
 
     const mesh: ScreenSpaceLineSegmentsMesh = new THREE.Mesh(geometry, material);
+    const depthOffsetNdc: number = typeof options.depthOffsetNdc === 'number' && Number.isFinite(options.depthOffsetNdc)
+      ? Math.max(0, options.depthOffsetNdc)
+      : 0;
     mesh.frustumCulled = false;
     mesh.userData['isScreenSpaceLineSegmentsMesh'] = true;
     mesh.userData['isFixedPixelLineSegments'] = true;
     mesh.userData['isVisualHelper'] = true;
     mesh.userData['isPickable'] = false;
     mesh.userData['lineWidthPixels'] = lineWidthPixels;
+    mesh.userData[ScreenSpaceLineSegmentsMeshFactory.DEPTH_OFFSET_NDC_KEY] = depthOffsetNdc;
     mesh.userData[ScreenSpaceLineSegmentsMeshFactory.LOCAL_SEGMENTS_KEY] = new Float32Array(vertices);
 
     /* 交互隔离流程：屏幕空间线段仅承担显示职责，不参与业务射线拾取。 */
@@ -195,6 +204,10 @@ export class ScreenSpaceLineSegmentsMeshFactory {
     }
 
     const lineWidthPixels: number = mesh.userData['lineWidthPixels'] as number;
+    const depthOffsetNdcValue: unknown = mesh.userData[ScreenSpaceLineSegmentsMeshFactory.DEPTH_OFFSET_NDC_KEY];
+    const depthOffsetNdc: number = typeof depthOffsetNdcValue === 'number' && Number.isFinite(depthOffsetNdcValue)
+      ? Math.max(0, depthOffsetNdcValue)
+      : 0;
     const halfWidthPixels: number = lineWidthPixels / 2;
     const ndcPixelX: number = 2 / rendererSize.x;
     const ndcPixelY: number = 2 / rendererSize.y;
@@ -236,15 +249,31 @@ export class ScreenSpaceLineSegmentsMeshFactory {
       const normalPixelY: number = pixelDx / pixelLength;
       const offsetClipX: number = normalPixelX * halfWidthPixels * ndcPixelX;
       const offsetClipY: number = normalPixelY * halfWidthPixels * ndcPixelY;
+      const startDepthClipZ: number = ScreenSpaceLineSegmentsMeshFactory._applyDepthOffset(ScreenSpaceLineSegmentsMeshFactory.START_CLIP.z, depthOffsetNdc);
+      const endDepthClipZ: number = ScreenSpaceLineSegmentsMeshFactory._applyDepthOffset(ScreenSpaceLineSegmentsMeshFactory.END_CLIP.z, depthOffsetNdc);
 
-      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.x + offsetClipX, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.y + offsetClipY, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.z);
-      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 3, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.x - offsetClipX, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.y - offsetClipY, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.z);
-      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 6, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.x + offsetClipX, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.y + offsetClipY, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.z);
-      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 9, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.x - offsetClipX, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.y - offsetClipY, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.z);
+      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.x + offsetClipX, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.y + offsetClipY, startDepthClipZ);
+      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 3, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.x - offsetClipX, ScreenSpaceLineSegmentsMeshFactory.START_CLIP.y - offsetClipY, startDepthClipZ);
+      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 6, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.x + offsetClipX, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.y + offsetClipY, endDepthClipZ);
+      ScreenSpaceLineSegmentsMeshFactory._writeCorner(positionAttribute, vertexOffset + 9, mesh, camera, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.x - offsetClipX, ScreenSpaceLineSegmentsMeshFactory.END_CLIP.y - offsetClipY, endDepthClipZ);
     }
 
     positionAttribute.needsUpdate = true;
     geometry.computeBoundingSphere();
+  }
+
+  /**
+   * 对 NDC 深度应用朝相机方向的轻微偏移。
+   * @param clipZ - 原始 NDC 深度，-1 表示近裁剪面，1 表示远裁剪面
+   * @param depthOffsetNdc - NDC 深度偏移量，正数表示向相机方向前移
+   * @returns 应用偏移并限制在近裁剪面之后的 NDC 深度
+   */
+  private static _applyDepthOffset(clipZ: number, depthOffsetNdc: number): number {
+    if (depthOffsetNdc <= 0) {
+      return clipZ;
+    }
+
+    return Math.max(-1, clipZ - depthOffsetNdc);
   }
 
   /**

@@ -202,6 +202,9 @@ export class BuildingObjectManager {
   /** 梁衔接节点聚合容差：与梁斜接端点重合判断保持一致。 */
   private static readonly BEAM_JOINT_EPSILON: number = 0.001;
 
+  /** 建筑实体线框 NDC 深度前移量；该值必须保持很小，避免背面线框被推到实体前方造成透墙显示。 */
+  private static readonly WIREFRAME_DEPTH_OFFSET_NDC: number = 0.00004;
+
   /** 所有建筑对象的纯数据 */
   private _objects: Map<string, BuildingObject> = new Map();
 
@@ -683,6 +686,7 @@ export class BuildingObjectManager {
         depthTest: true,
         depthWrite: false,
         opacity: 1,
+        depthOffsetNdc: BuildingObjectManager.WIREFRAME_DEPTH_OFFSET_NDC,
       });
       fixedPixelLines.userData['isWireframe'] = true;
       fixedPixelLines.userData['isEnhancedWireframe'] = true;
@@ -739,6 +743,7 @@ export class BuildingObjectManager {
         depthTest: true,
         depthWrite: false,
         opacity: 1,
+        depthOffsetNdc: BuildingObjectManager.WIREFRAME_DEPTH_OFFSET_NDC,
       });
       fixedPixelLines.userData['isWireframe'] = true;
       fixedPixelLines.userData['isEnhancedWireframe'] = true;

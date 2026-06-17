@@ -20,6 +20,8 @@ export interface BuildingEdgeLineOptions {
   fixedPixelLineWidthEnabled?: boolean;
   /** 固定像素线宽，单位为 CSS 像素。 */
   fixedPixelLineWidth?: number;
+  /** NDC 深度偏移量，正数表示向相机方向轻微前移；未传入时使用建筑线框默认偏移。 */
+  depthOffsetNdc?: number;
 }
 
 /**
@@ -44,6 +46,9 @@ export class BuildingEdgeLineHelper {
 
   /** 默认共面判断阈值：法向量点积 > 0.999 视为共面（夹角 < 约 2.6°）。 */
   private static readonly DEFAULT_COPLANAR_DOT_THRESHOLD: number = 0.999;
+
+  /** 建筑实体线框 NDC 深度前移量；该值必须保持很小，避免背面线框被推到实体前方造成透墙显示。 */
+  private static readonly DEFAULT_DEPTH_OFFSET_NDC: number = 0.00005;
 
   /** 坐标合并精度，用于将 CSG/挤压几何中的重复物理顶点合并为逻辑顶点。 */
   private static readonly COORDINATE_PRECISION: number = 6;
@@ -359,12 +364,14 @@ export class BuildingEdgeLineHelper {
 
     const colorValue: THREE.ColorRepresentation = options.color ?? BuildingEdgeLineHelper.DEFAULT_COLOR;
     if (options.fixedPixelLineWidthEnabled === true) {
+      const depthOffsetNdc: number = options.depthOffsetNdc ?? BuildingEdgeLineHelper.DEFAULT_DEPTH_OFFSET_NDC;
       const fixedPixelLines = FixedPixelLineSegmentsFactory.create(vertices, {
         color: colorValue,
         lineWidthPixels: options.fixedPixelLineWidth ?? FixedPixelLineSegmentsFactory.DEFAULT_LINE_WIDTH_PIXELS,
         depthTest: true,
         depthWrite: false,
         opacity: 1,
+        depthOffsetNdc: depthOffsetNdc,
       });
       fixedPixelLines.userData['isWireframe'] = true;
       fixedPixelLines.userData['isEnhancedWireframe'] = true;
