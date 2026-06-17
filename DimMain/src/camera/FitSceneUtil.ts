@@ -20,7 +20,7 @@ const HELPER_NAME_PREFIX: string = '__';
  * 自适应场景视图留白系数
  * 数值越小，相机越靠近场景中心，模型在视图中显示越大；仍会受最小安全距离保护约束。
  */
-const FIT_SCENE_VIEW_PADDING_FACTOR: number = 0.6;
+const FIT_SCENE_VIEW_PADDING_FACTOR: number = 1.0;
 
 /**
  * 计算场景内所有可见 Mesh 的合并包围盒

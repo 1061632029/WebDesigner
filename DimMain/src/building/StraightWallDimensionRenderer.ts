@@ -6,6 +6,7 @@
 import * as THREE from 'three/webgpu';
 import type { Point2D } from './BuildingTypes';
 import type { SceneManager } from '../scene/SceneManager';
+import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
 /** 当前可编辑尺寸颜色，匹配矩形墙动态标注蓝色。 */
 const ACTIVE_DIM_LINE_COLOR: number = 0x2f8df6;
@@ -120,7 +121,7 @@ function createDistanceLabelSprite(valueText: string, x: number, z: number): THR
     depthWrite: false,
   });
   const sprite: THREE.Sprite = new THREE.Sprite(material);
-  sprite.scale.set(LABEL_SPRITE_W, LABEL_SPRITE_H, 1.0);
+  applyFixedScreenSpriteSize(sprite, LABEL_SPRITE_W, LABEL_SPRITE_H);
   sprite.position.set(x, PREVIEW_DIMENSION_Y, z);
   sprite.renderOrder = PREVIEW_LABEL_RENDER_ORDER;
 

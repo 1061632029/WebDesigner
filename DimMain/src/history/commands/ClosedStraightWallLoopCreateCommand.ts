@@ -6,8 +6,9 @@
 
 import * as THREE from 'three/webgpu';
 import type { ICommand } from '../ICommand';
-import type { Point2D, StraightWallData } from '../../building/BuildingTypes';
+import type { Point2D, SlabData, StraightWallData } from '../../building/BuildingTypes';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
+import type { GeneratedSurfaceSignatureSnapshot } from '../../building/BuildingObjectManager';
 import { WallCascadeDeleteCommand } from './WallCascadeDeleteCommand';
 
 /** 闭合前已有直墙中心线更新参数。 */
@@ -47,6 +48,18 @@ export class ClosedStraightWallLoopCreateCommand implements ICommand {
   /** 最近一次撤销闭合段时生成的级联删除命令。 */
   private _cascadeDeleteCommand: WallCascadeDeleteCommand | null = null;
 
+  /** 首次执行前的楼板/天花板自动生成签名缓存快照。 */
+  private _beforeSignatureSnapshot: GeneratedSurfaceSignatureSnapshot | null = null;
+
+  /** 首次执行后的楼板/天花板自动生成签名缓存快照。 */
+  private _afterSignatureSnapshot: GeneratedSurfaceSignatureSnapshot | null = null;
+
+  /** 首次执行前的楼板完整数据快照，用于撤销子空间冲孔。 */
+  private _beforeSlabSnapshot: SlabData[] | null = null;
+
+  /** 首次执行后的楼板完整数据快照，用于重做子空间冲孔。 */
+  private _afterSlabSnapshot: SlabData[] | null = null;
+
   /**
    * @param manager - 建筑对象管理器
    * @param scene - Three.js 场景
@@ -72,6 +85,13 @@ export class ClosedStraightWallLoopCreateCommand implements ICommand {
    * 关键流程：先回写已有墙段到闭合轮廓中心线，再创建最后闭合段，保证首尾墙角连续。
    */
   public execute(): void {
+    const isFirstExecute: boolean = this._beforeSignatureSnapshot === null;
+    if (isFirstExecute) {
+      /* 关键流程：闭合前先捕获楼板与签名状态，便于撤销时恢复被子空间冲孔/裁剪改写的原楼板。 */
+      this._beforeSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+      this._beforeSlabSnapshot = this._manager.getSlabDataSnapshot();
+    }
+
     if (this._cascadeDeleteCommand !== null) {
       /* 重做时先恢复撤销阶段删除的闭合墙及依赖对象，再继续确保已有墙段为闭合中心线。 */
       this._cascadeDeleteCommand.undo();
@@ -88,6 +108,31 @@ export class ClosedStraightWallLoopCreateCommand implements ICommand {
           end: ClosedStraightWallLoopCreateCommand._clonePoint(update.nextEnd),
         } as Partial<StraightWallData>
       );
+    }
+
+    if (isFirstExecute) {
+      /* 关键流程：闭合墙创建时会先触发一次楼板检测，但此时已有墙段尚未完成中心线回写。
+       * 因此必须在闭合墙与已有墙段全部进入最终状态后，显式刷新关联墙体的楼板/天花板，
+       * 避免视觉上已经闭合但自动楼板检测错过最终闭合拓扑。
+       */
+      const affectedWallIds: string[] = [this._closingWallData.id];
+      for (const update of this._wallUpdates) {
+        affectedWallIds.push(update.wallId);
+      }
+      this._manager.refreshClosedSurfacesForWalls(affectedWallIds);
+    }
+
+    if (isFirstExecute) {
+      this._afterSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+      this._afterSlabSnapshot = this._manager.getSlabDataSnapshot();
+    } else {
+      if (this._afterSignatureSnapshot !== null) {
+        this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._afterSignatureSnapshot);
+      }
+      if (this._afterSlabSnapshot !== null) {
+        /* 重做闭合子空间时恢复执行后的楼板冲孔结果，保证完全包含与部分相交场景轮廓一致。 */
+        this._manager.restoreSlabDataSnapshot(this._afterSlabSnapshot);
+      }
     }
   }
 
@@ -114,6 +159,14 @@ export class ClosedStraightWallLoopCreateCommand implements ICommand {
     );
     cascadeDeleteCommand.execute();
     this._cascadeDeleteCommand = cascadeDeleteCommand;
+
+    if (this._beforeSignatureSnapshot !== null) {
+      this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._beforeSignatureSnapshot);
+    }
+    if (this._beforeSlabSnapshot !== null) {
+      /* 撤销闭合子空间时恢复原楼板快照，覆盖冲孔、部分相交裁剪和拆分楼板的全部副作用。 */
+      this._manager.restoreSlabDataSnapshot(this._beforeSlabSnapshot);
+    }
   }
 
   /** 释放撤销闭合段时被级联删除的依赖资源。 */

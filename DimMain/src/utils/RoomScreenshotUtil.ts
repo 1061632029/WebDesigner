@@ -6,7 +6,7 @@
 
 import * as THREE from 'three/webgpu';
 import type { BuildingObjectManager } from '../building/BuildingObjectManager';
-import type { BuildingObject, Point2D, SlabData, CeilingData, WallData, RectWallData, StraightWallData } from '../building/BuildingTypes';
+import type { BuildingObject, Point2D, SlabData, CeilingData, WallData, RectWallData, StraightWallData, ArcWallData } from '../building/BuildingTypes';
 import { WallPlacementLineConverter } from '../building/WallPlacementLineConverter';
 
 /** 房间截图选项 */
@@ -63,6 +63,20 @@ interface CssVerticalBoundaryLine {
   top: CssPoint;
   /** 线段底部屏幕点 */
   bottom: CssPoint;
+}
+
+/** CSS 像素竖向边界线配对 */
+interface CssVerticalBoundaryLinePair {
+  /** 左侧内墙竖向边界线 */
+  left: CssVerticalBoundaryLine;
+  /** 右侧内墙竖向边界线 */
+  right: CssVerticalBoundaryLine;
+  /** 顶部水平裁剪线 Y 坐标 */
+  cropTopY: number;
+  /** 底部水平裁剪线 Y 坐标 */
+  cropBottomY: number;
+  /** 配对评分，分数越大越适合作为最终截图边界 */
+  score: number;
 }
 
 /** 墙体世界空间竖向边界线 */
@@ -123,6 +137,9 @@ const DEFAULT_ROOM_HEIGHT: number = 3.0;
 
 /** 墙体端点连接容差，避免浮点误差导致闭合环识别失败。 */
 const WALL_LOOP_POINT_TOLERANCE: number = 0.01;
+
+/** 楼板节点匹配容差，避免墙体实际轮廓点与楼板节点因浮点偏移导致漏判。 */
+const SLAB_NODE_MATCH_TOLERANCE: number = 0.03;
 
 /**
  * 拍摄当前房间画面。
@@ -540,7 +557,7 @@ function collectStructuralYBounds(allObjects: BuildingObject[]): { minY: number;
 
 /**
  * 将房间室内空间转换为 Canvas CSS 像素截图保留区域。
- * 关键流程：优先把墙体最外侧边缘的世界坐标转换为屏幕坐标，并使用屏幕坐标四边形作为截图遮罩区域。
+ * 关键流程：优先把墙体内侧边缘的世界坐标转换为屏幕坐标，并只保留屏幕最外侧墙线四点围成的区域。
  * @param allObjects - 全部建筑对象
  * @param roomBounds - 房间世界空间边界
  * @param camera - 当前活动相机
@@ -606,13 +623,17 @@ function createRoomScreenCropRegion(
 }
 
 /**
- * 收集可见墙体外边缘三维竖向边界线。
- * 关键流程：为每段墙体读取 AABB 的 XZ 外侧范围和 Y 高度范围，生成四条从墙底到墙顶的世界竖向线段。
+ * 收集可见墙体内侧三维竖向边界线。
+ * 关键流程：先收集楼板真实轮廓节点，再从墙体实际裁剪/偏移轮廓点中筛出与楼板节点重合的竖线。
  * @param allObjects - 全部建筑对象
- * @returns 墙体外边缘世界竖向边界线集合；没有有效墙体时返回空数组
+ * @returns 墙体内侧世界竖向边界线集合；没有有效内侧墙线时返回空数组
  */
-function collectOuterWallWorldVerticalBoundaryLines(allObjects: BuildingObject[]): WorldVerticalBoundaryLine[] {
+function collectInnerWallWorldVerticalBoundaryLines(allObjects: BuildingObject[]): WorldVerticalBoundaryLine[] {
   const worldLines: WorldVerticalBoundaryLine[] = [];
+  const slabNodes: Point2D[] = collectVisibleSlabOutlineNodes(allObjects);
+  if (slabNodes.length < 2) {
+    return worldLines;
+  }
 
   for (const object of allObjects) {
     if (!object.visible || object.category !== 'wall') {
@@ -625,47 +646,210 @@ function collectOuterWallWorldVerticalBoundaryLines(allObjects: BuildingObject[]
       continue;
     }
 
-    /* 墙体外边缘线生成流程：保留四个 XZ 角点对应的竖向线，后续按当前相机投影选取最外侧线段。 */
-    worldLines.push(...createWallBoundingBoxWorldVerticalBoundaryLines(object, wallMinY, wallMaxY));
+    const wall: WallData = object as WallData;
+    const actualContourPoints: Point2D[] = collectWallActualContourPoints(wall);
+    for (const contourPoint of actualContourPoints) {
+      if (!isPointCoincidentWithSlabNode(contourPoint, slabNodes)) {
+        continue;
+      }
+
+      worldLines.push(createWorldVerticalBoundaryLine(contourPoint, wallMinY, wallMaxY));
+    }
   }
 
   return worldLines;
 }
 
 /**
- * 根据墙体 AABB 和高度生成外边缘竖向边界线。
- * @param object - 墙体建筑对象
- * @param minY - 墙体底部世界高度
- * @param maxY - 墙体顶部世界高度
- * @returns 四条世界空间竖向边界线
+ * 收集可见楼板轮廓节点，作为截图内墙竖线必须重合的室内节点基准。
+ * @param allObjects - 全部建筑对象
+ * @returns 已叠加对象偏移的楼板轮廓节点
  */
-function createWallBoundingBoxWorldVerticalBoundaryLines(
-  object: BuildingObject,
-  minY: number,
-  maxY: number
-): WorldVerticalBoundaryLine[] {
-  const minX: number = object.boundingBox.min.x;
-  const maxX: number = object.boundingBox.max.x;
-  const minZ: number = object.boundingBox.min.z;
-  const maxZ: number = object.boundingBox.max.z;
-  const lines: WorldVerticalBoundaryLine[] = [
-    { top: new THREE.Vector3(minX, maxY, minZ), bottom: new THREE.Vector3(minX, minY, minZ) },
-    { top: new THREE.Vector3(maxX, maxY, minZ), bottom: new THREE.Vector3(maxX, minY, minZ) },
-    { top: new THREE.Vector3(maxX, maxY, maxZ), bottom: new THREE.Vector3(maxX, minY, maxZ) },
-    { top: new THREE.Vector3(minX, maxY, maxZ), bottom: new THREE.Vector3(minX, minY, maxZ) },
-  ];
+function collectVisibleSlabOutlineNodes(allObjects: BuildingObject[]): Point2D[] {
+  const slabNodes: Point2D[] = [];
 
-  return lines;
+  for (const object of allObjects) {
+    if (!object.visible || object.category !== 'slab') {
+      continue;
+    }
+
+    const slab: SlabData = object as SlabData;
+    for (const outlinePoint of slab.outline) {
+      slabNodes.push({
+        x: outlinePoint.x + slab.offsetX,
+        z: outlinePoint.z + slab.offsetZ,
+      });
+    }
+  }
+
+  return slabNodes;
 }
 
 /**
- * 将墙体最外侧边缘世界坐标转换为截图保留四边形。
- * 关键流程：把所有可见墙体外边缘竖向线转换到 Canvas 屏幕坐标，再取当前视图内左右最外侧竖向线构造四点遮罩。
+ * 收集墙体实际轮廓点。
+ * @param wall - 墙体数据
+ * @returns 已叠加对象偏移的实际轮廓点
+ */
+function collectWallActualContourPoints(wall: WallData): Point2D[] {
+  if (wall.subType === 'straight') {
+    return collectStraightWallActualContourPoints(wall as StraightWallData);
+  }
+
+  if (wall.subType === 'arc') {
+    return collectArcWallActualContourPoints(wall as ArcWallData);
+  }
+
+  return collectRectWallActualContourPoints(wall as RectWallData);
+}
+
+/**
+ * 收集直墙实际轮廓四角点。
+ * @param wall - 直墙数据
+ * @returns 直墙两侧边的端点
+ */
+function collectStraightWallActualContourPoints(wall: StraightWallData): Point2D[] {
+  const start: Point2D = { x: wall.start.x + wall.offsetX, z: wall.start.z + wall.offsetZ };
+  const end: Point2D = { x: wall.end.x + wall.offsetX, z: wall.end.z + wall.offsetZ };
+  return collectStraightSegmentActualContourPoints(start, end, wall.thickness);
+}
+
+/**
+ * 根据直线中心段收集实际墙体轮廓四角点。
+ * @param start - 中心线起点
+ * @param end - 中心线终点
+ * @param thickness - 墙体厚度
+ * @returns 中心段两侧偏移后的四角点
+ */
+function collectStraightSegmentActualContourPoints(start: Point2D, end: Point2D, thickness: number): Point2D[] {
+  const deltaX: number = end.x - start.x;
+  const deltaZ: number = end.z - start.z;
+  const length: number = Math.sqrt(deltaX * deltaX + deltaZ * deltaZ);
+  if (length <= MIN_BOUND_SIZE) {
+    return [];
+  }
+
+  /* 实际轮廓计算流程：中心线按左右法线各偏移半墙厚，得到真实墙体两侧边端点。 */
+  const normalX: number = -deltaZ / length;
+  const normalZ: number = deltaX / length;
+  const halfThickness: number = thickness * 0.5;
+  return [
+    { x: start.x + normalX * halfThickness, z: start.z + normalZ * halfThickness },
+    { x: end.x + normalX * halfThickness, z: end.z + normalZ * halfThickness },
+    { x: end.x - normalX * halfThickness, z: end.z - normalZ * halfThickness },
+    { x: start.x - normalX * halfThickness, z: start.z - normalZ * halfThickness },
+  ];
+}
+
+/**
+ * 收集弧墙实际轮廓采样点。
+ * @param wall - 弧墙数据
+ * @returns 弧墙内外侧采样轮廓点
+ */
+function collectArcWallActualContourPoints(wall: ArcWallData): Point2D[] {
+  if (Math.abs(wall.bulge) <= MIN_BOUND_SIZE) {
+    const fallbackStart: Point2D = { x: wall.start.x + wall.offsetX, z: wall.start.z + wall.offsetZ };
+    const fallbackEnd: Point2D = { x: wall.end.x + wall.offsetX, z: wall.end.z + wall.offsetZ };
+    return collectStraightSegmentActualContourPoints(fallbackStart, fallbackEnd, wall.thickness);
+  }
+
+  const start: Point2D = { x: wall.start.x + wall.offsetX, z: wall.start.z + wall.offsetZ };
+  const end: Point2D = { x: wall.end.x + wall.offsetX, z: wall.end.z + wall.offsetZ };
+  const chordDeltaX: number = end.x - start.x;
+  const chordDeltaZ: number = end.z - start.z;
+  const chordLength: number = Math.sqrt(chordDeltaX * chordDeltaX + chordDeltaZ * chordDeltaZ);
+  if (chordLength <= MIN_BOUND_SIZE) {
+    return [];
+  }
+
+  /* 弧墙采样流程：按 bulge 还原中心线圆弧，再在每个采样点沿半径方向偏移半墙厚得到内外实际轮廓。 */
+  const halfChord: number = chordLength * 0.5;
+  const signedSagitta: number = wall.bulge * chordLength * 0.5;
+  const centerOffset: number = (halfChord * halfChord - signedSagitta * signedSagitta) / (2 * signedSagitta);
+  const middleX: number = (start.x + end.x) * 0.5;
+  const middleZ: number = (start.z + end.z) * 0.5;
+  const leftNormalX: number = -chordDeltaZ / chordLength;
+  const leftNormalZ: number = chordDeltaX / chordLength;
+  const centerX: number = middleX + leftNormalX * centerOffset;
+  const centerZ: number = middleZ + leftNormalZ * centerOffset;
+  const radius: number = Math.sqrt((start.x - centerX) * (start.x - centerX) + (start.z - centerZ) * (start.z - centerZ));
+  const sampleCount: number = Math.max(2, wall.segments + 1);
+  const totalAngle: number = 4 * Math.atan(wall.bulge);
+  const startAngle: number = Math.atan2(start.z - centerZ, start.x - centerX);
+  const halfThickness: number = wall.thickness * 0.5;
+  const contourPoints: Point2D[] = [];
+
+  for (let sampleIndex: number = 0; sampleIndex < sampleCount; sampleIndex += 1) {
+    const ratio: number = sampleCount === 1 ? 0 : sampleIndex / (sampleCount - 1);
+    const angle: number = startAngle + totalAngle * ratio;
+    const radialX: number = Math.cos(angle);
+    const radialZ: number = Math.sin(angle);
+    const centerLinePoint: Point2D = {
+      x: centerX + radialX * radius,
+      z: centerZ + radialZ * radius,
+    };
+    contourPoints.push({ x: centerLinePoint.x + radialX * halfThickness, z: centerLinePoint.z + radialZ * halfThickness });
+    contourPoints.push({ x: centerLinePoint.x - radialX * halfThickness, z: centerLinePoint.z - radialZ * halfThickness });
+  }
+
+  return contourPoints;
+}
+
+/**
+ * 收集矩形墙实际轮廓节点。
+ * @param wall - 矩形墙数据
+ * @returns 矩形室内轮廓节点；子墙存在时实际竖线主要由子直墙提供
+ */
+function collectRectWallActualContourPoints(wall: RectWallData): Point2D[] {
+  const minX: number = Math.min(wall.corner1.x, wall.corner2.x) + wall.offsetX;
+  const maxX: number = Math.max(wall.corner1.x, wall.corner2.x) + wall.offsetX;
+  const minZ: number = Math.min(wall.corner1.z, wall.corner2.z) + wall.offsetZ;
+  const maxZ: number = Math.max(wall.corner1.z, wall.corner2.z) + wall.offsetZ;
+  return [
+    { x: minX, z: minZ },
+    { x: maxX, z: minZ },
+    { x: maxX, z: maxZ },
+    { x: minX, z: maxZ },
+  ];
+}
+
+/**
+ * 判断墙体实际轮廓点是否与任一楼板节点重合。
+ * @param contourPoint - 墙体实际轮廓点
+ * @param slabNodes - 楼板轮廓节点集合
+ * @returns 在容差内重合时返回 true
+ */
+function isPointCoincidentWithSlabNode(contourPoint: Point2D, slabNodes: Point2D[]): boolean {
+  for (const slabNode of slabNodes) {
+    if (computePointDistance(contourPoint, slabNode) <= SLAB_NODE_MATCH_TOLERANCE) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 根据 XZ 轮廓节点和墙体高度创建世界竖线。
+ * @param point - XZ 轮廓点
+ * @param minY - 墙体底部世界高度
+ * @param maxY - 墙体顶部世界高度
+ * @returns 世界空间竖向边界线
+ */
+function createWorldVerticalBoundaryLine(point: Point2D, minY: number, maxY: number): WorldVerticalBoundaryLine {
+  return {
+    top: new THREE.Vector3(point.x, maxY, point.z),
+    bottom: new THREE.Vector3(point.x, minY, point.z),
+  };
+}
+
+/**
+ * 将墙体内侧边缘世界坐标转换为截图四点遮罩保留区域。
+ * 关键流程：把所有可见墙体内侧竖向线转换到 Canvas 屏幕坐标，水平方向取左右最外侧线，竖直方向取两条外侧线的公共可见范围。
  * @param allObjects - 全部建筑对象
  * @param camera - 当前活动相机
  * @param canvasRect - Canvas DOM 尺寸
  * @param options - 截图裁剪参数
- * @returns 带四点遮罩的 CSS 裁剪区域；屏幕坐标转换失败时返回 null
+ * @returns 按外侧墙线屏幕坐标生成的四点遮罩 CSS 裁剪区域；无法识别内侧墙线或屏幕坐标转换失败时返回 null
  */
 function createOuterWallScreenQuadCropRegion(
   allObjects: BuildingObject[],
@@ -673,7 +857,7 @@ function createOuterWallScreenQuadCropRegion(
   canvasRect: DOMRect,
   options: RoomScreenshotOptions
 ): CssCropRegion | null {
-  const wallWorldLines: WorldVerticalBoundaryLine[] = collectOuterWallWorldVerticalBoundaryLines(allObjects);
+  const wallWorldLines: WorldVerticalBoundaryLine[] = collectInnerWallWorldVerticalBoundaryLines(allObjects);
   if (wallWorldLines.length <= 0) {
     return null;
   }
@@ -691,9 +875,9 @@ function createOuterWallScreenQuadCropRegion(
     return null;
   }
 
-  const cropRegion: CssCropRegion | null = createCropRegionFromMaskQuad(maskQuad, canvasRect, options);
+  const cropRegion: CssCropRegion | null = createCropRegionFromBoundaryScreenQuad(maskQuad, canvasRect, options);
   if (cropRegion === null) {
-    console.warn('[房间拍摄] 墙体外边缘屏幕坐标四点区域过小，回退为房间外接裁剪');
+    console.warn('[房间拍摄] 墙体内侧边缘屏幕四点区域过小，回退为房间外接裁剪');
   }
 
   return cropRegion;
@@ -758,50 +942,143 @@ function isScreenVerticalBoundaryLineVisible(screenLine: CssVerticalBoundaryLine
 }
 
 /**
- * 根据 Canvas 屏幕竖向边界线创建最外侧四边形遮罩。
- * @param screenLines - 墙体外边缘转换到 Canvas 后的 CSS 像素竖向线段
- * @returns 由当前视图内左右最外侧竖向边界线围成的四边形；线段不足或尺寸过小时返回 null
+ * 根据 Canvas 屏幕竖向边界线创建同时裁剪水平和竖直方向的屏幕四角点。
+ * @param screenLines - 墙体内侧边缘转换到 Canvas 后的 CSS 像素竖向线段
+ * @returns 由当前视图内左右边界和上下边界围成的屏幕四角点；线段不足或尺寸过小时返回 null
  */
 function createOuterVerticalBoundaryScreenQuad(screenLines: CssVerticalBoundaryLine[]): CssScreenQuad | null {
   if (screenLines.length < 2) {
     return null;
   }
 
-  let leftLine: CssVerticalBoundaryLine | null = null;
-  let rightLine: CssVerticalBoundaryLine | null = null;
-  let minCenterX: number = Number.POSITIVE_INFINITY;
-  let maxCenterX: number = Number.NEGATIVE_INFINITY;
-
-  /* 最外侧边界识别流程：以每条竖向线段的屏幕横向中心为基准，选出当前视图内最左和最右的墙体边界线。 */
-  for (const screenLine of screenLines) {
-    const centerX: number = computeScreenVerticalBoundaryLineCenterX(screenLine);
-    if (centerX < minCenterX) {
-      minCenterX = centerX;
-      leftLine = screenLine;
-    }
-
-    if (centerX > maxCenterX) {
-      maxCenterX = centerX;
-      rightLine = screenLine;
-    }
-  }
-
-  if (leftLine === null || rightLine === null || leftLine === rightLine) {
+  const bestPair: CssVerticalBoundaryLinePair | null = selectBestOuterVerticalBoundaryLinePair(screenLines);
+  if (bestPair === null) {
     return null;
   }
 
-  const maskWidth: number = Math.abs(computeScreenVerticalBoundaryLineCenterX(rightLine) - computeScreenVerticalBoundaryLineCenterX(leftLine));
-  const maskHeight: number = Math.max(computeScreenVerticalBoundaryLineLength(leftLine), computeScreenVerticalBoundaryLineLength(rightLine));
-  if (maskWidth < 2 || maskHeight < 2) {
+  /* 上下裁剪流程：最终配对已经确认公共有效范围，顶部取更低节点，底部取更高节点，严格按水平线裁掉上下外部区域。 */
+  const topLeft: CssPoint | null = computeScreenBoundaryLinePointAtY(bestPair.left, bestPair.cropTopY);
+  const topRight: CssPoint | null = computeScreenBoundaryLinePointAtY(bestPair.right, bestPair.cropTopY);
+  const bottomRight: CssPoint | null = computeScreenBoundaryLinePointAtY(bestPair.right, bestPair.cropBottomY);
+  const bottomLeft: CssPoint | null = computeScreenBoundaryLinePointAtY(bestPair.left, bestPair.cropBottomY);
+  if (topLeft === null || topRight === null || bottomRight === null || bottomLeft === null) {
     return null;
   }
 
   return {
-    topLeft: leftLine.top,
-    topRight: rightLine.top,
-    bottomRight: rightLine.bottom,
-    bottomLeft: leftLine.bottom,
+    topLeft: topLeft,
+    topRight: topRight,
+    bottomRight: bottomRight,
+    bottomLeft: bottomLeft,
   };
+}
+
+/**
+ * 从所有候选内墙竖线中选择最适合裁剪的左右外侧配对。
+ * 关键流程：不再单纯取屏幕最左/最右线，而是遍历所有左右组合，优先选择横向跨度大、公共高度足够、顶部裁剪线更低的有效组合。
+ * @param screenLines - 墙体内侧边缘转换到 Canvas 后的 CSS 像素竖向线段
+ * @returns 最佳左右竖线配对；没有有效组合时返回 null
+ */
+function selectBestOuterVerticalBoundaryLinePair(screenLines: CssVerticalBoundaryLine[]): CssVerticalBoundaryLinePair | null {
+  let bestPair: CssVerticalBoundaryLinePair | null = null;
+
+  for (let leftIndex: number = 0; leftIndex < screenLines.length; leftIndex += 1) {
+    const firstLine: CssVerticalBoundaryLine | undefined = screenLines[leftIndex];
+    if (firstLine === undefined) {
+      continue;
+    }
+
+    for (let rightIndex: number = leftIndex + 1; rightIndex < screenLines.length; rightIndex += 1) {
+      const secondLine: CssVerticalBoundaryLine | undefined = screenLines[rightIndex];
+      if (secondLine === undefined) {
+        continue;
+      }
+
+      const candidatePair: CssVerticalBoundaryLinePair | null = createValidVerticalBoundaryLinePair(firstLine, secondLine);
+      if (candidatePair === null) {
+        continue;
+      }
+
+      if (bestPair === null || candidatePair.score > bestPair.score) {
+        bestPair = candidatePair;
+      }
+    }
+  }
+
+  return bestPair;
+}
+
+/**
+ * 创建并校验一组左右内墙竖线配对。
+ * @param firstLine - 第一条候选竖线
+ * @param secondLine - 第二条候选竖线
+ * @returns 有效配对及评分；尺寸过小或上下公共范围无效时返回 null
+ */
+function createValidVerticalBoundaryLinePair(
+  firstLine: CssVerticalBoundaryLine,
+  secondLine: CssVerticalBoundaryLine
+): CssVerticalBoundaryLinePair | null {
+  const firstCenterX: number = computeScreenVerticalBoundaryLineCenterX(firstLine);
+  const secondCenterX: number = computeScreenVerticalBoundaryLineCenterX(secondLine);
+  const leftLine: CssVerticalBoundaryLine = firstCenterX <= secondCenterX ? firstLine : secondLine;
+  const rightLine: CssVerticalBoundaryLine = firstCenterX <= secondCenterX ? secondLine : firstLine;
+  const leftCenterX: number = Math.min(firstCenterX, secondCenterX);
+  const rightCenterX: number = Math.max(firstCenterX, secondCenterX);
+  const pairWidth: number = rightCenterX - leftCenterX;
+
+  /* 配对过滤流程：只有两条线横向跨度足够，并且顶部/底部水平裁剪后仍保留有效高度，才允许作为截图边界。 */
+  if (!Number.isFinite(pairWidth) || pairWidth < 8) {
+    return null;
+  }
+
+  const cropTopY: number = Math.max(leftLine.top.y, rightLine.top.y);
+  const cropBottomY: number = Math.min(leftLine.bottom.y, rightLine.bottom.y);
+  const pairHeight: number = cropBottomY - cropTopY;
+  if (!Number.isFinite(pairHeight) || pairHeight < 8) {
+    return null;
+  }
+
+  const widthScore: number = pairWidth * 10;
+  const heightScore: number = pairHeight;
+  const topCropScore: number = cropTopY * 4;
+  const bottomCropScore: number = -cropBottomY * 0.25;
+  const score: number = widthScore + heightScore + topCropScore + bottomCropScore;
+
+  return {
+    left: leftLine,
+    right: rightLine,
+    cropTopY: cropTopY,
+    cropBottomY: cropBottomY,
+    score: score,
+  };
+}
+
+/**
+ * 在屏幕边界线上按指定 Y 坐标计算对应点。
+ * @param screenLine - 屏幕竖向边界线
+ * @param targetY - 目标屏幕 Y 坐标
+ * @returns 位于边界线延长方向上的屏幕点；线段数据无效时返回 null
+ */
+function computeScreenBoundaryLinePointAtY(screenLine: CssVerticalBoundaryLine, targetY: number): CssPoint | null {
+  const deltaY: number = screenLine.bottom.y - screenLine.top.y;
+  const deltaX: number = screenLine.bottom.x - screenLine.top.x;
+  if (!Number.isFinite(targetY) || !Number.isFinite(deltaY) || !Number.isFinite(deltaX)) {
+    return null;
+  }
+
+  /* 竖直方向裁剪流程：按全局上下边界在左右墙线方向上求点，保证截图同时裁掉上下外部区域。 */
+  if (Math.abs(deltaY) <= MIN_BOUND_SIZE) {
+    const centerX: number = computeScreenVerticalBoundaryLineCenterX(screenLine);
+    return { x: centerX, y: targetY };
+  }
+
+  const ratio: number = (targetY - screenLine.top.y) / deltaY;
+  const pointX: number = screenLine.top.x + deltaX * ratio;
+  if (!Number.isFinite(pointX)) {
+    return null;
+  }
+
+  return { x: pointX, y: targetY };
 }
 
 /**
@@ -844,14 +1121,14 @@ function convertWorldPointToScreenPoint(worldPoint: THREE.Vector3, camera: THREE
 }
 
 /**
- * 根据四点遮罩计算 Canvas 裁剪区域。
- * @param maskQuad - CSS 像素四点遮罩区域
+ * 根据外侧墙线屏幕四角点计算 Canvas 四点遮罩裁剪区域。
+ * @param boundaryQuad - CSS 像素外侧墙线四角点
  * @param canvasRect - Canvas DOM 尺寸
  * @param options - 截图裁剪参数
- * @returns 带遮罩的裁剪区域；区域过小时返回 null
+ * @returns 带四点遮罩的裁剪区域；区域过小时返回 null
  */
-function createCropRegionFromMaskQuad(maskQuad: CssScreenQuad, canvasRect: DOMRect, options: RoomScreenshotOptions): CssCropRegion | null {
-  const points: CssPoint[] = [maskQuad.topLeft, maskQuad.topRight, maskQuad.bottomRight, maskQuad.bottomLeft];
+function createCropRegionFromBoundaryScreenQuad(boundaryQuad: CssScreenQuad, canvasRect: DOMRect, options: RoomScreenshotOptions): CssCropRegion | null {
+  const points: CssPoint[] = [boundaryQuad.topLeft, boundaryQuad.topRight, boundaryQuad.bottomRight, boundaryQuad.bottomLeft];
   let minX: number = Number.POSITIVE_INFINITY;
   let maxX: number = Number.NEGATIVE_INFINITY;
   let minY: number = Number.POSITIVE_INFINITY;
@@ -878,7 +1155,8 @@ function createCropRegionFromMaskQuad(maskQuad: CssScreenQuad, canvasRect: DOMRe
     return null;
   }
 
-  return { x: cropLeft, y: cropTop, width: cropWidth, height: cropHeight, maskQuad: maskQuad };
+  /* 四点截取流程：外侧墙线四个端点用于计算截图外接范围，并作为遮罩只保留四点围成区域。 */
+  return { x: cropLeft, y: cropTop, width: cropWidth, height: cropHeight, maskQuad: boundaryQuad };
 }
 
 /**
@@ -909,7 +1187,7 @@ function cropCanvasToDataUrl(
     return sourceCanvas.toDataURL('image/png');
   }
 
-  /* 裁剪流程：若存在边界墙体四点遮罩，则只绘制顶部到底部四点连接区域，区域外保持透明。 */
+  /* 裁剪流程：若存在边界墙体四点遮罩，则只绘制四点围成区域，区域外保持透明。 */
   context.clearRect(0, 0, sourceWidth, sourceHeight);
   if (cropRegion.maskQuad !== null) {
     clipContextToMaskQuad(context, cropRegion.maskQuad, cropRegion, scaleX, scaleY);

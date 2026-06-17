@@ -13,6 +13,7 @@ import type {
   ArcWallData,
   RectWallData,
   SlabBoundaryDimensionSegment,
+  SlabInnerOutlineBinding,
   SlabData,
   CeilingData,
   BeamData,
@@ -29,6 +30,8 @@ import { WALL_DEFAULTS, SLAB_DEFAULTS, CEILING_DEFAULTS, BEAM_DEFAULTS, getDefau
 import { WallGeometryBuilder } from './WallGeometryBuilder';
 import { BeamGeometryBuilder } from './BeamGeometryBuilder';
 import { SlabGeometryBuilder } from './SlabGeometryBuilder';
+import { SlabContourPuncher } from './SlabContourPuncher';
+import type { SlabPunchResult } from './SlabContourPuncher';
 import { CeilingGeometryBuilder } from './CeilingGeometryBuilder';
 import { WallConnectionManager } from './WallConnectionManager';
 import { BeamMiterCalculator } from './BeamMiterCalculator';
@@ -43,6 +46,7 @@ import type { WallSnapResult } from './WallSnapHelper';
 import { WallJointNodeRenderer } from './WallJointNodeRenderer';
 import { LineElementDragGeometryHelper } from '../interaction/LineElementDragGeometryHelper';
 import type { LineElementDirectionConstraint } from '../interaction/LineElementDragGeometryHelper';
+import { FixedPixelLineSegmentsFactory, type FixedPixelLineSegments } from '../rendering/FixedPixelLineSegmentsFactory';
 
 /**
  * 建筑对象变更事件回调
@@ -125,6 +129,26 @@ export interface StraightWallDragSnapshot {
   jointPositions: Map<string, Point2D>;
   /** 拖拽开始时吸附在受影响直墙上的门窗位置快照。 */
   attachedDoorWindowPositions: Map<string, StraightWallAttachedDoorWindowSnapshot[]>;
+}
+
+/** 弧形墙自身拖拽开始快照。 */
+export interface ArcWallDragSnapshot {
+  /** 被拖拽弧形墙 ID。 */
+  wallId: string;
+  /** 弧形墙拖拽开始时的起点。 */
+  start: Point2D;
+  /** 弧形墙拖拽开始时的终点。 */
+  end: Point2D;
+  /** 弧形墙拖拽开始时的弧度因子。 */
+  bulge: number;
+  /** 弧形墙拖拽开始时的分段数。 */
+  segments: number;
+  /** 弧形墙拖拽开始时圆心到弦中心点的单位方向。 */
+  dragDirection: Point2D;
+  /** 拖拽开始时弧墙端点对应的连接节点，用于撤销/重做时保持快照语义清晰。 */
+  jointMapping: { start: string | null; end: string | null };
+  /** 拖拽开始时与弧墙共享端点节点的其他墙体 ID。 */
+  connectedWallIds: string[];
 }
 
 /**
@@ -235,6 +259,12 @@ export class BuildingObjectManager {
   /** 梁计数器（用于自动命名） */
   private _beamCount: number = 0;
 
+  /** 是否启用 WebGPU 固定像素宽度线框强化。 */
+  private _fixedPixelWireframeEnabled: boolean = true;
+
+  /** 固定像素线框宽度，单位为 CSS 像素。 */
+  private _fixedPixelWireframeWidth: number = FixedPixelLineSegmentsFactory.DEFAULT_LINE_WIDTH_PIXELS;
+
   /**
    * @param sceneManager - 场景管理器
    */
@@ -248,6 +278,22 @@ export class BuildingObjectManager {
    */
   public get connectionManager(): WallConnectionManager {
     return this._connectionManager;
+  }
+
+  /**
+   * 设置建筑线框是否使用 WebGPU 固定像素宽度强化。
+   * @param enabled - true 表示使用屏幕空间固定像素粗线，false 表示回退浏览器原生 1px LineSegments
+   */
+  public setFixedPixelWireframeEnabled(enabled: boolean): void {
+    this._fixedPixelWireframeEnabled = enabled;
+  }
+
+  /**
+   * 设置建筑线框固定像素宽度。
+   * @param lineWidthPixels - 线宽，单位为 CSS 像素
+   */
+  public setFixedPixelWireframeWidth(lineWidthPixels: number): void {
+    this._fixedPixelWireframeWidth = Math.max(1, lineWidthPixels);
   }
 
   /**
@@ -269,6 +315,46 @@ export class BuildingObjectManager {
     /* 撤销/重做流程会直接增删楼板与天花板对象，因此必须同步恢复去重缓存，避免重复自动生成。 */
     this._generatedSlabSignatures = new Set<string>(snapshot.slabSignatures);
     this._generatedCeilingSignatures = new Set<string>(snapshot.ceilingSignatures);
+  }
+
+  /**
+   * 获取当前全部楼板数据快照。
+   * @returns 楼板数据深拷贝列表，用于房间内创建子空间时回滚冲孔、拆分后的楼板轮廓状态。
+   */
+  public getSlabDataSnapshot(): SlabData[] {
+    const slabDataList: SlabData[] = [];
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'slab') {
+        continue;
+      }
+      slabDataList.push(JSON.parse(JSON.stringify(objectData)) as SlabData);
+    }
+    return slabDataList;
+  }
+
+  /**
+   * 根据楼板快照恢复全部楼板状态。
+   * @param snapshot - 需要恢复的楼板数据快照。
+   */
+  public restoreSlabDataSnapshot(snapshot: SlabData[]): void {
+    const currentSlabIds: string[] = [];
+    for (const objectData of this._objects.values()) {
+      if (objectData.category === 'slab') {
+        currentSlabIds.push(objectData.id);
+      }
+    }
+
+    /* 恢复流程：先移除当前所有楼板及墙体绑定，再按快照重建楼板 Mesh，确保冲孔/拆分结果可被撤销。 */
+    for (const slabId of currentSlabIds) {
+      this._unlinkSlabFromWalls(slabId);
+      this._removeMeshFromScene(slabId);
+      this._objects.delete(slabId);
+      this._notify(slabId, 'remove');
+    }
+
+    for (const slabData of snapshot) {
+      this.addObject(JSON.parse(JSON.stringify(slabData)) as SlabData);
+    }
   }
 
   /* ========== 材质工厂方法 ========== */
@@ -337,8 +423,17 @@ export class BuildingObjectManager {
         this._tryAutoGenerateSlab(wallData.id);
       }
     } else if (data.category === 'slab') {
-      /* 历史命令重做或反序列化时可能直接恢复楼板对象，需要同步创建渲染实例。 */
-      this._createSlabMesh(data as SlabData);
+      const slabData: SlabData = data as SlabData;
+      /* 历史命令重做或反序列化时可能直接恢复楼板对象，需要同步创建渲染实例并恢复墙体绑定。 */
+      this._createSlabMesh(slabData);
+      if (Array.isArray(slabData.wallIds) && slabData.wallIds.length > 0) {
+        this._syncWallsToSlab(slabData.id, slabData.wallIds);
+      }
+      if (Array.isArray(slabData.innerOutlineBindings)) {
+        for (const innerOutlineBinding of slabData.innerOutlineBindings) {
+          this._syncWallsToSlab(slabData.id, innerOutlineBinding.wallIds);
+        }
+      }
     } else if (data.category === 'beam') {
       /* 梁使用独立线式布置数据与几何构建逻辑，不参与墙体连接拓扑。 */
       this._createBeamMesh(data as BeamData);
@@ -347,7 +442,7 @@ export class BuildingObjectManager {
       const ceilingData: CeilingData = data as CeilingData;
       /* 历史命令重做或反序列化时可能直接恢复天花板对象，需要同步创建渲染实例并恢复墙体绑定。 */
       this._createCeilingMesh(ceilingData);
-      if (ceilingData.wallIds.length > 0) {
+      if (Array.isArray(ceilingData.wallIds) && ceilingData.wallIds.length > 0) {
         this._syncWallsToCeiling(ceilingData.id, ceilingData.wallIds, ceilingData.bottomOffset);
       }
     }
@@ -580,9 +675,21 @@ export class BuildingObjectManager {
       vertices[i * 6 + 5] = positionAttribute.getZ(endIdx);
     }
 
-    /* 使用 WebGPU 兼容的 LineSegments 创建线框。
-     * 注意：LineBasicMaterial.linewidth 在多数浏览器中固定为 1px，若需要粗线需改为 Mesh 化线框。
-     */
+    /* 使用 WebGPU 固定像素线段强化线框：基于屏幕空间切线偏移生成矩形线带，线宽不受透视远近影响。 */
+    if (this._fixedPixelWireframeEnabled) {
+      const fixedPixelLines: FixedPixelLineSegments = FixedPixelLineSegmentsFactory.create(vertices, {
+        color: 0x333333,
+        lineWidthPixels: this._fixedPixelWireframeWidth,
+        depthTest: true,
+        depthWrite: false,
+        opacity: 1,
+      });
+      fixedPixelLines.userData['isWireframe'] = true;
+      fixedPixelLines.userData['isEnhancedWireframe'] = true;
+      return FixedPixelLineSegmentsFactory.asLineSegments(fixedPixelLines);
+    }
+
+    /* 回退路径：使用 WebGPU 兼容的原生 LineSegments 创建 1px 线框。 */
     const lineSegGeom: THREE.BufferGeometry = new THREE.BufferGeometry();
     lineSegGeom.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
 
@@ -596,6 +703,88 @@ export class BuildingObjectManager {
     /* 标记为线框对象，供 hideAllWireframes / restoreAllWireframes 识别 */
     lines.userData['isWireframe'] = true;
     return lines;
+  }
+
+  /**
+   * 为楼板、天花板等面状构件创建固定像素边线。
+   * 关键流程：先用 EdgesGeometry 提取真实几何棱边，再复用屏幕空间线段 Mesh，保证远近缩放时轮廓线仍保持稳定像素宽度。
+   * @param geometry - 需要提取棱边的几何体
+   * @param color - 边线颜色
+   * @returns 可作为子对象挂载到构件 Mesh 的边线对象；无边线时返回 null
+   */
+  private _createSurfaceEdgeWireframe(
+    geometry: THREE.BufferGeometry,
+    color: THREE.ColorRepresentation
+  ): THREE.Object3D | null {
+    const edgeGeometry: THREE.EdgesGeometry = new THREE.EdgesGeometry(geometry, 15);
+    const positionAttribute: THREE.BufferAttribute = edgeGeometry.getAttribute('position') as THREE.BufferAttribute;
+    if (positionAttribute === undefined || positionAttribute === null || positionAttribute.count === 0) {
+      edgeGeometry.dispose();
+      return null;
+    }
+
+    /* 固定像素线段流程：将 EdgesGeometry 的端点复制为稳定数组，交给屏幕空间线段工厂生成可控宽度轮廓。 */
+    if (this._fixedPixelWireframeEnabled) {
+      const vertices: Float32Array = new Float32Array(positionAttribute.count * 3);
+      for (let vertexIndex: number = 0; vertexIndex < positionAttribute.count; vertexIndex++) {
+        const offset: number = vertexIndex * 3;
+        vertices[offset] = positionAttribute.getX(vertexIndex);
+        vertices[offset + 1] = positionAttribute.getY(vertexIndex);
+        vertices[offset + 2] = positionAttribute.getZ(vertexIndex);
+      }
+
+      const fixedPixelLines: FixedPixelLineSegments = FixedPixelLineSegmentsFactory.create(vertices, {
+        color: color,
+        lineWidthPixels: this._fixedPixelWireframeWidth,
+        depthTest: true,
+        depthWrite: false,
+        opacity: 1,
+      });
+      fixedPixelLines.userData['isWireframe'] = true;
+      fixedPixelLines.userData['isEnhancedWireframe'] = true;
+      fixedPixelLines.userData['isSurfaceEdgeWireframe'] = true;
+      edgeGeometry.dispose();
+      return FixedPixelLineSegmentsFactory.asObject3D(fixedPixelLines);
+    }
+
+    /* 兼容分支：关闭固定像素增强时仍保留原生 LineSegments，便于排查 WebGPU 线段 Mesh 问题。 */
+    const wireframeMaterial: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
+      color: color,
+      depthTest: true,
+      depthWrite: false,
+    });
+    const wireframe: THREE.LineSegments = new THREE.LineSegments(edgeGeometry, wireframeMaterial);
+    wireframe.userData['isWireframe'] = true;
+    wireframe.userData['isSurfaceEdgeWireframe'] = true;
+    return wireframe;
+  }
+
+  /**
+   * 释放线框辅助对象占用的 GPU 资源。
+   * 关键流程：优先交给固定像素线段工厂释放屏幕空间 Mesh；回退分支兼容原生 LineSegments。
+   * @param wireframeObject - 需要释放的线框辅助对象
+   */
+  private _disposeWireframeObject(wireframeObject: THREE.Object3D): void {
+    if (FixedPixelLineSegmentsFactory.isFixedPixelLineSegments(wireframeObject)) {
+      FixedPixelLineSegmentsFactory.dispose(wireframeObject);
+      return;
+    }
+
+    if (!(wireframeObject instanceof THREE.LineSegments)) {
+      return;
+    }
+
+    const lineSegments: THREE.LineSegments = wireframeObject as THREE.LineSegments;
+    lineSegments.geometry.dispose();
+    if (Array.isArray(lineSegments.material)) {
+      for (let materialIndex: number = 0; materialIndex < lineSegments.material.length; materialIndex++) {
+        const material: THREE.Material = lineSegments.material[materialIndex]!;
+        material.dispose();
+      }
+      return;
+    }
+
+    lineSegments.material.dispose();
   }
 
   /**
@@ -1217,6 +1406,138 @@ export class BuildingObjectManager {
       return [];
     }
     return this.moveStraightWallWithConnectionsFromSnapshot(snapshot, offset);
+  }
+
+  /**
+   * 创建弧形墙拖拽开始快照。
+   * 关键流程：根据弧形墙圆心与弦中心点计算唯一拖拽方向，后续鼠标位移会投影到该方向上。
+   * @param wallId - 被拖拽的弧形墙 ID
+   * @returns 弧形墙拖拽快照；墙体不存在或弧线退化时返回 null
+   */
+  public createArcWallDragSnapshot(wallId: string): ArcWallDragSnapshot | null {
+    const wallObject: BuildingObject | undefined = this._objects.get(wallId);
+    if (wallObject === undefined || wallObject.category !== 'wall' || (wallObject as WallData).subType !== 'arc') {
+      return null;
+    }
+
+    const wallData: ArcWallData = wallObject as ArcWallData;
+    const dragDirection: Point2D | null = this._computeArcWallCenterToChordMidDirection(wallData);
+    if (dragDirection === null) {
+      return null;
+    }
+
+    const jointMapping: { start: string | null; end: string | null } = this._connectionManager.getWallJoints(wallId);
+    const connectedWallIds: Set<string> = new Set<string>();
+    const jointIds: Array<string | null> = [jointMapping.start, jointMapping.end];
+    for (const jointId of jointIds) {
+      if (jointId === null) {
+        continue;
+      }
+
+      /* 快照采集流程：拖拽前缓存弧墙两端直接衔接的其他墙体，断开拓扑后仍可重建这些墙体端面。 */
+      const connections: WallConnection[] = this._connectionManager.getJointConnections(jointId);
+      for (const connection of connections) {
+        if (connection.wallId === wallId) {
+          continue;
+        }
+        const connectedObject: BuildingObject | undefined = this._objects.get(connection.wallId);
+        if (connectedObject === undefined || connectedObject.category !== 'wall') {
+          continue;
+        }
+        const connectedWall: WallData = connectedObject as WallData;
+        if (connectedWall.subType === 'rect') {
+          continue;
+        }
+        connectedWallIds.add(connection.wallId);
+      }
+    }
+
+    return {
+      wallId: wallId,
+      start: { x: wallData.start.x, z: wallData.start.z },
+      end: { x: wallData.end.x, z: wallData.end.z },
+      bulge: wallData.bulge,
+      segments: wallData.segments,
+      dragDirection: dragDirection,
+      jointMapping: { start: jointMapping.start, end: jointMapping.end },
+      connectedWallIds: Array.from(connectedWallIds.values()),
+    };
+  }
+
+  /**
+   * 从拖拽开始快照按 P + L 方式移动弧形墙。
+   * @param snapshot - 弧形墙拖拽开始快照
+   * @param totalOffset - 当前鼠标投影到弧墙径向拖拽线后的总偏移
+   * @returns 成功移动时返回被更新墙体 ID 列表
+   */
+  public moveArcWallFromSnapshot(snapshot: ArcWallDragSnapshot, totalOffset: Point2D): string[] {
+    const wallObject: BuildingObject | undefined = this._objects.get(snapshot.wallId);
+    if (wallObject === undefined || wallObject.category !== 'wall' || (wallObject as WallData).subType !== 'arc') {
+      return [];
+    }
+
+    const wallData: ArcWallData = wallObject as ArcWallData;
+    const affectedWallIds: Set<string> = new Set<string>();
+    affectedWallIds.add(snapshot.wallId);
+    for (const connectedWallId of snapshot.connectedWallIds) {
+      affectedWallIds.add(connectedWallId);
+    }
+
+    /* 弧墙拖拽流程：先断开原端点衔接，避免旧节点被移动导致相邻墙体继续被拉扯。 */
+    this._connectionManager.disconnectWall(snapshot.wallId);
+    wallData.start = {
+      x: snapshot.start.x + totalOffset.x,
+      z: snapshot.start.z + totalOffset.z,
+    };
+    wallData.end = {
+      x: snapshot.end.x + totalOffset.x,
+      z: snapshot.end.z + totalOffset.z,
+    };
+    wallData.bulge = snapshot.bulge;
+    wallData.segments = snapshot.segments;
+
+    /* 重新注册流程：按移动后的端点重新吸附/合并节点，后续拖拽结束时基于新拓扑重新做封闭检测。 */
+    const registeredJoints: { startJointId: string; endJointId: string } =
+      this._connectionManager.registerWall(wallData.id, wallData.start, wallData.end);
+    this._syncWallEndpointsFromJointIds(wallData, registeredJoints.startJointId, registeredJoints.endJointId);
+
+    const nextJointMapping: { start: string | null; end: string | null } = this._connectionManager.getWallJoints(snapshot.wallId);
+    const nextJointIds: Array<string | null> = [nextJointMapping.start, nextJointMapping.end];
+    for (const jointId of nextJointIds) {
+      if (jointId === null) {
+        continue;
+      }
+      const connections: WallConnection[] = this._connectionManager.getJointConnections(jointId);
+      for (const connection of connections) {
+        const connectedObject: BuildingObject | undefined = this._objects.get(connection.wallId);
+        if (connectedObject === undefined || connectedObject.category !== 'wall') {
+          continue;
+        }
+        const connectedWall: WallData = connectedObject as WallData;
+        if (connectedWall.subType === 'rect') {
+          continue;
+        }
+        affectedWallIds.add(connection.wallId);
+      }
+    }
+
+    this._rebuildWallMeshesForCurrentTopology(affectedWallIds);
+    this.refreshConnectionLines();
+    return Array.from(affectedWallIds.values());
+  }
+
+  /**
+   * 移动指定弧形墙。
+   * @param wallId - 被移动弧形墙 ID
+   * @param offset - XZ 平面偏移
+   * @returns 成功移动时返回被更新墙体 ID 列表
+   */
+  public moveArcWall(wallId: string, offset: Point2D): string[] {
+    const snapshot: ArcWallDragSnapshot | null = this.createArcWallDragSnapshot(wallId);
+    if (snapshot === null) {
+      return [];
+    }
+    return this.moveArcWallFromSnapshot(snapshot, offset);
   }
 
   /**
@@ -2263,23 +2584,24 @@ export class BuildingObjectManager {
   }
 
   /**
-   * 创建弧形墙
+   * 构造弧形墙数据但不加入场景
+   * 用于命令模式先生成稳定 ID 与快照，再由命令统一 execute/undo。
    * @param start - 弧线起点
    * @param end - 弧线终点
    * @param bulge - 弧度因子（tan(angle/4)，正值左凸，负值右凸）
    * @param thickness - 厚度（默认 0.24m）
    * @param height - 高度（默认 2.8m）
    * @param segments - 弧线分段数（默认使用全局弧墙细分配置）
-   * @returns 新建的弧形墙 ID
+   * @returns 新建的弧形墙数据
    */
-  public createArcWall(
+  public createArcWallData(
     start: Point2D,
     end: Point2D,
     bulge: number,
     thickness: number = WALL_DEFAULTS.thickness,
     height: number = WALL_DEFAULTS.height,
     segments: number = WALL_DEFAULTS.arcSegments
-  ): string {
+  ): ArcWallData {
     /* 弧墙布置关键流程：交互传入的弧线表示墙内侧面，入库前转换为内部几何仍使用的中心弧线。 */
     const centerArc: ArcWallCenterLine = WallPlacementLineConverter.convertInnerArcToCenterArc(
       start,
@@ -2314,8 +2636,30 @@ export class BuildingObjectManager {
         size: { x: 0, y: 0, z: 0 },
       },
     };
+    return data;
+  }
+
+  /**
+   * 创建弧形墙
+   * @param start - 弧线起点
+   * @param end - 弧线终点
+   * @param bulge - 弧度因子（tan(angle/4)，正值左凸，负值右凸）
+   * @param thickness - 厚度（默认 0.24m）
+   * @param height - 高度（默认 2.8m）
+   * @param segments - 弧线分段数（默认使用全局弧墙细分配置）
+   * @returns 新建的弧形墙 ID
+   */
+  public createArcWall(
+    start: Point2D,
+    end: Point2D,
+    bulge: number,
+    thickness: number = WALL_DEFAULTS.thickness,
+    height: number = WALL_DEFAULTS.height,
+    segments: number = WALL_DEFAULTS.arcSegments
+  ): string {
+    const data: ArcWallData = this.createArcWallData(start, end, bulge, thickness, height, segments);
     this.addObject(data);
-    return id;
+    return data.id;
   }
 
   /**
@@ -2442,8 +2786,11 @@ export class BuildingObjectManager {
     outline: Point2D[],
     slabThickness: number = SLAB_DEFAULTS.slabThickness,
     wallIds: string[] = [],
-    boundaryDimensionSegments: SlabBoundaryDimensionSegment[] = this._createFallbackBoundaryDimensionSegments(outline)
+    boundaryDimensionSegments: SlabBoundaryDimensionSegment[] = this._createFallbackBoundaryDimensionSegments(outline),
+    innerOutlines: Point2D[][] = []
   ): string {
+    this._applySlabPunchingForNewOutline(outline, wallIds);
+
     this._slabCount += 1;
     const id: string = IdGenerator.generate('slab');
     const data: SlabData = {
@@ -2459,6 +2806,10 @@ export class BuildingObjectManager {
       offsetZ: 0,
       material: getDefaultMaterial('slab'),
       outline: outline,
+      innerOutlines: innerOutlines.map((innerOutline: Point2D[]): Point2D[] => this._clonePointOutline(innerOutline)),
+      innerOutlineBindings: [],
+      /* 记录围合该楼板的墙体集合，用于区分共享墙两侧的最小封闭空间。 */
+      wallIds: wallIds.slice(),
       boundaryDimensionSegments: boundaryDimensionSegments,
       slabThickness: slabThickness,
       /* 楼板顶面高度偏移，默认顶面位于 Y=0（楼板顶面 Y = topOffset） */
@@ -2483,6 +2834,325 @@ export class BuildingObjectManager {
 
     console.log(`[BuildingObjectManager] 楼板已自动生成: id=${id}, 顶点数=${outline.length}, 厚度=${slabThickness * 1000}mm`);
     return id;
+  }
+
+  /**
+   * 对新生成楼板轮廓与既有楼板执行冲孔/裁剪。
+   * @param newOutline - 即将创建的楼板净轮廓。
+   * @param newWallIds - 即将创建楼板绑定的墙体 ID，用于跳过同一闭合区域。
+   */
+  private _applySlabPunchingForNewOutline(newOutline: Point2D[], newWallIds: string[]): void {
+    if (newOutline.length < 3) {
+      return;
+    }
+
+    const existingSlabs: SlabData[] = [];
+    this._objects.forEach((objectData: BuildingObject): void => {
+      if (objectData.category !== 'slab') {
+        return;
+      }
+
+      const slabData: SlabData = objectData as SlabData;
+      if (this._areWallIdSetsEqual(slabData.wallIds, new Set<string>(newWallIds))) {
+        return;
+      }
+
+      existingSlabs.push(slabData);
+    });
+
+    /* 关键流程：逐个既有楼板判断与新子空间轮廓关系，完全包含生成内洞，部分相交则扣除相交区域后重绘。 */
+    for (const slabData of existingSlabs) {
+      const punchResult: SlabPunchResult = SlabContourPuncher.punch(slabData.outline, newOutline);
+      if (punchResult.relation === 'none') {
+        continue;
+      }
+
+      if (punchResult.relation === 'contained' && punchResult.innerOutline !== null) {
+        this._appendSlabInnerOutline(slabData, punchResult.innerOutline, newWallIds);
+        continue;
+      }
+
+      this._replaceSlabWithRemainingOutlines(slabData, punchResult.remainingOutlines);
+    }
+  }
+
+  /**
+   * 给父楼板追加内轮廓洞口并刷新渲染对象。
+   * @param slabData - 需要冲孔的父楼板。
+   * @param innerOutline - 子空间净轮廓。
+   * @param wallIds - 围合该洞口的子空间墙体 ID 列表。
+   */
+  private _appendSlabInnerOutline(slabData: SlabData, innerOutline: Point2D[], wallIds: string[]): void {
+    const innerOutlines: Point2D[][] = Array.isArray(slabData.innerOutlines) ? slabData.innerOutlines : [];
+    const innerOutlineBindings: SlabInnerOutlineBinding[] = Array.isArray(slabData.innerOutlineBindings)
+      ? slabData.innerOutlineBindings
+      : [];
+    for (const existingInnerOutline of innerOutlines) {
+      if (this._arePointOutlinesEqual(existingInnerOutline, innerOutline)) {
+        this._upsertSlabInnerOutlineBinding(innerOutlineBindings, innerOutline, wallIds);
+        slabData.innerOutlineBindings = innerOutlineBindings;
+        this._syncWallsToSlab(slabData.id, wallIds);
+        return;
+      }
+    }
+
+    innerOutlines.push(this._clonePointOutline(innerOutline));
+    slabData.innerOutlines = innerOutlines;
+    this._upsertSlabInnerOutlineBinding(innerOutlineBindings, innerOutline, wallIds);
+    slabData.innerOutlineBindings = innerOutlineBindings;
+    this._syncWallsToSlab(slabData.id, wallIds);
+    this._removeMeshFromScene(slabData.id);
+    this._createSlabMesh(slabData);
+    this._notify(slabData.id, 'update');
+  }
+
+  /**
+   * 用裁剪后的剩余轮廓重绘原楼板，必要时为额外剩余区域创建独立楼板。
+   * @param slabData - 被部分相交裁剪的楼板。
+   * @param remainingOutlines - 扣除相交区域后的剩余轮廓集合。
+   */
+  private _replaceSlabWithRemainingOutlines(slabData: SlabData, remainingOutlines: Point2D[][]): void {
+    if (remainingOutlines.length === 0) {
+      this.removeObject(slabData.id);
+      return;
+    }
+
+    const firstRemainingOutline: Point2D[] = remainingOutlines[0]!;
+    slabData.outline = this._clonePointOutline(firstRemainingOutline);
+    slabData.innerOutlines = this._filterInnerOutlinesForOuterOutline(slabData.innerOutlines, slabData.outline);
+    slabData.innerOutlineBindings = this._filterInnerOutlineBindingsForOuterOutline(slabData.innerOutlineBindings, slabData.outline);
+    slabData.boundaryDimensionSegments = this._createFallbackBoundaryDimensionSegments(slabData.outline);
+    this._removeMeshFromScene(slabData.id);
+    this._createSlabMesh(slabData);
+    this._notify(slabData.id, 'update');
+
+    for (let index: number = 1; index < remainingOutlines.length; index += 1) {
+      const remainingOutline: Point2D[] = remainingOutlines[index]!;
+      this._createDetachedSlabFromSource(slabData, remainingOutline);
+    }
+  }
+
+  /**
+   * 根据父楼板属性创建一个不绑定墙体的剩余楼板。
+   * @param sourceSlab - 提供材质、厚度和高度参数的源楼板。
+   * @param outline - 剩余区域外轮廓。
+   */
+  private _createDetachedSlabFromSource(sourceSlab: SlabData, outline: Point2D[]): void {
+    this._slabCount += 1;
+    const id: string = IdGenerator.generate('slab');
+    const data: SlabData = {
+      id: id,
+      category: 'slab',
+      name: `楼板-${this._slabCount}`,
+      visible: sourceSlab.visible,
+      locked: sourceSlab.locked,
+      height: sourceSlab.height,
+      elevation: sourceSlab.elevation,
+      offsetX: sourceSlab.offsetX,
+      offsetY: sourceSlab.offsetY,
+      offsetZ: sourceSlab.offsetZ,
+      material: { ...sourceSlab.material },
+      outline: this._clonePointOutline(outline),
+      innerOutlines: this._filterInnerOutlinesForOuterOutline(sourceSlab.innerOutlines, outline),
+      innerOutlineBindings: this._filterInnerOutlineBindingsForOuterOutline(sourceSlab.innerOutlineBindings, outline),
+      wallIds: [],
+      boundaryDimensionSegments: this._createFallbackBoundaryDimensionSegments(outline),
+      slabThickness: sourceSlab.slabThickness,
+      topOffset: sourceSlab.topOffset,
+      boundingBox: {
+        min: { x: 0, z: 0 },
+        max: { x: 0, z: 0 },
+        center: { x: 0, z: 0 },
+        size: { x: 0, y: 0, z: 0 },
+      },
+    };
+
+    this._objects.set(id, data);
+    this._createSlabMesh(data);
+    this._notify(id, 'add');
+  }
+
+  /**
+   * 过滤仍完全位于指定外轮廓内部的楼板内洞。
+   * @param innerOutlines - 原内洞集合。
+   * @param outerOutline - 新外轮廓。
+   * @returns 可继续保留的内洞集合。
+   */
+  private _filterInnerOutlinesForOuterOutline(innerOutlines: Point2D[][] | undefined, outerOutline: Point2D[]): Point2D[][] {
+    if (!Array.isArray(innerOutlines)) {
+      return [];
+    }
+
+    const filteredInnerOutlines: Point2D[][] = [];
+    for (const innerOutline of innerOutlines) {
+      if (SlabContourPuncher.isOutlineContained(innerOutline, outerOutline)) {
+        filteredInnerOutlines.push(this._clonePointOutline(innerOutline));
+      }
+    }
+    return filteredInnerOutlines;
+  }
+
+  /**
+   * 过滤仍完全位于指定外轮廓内部的楼板洞口绑定。
+   * @param innerOutlineBindings - 原洞口绑定集合。
+   * @param outerOutline - 新外轮廓。
+   * @returns 可继承到指定外轮廓内的洞口绑定集合。
+   */
+  private _filterInnerOutlineBindingsForOuterOutline(
+    innerOutlineBindings: SlabInnerOutlineBinding[] | undefined,
+    outerOutline: Point2D[]
+  ): SlabInnerOutlineBinding[] {
+    if (!Array.isArray(innerOutlineBindings)) {
+      return [];
+    }
+
+    const filteredBindings: SlabInnerOutlineBinding[] = [];
+    for (const innerOutlineBinding of innerOutlineBindings) {
+      if (SlabContourPuncher.isOutlineContained(innerOutlineBinding.outline, outerOutline)) {
+        filteredBindings.push({
+          outline: this._clonePointOutline(innerOutlineBinding.outline),
+          wallIds: innerOutlineBinding.wallIds.slice(),
+        });
+      }
+    }
+    return filteredBindings;
+  }
+
+  /**
+   * 追加或更新楼板洞口绑定，确保同一洞口只记录一次并保留墙体 ID。
+   * @param bindings - 待更新的洞口绑定集合。
+   * @param innerOutline - 洞口内轮廓。
+   * @param wallIds - 围合该洞口的墙体 ID 列表。
+   */
+  private _upsertSlabInnerOutlineBinding(bindings: SlabInnerOutlineBinding[], innerOutline: Point2D[], wallIds: string[]): void {
+    for (const binding of bindings) {
+      if (this._arePointOutlinesEqual(binding.outline, innerOutline)) {
+        binding.wallIds = wallIds.slice();
+        return;
+      }
+    }
+
+    bindings.push({
+      outline: this._clonePointOutline(innerOutline),
+      wallIds: wallIds.slice(),
+    });
+  }
+
+  /**
+   * 根据子空间封闭环刷新父楼板内轮廓洞口。
+   * 关键流程：墙体移动重新检测封闭环后，通过洞口绑定的墙体 ID 定位父楼板中的旧内洞，并同步替换为新的净轮廓。
+   * @param innerOutline - 当前子空间封闭环的最新室内净轮廓。
+   * @param wallIds - 围合当前子空间封闭环的墙体 ID 列表。
+   */
+  private _refreshSlabInnerOutlinesForLoop(innerOutline: Point2D[], wallIds: string[]): void {
+    const targetWallIdSet: Set<string> = new Set<string>(wallIds);
+
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'slab') {
+        continue;
+      }
+
+      const slabData: SlabData = objectData as SlabData;
+      if (this._areWallIdSetsEqual(slabData.wallIds, targetWallIdSet)) {
+        continue;
+      }
+
+      const innerOutlineBindings: SlabInnerOutlineBinding[] = Array.isArray(slabData.innerOutlineBindings)
+        ? slabData.innerOutlineBindings
+        : [];
+      if (innerOutlineBindings.length === 0) {
+        continue;
+      }
+
+      const innerOutlines: Point2D[][] = Array.isArray(slabData.innerOutlines) ? slabData.innerOutlines : [];
+      const shouldKeepInnerOutline: boolean = SlabContourPuncher.isOutlineContained(innerOutline, slabData.outline);
+      let hasChanged: boolean = false;
+
+      /* 循环逻辑：倒序处理绑定，便于新轮廓移出父楼板时同步删除旧绑定和旧洞口，避免残留冲孔。 */
+      for (let bindingIndex: number = innerOutlineBindings.length - 1; bindingIndex >= 0; bindingIndex -= 1) {
+        const binding: SlabInnerOutlineBinding = innerOutlineBindings[bindingIndex]!;
+        if (!this._areWallIdSetsEqual(binding.wallIds, targetWallIdSet)) {
+          continue;
+        }
+
+        const oldBindingOutline: Point2D[] = binding.outline;
+        const innerOutlineIndex: number = this._findMatchingInnerOutlineIndex(innerOutlines, oldBindingOutline);
+        if (!shouldKeepInnerOutline) {
+          innerOutlineBindings.splice(bindingIndex, 1);
+          if (innerOutlineIndex >= 0) {
+            innerOutlines.splice(innerOutlineIndex, 1);
+          }
+          hasChanged = true;
+          continue;
+        }
+
+        const clonedInnerOutline: Point2D[] = this._clonePointOutline(innerOutline);
+        binding.outline = clonedInnerOutline;
+        binding.wallIds = wallIds.slice();
+        if (innerOutlineIndex >= 0) {
+          innerOutlines[innerOutlineIndex] = this._clonePointOutline(innerOutline);
+        } else {
+          innerOutlines.push(this._clonePointOutline(innerOutline));
+        }
+        hasChanged = true;
+      }
+
+      if (!hasChanged) {
+        continue;
+      }
+
+      slabData.innerOutlines = innerOutlines;
+      slabData.innerOutlineBindings = innerOutlineBindings;
+      this._removeMeshFromScene(slabData.id);
+      this._createSlabMesh(slabData);
+      this._notify(slabData.id, 'update');
+    }
+  }
+
+  /**
+   * 在楼板内洞集合中查找与目标轮廓完全一致的索引。
+   * @param innerOutlines - 待搜索的楼板内洞集合。
+   * @param targetOutline - 目标洞口轮廓。
+   * @returns 匹配轮廓索引；未找到时返回 -1。
+   */
+  private _findMatchingInnerOutlineIndex(innerOutlines: Point2D[][], targetOutline: Point2D[]): number {
+    for (let index: number = 0; index < innerOutlines.length; index += 1) {
+      const innerOutline: Point2D[] = innerOutlines[index]!;
+      if (this._arePointOutlinesEqual(innerOutline, targetOutline)) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 克隆 XZ 平面点轮廓，避免多个楼板共享可变数组引用。
+   * @param outline - 原始轮廓。
+   * @returns 克隆后的轮廓。
+   */
+  private _clonePointOutline(outline: Point2D[]): Point2D[] {
+    return outline.map((point: Point2D): Point2D => ({ x: point.x, z: point.z }));
+  }
+
+  /**
+   * 判断两个点轮廓是否按相同顺序完全一致。
+   * @param firstOutline - 第一个轮廓。
+   * @param secondOutline - 第二个轮廓。
+   * @returns 点数量与各点坐标均一致时返回 true。
+   */
+  private _arePointOutlinesEqual(firstOutline: Point2D[], secondOutline: Point2D[]): boolean {
+    if (firstOutline.length !== secondOutline.length) {
+      return false;
+    }
+
+    for (let index: number = 0; index < firstOutline.length; index += 1) {
+      const firstPoint: Point2D = firstOutline[index]!;
+      const secondPoint: Point2D = secondOutline[index]!;
+      if (!this._arePointsClose2D(firstPoint, secondPoint)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -2844,6 +3514,14 @@ export class BuildingObjectManager {
     const mesh: THREE.Mesh | undefined = this._meshes.get(id);
     if (mesh !== undefined) {
       this._sceneManager.remove(mesh);
+
+      /* 释放线框子对象资源：固定像素线段使用自定义 Mesh，需要在父 Mesh 销毁前显式释放几何体和材质。 */
+      mesh.children.forEach((child: THREE.Object3D): void => {
+        if (child.userData['isWireframe'] === true) {
+          this._disposeWireframeObject(child);
+        }
+      });
+
       mesh.geometry.dispose();
 
       /* 释放独立材质（支持单材质和材质数组两种情况） */
@@ -2896,10 +3574,46 @@ export class BuildingObjectManager {
     }
 
     /* 节点显示流程：衔接线停用后，墙节点与梁节点统一转换为 WallJoint 兼容对象并使用同一个圆片渲染器。 */
-    const wallJoints: WallJoint[] = this._connectionManager.getAllJoints();
+    const wallJoints: WallJoint[] = this._collectRenderableWallJointNodes();
     const beamJoints: WallJoint[] = this._collectBeamJointNodes();
     const allJointNodes: WallJoint[] = [...wallJoints, ...beamJoints];
     this._wallJointNodeRenderer.refresh(allJointNodes);
+  }
+
+  /**
+   * 收集允许显示圆片的墙体衔接节点。
+   * 弧形墙端点衔接处由弧形轮廓自身表达，不显示额外圆片，避免在弧形墙衔接处产生视觉干扰。
+   * @returns 过滤后的墙体衔接节点列表
+   */
+  private _collectRenderableWallJointNodes(): WallJoint[] {
+    const joints: WallJoint[] = this._connectionManager.getAllJoints();
+    const renderableJoints: WallJoint[] = [];
+
+    for (const joint of joints) {
+      if (this._isWallJointConnectedToArcWall(joint)) {
+        /* 连接到弧形墙时跳过圆片渲染，保留连接拓扑但不显示节点圆片。 */
+        continue;
+      }
+      renderableJoints.push(joint);
+    }
+
+    return renderableJoints;
+  }
+
+  /**
+   * 判断墙体衔接节点是否连接到了弧形墙。
+   * @param joint - 待判断的墙体衔接节点
+   * @returns 连接到任意弧形墙时返回 true
+   */
+  private _isWallJointConnectedToArcWall(joint: WallJoint): boolean {
+    for (const connection of joint.connections) {
+      const object: BuildingObject | undefined = this._objects.get(connection.wallId);
+      if (object !== undefined && object.category === 'wall' && object.subType === 'arc') {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -3232,11 +3946,7 @@ export class BuildingObjectManager {
         }
       });
       for (const wireframeObj of wireframesToRemove) {
-        const wf: THREE.LineSegments = wireframeObj as THREE.LineSegments;
-        wf.geometry.dispose();
-        if (wf.material instanceof THREE.Material) {
-          (wf.material as THREE.Material).dispose();
-        }
+        this._disposeWireframeObject(wireframeObj);
         mesh.remove(wireframeObj);
       }
     });
@@ -3300,11 +4010,23 @@ export class BuildingObjectManager {
         }
       }
 
-      const wireframe: THREE.LineSegments | null = this._createFilteredEdges(
-        mesh.geometry,
-        excludeGroupsForRestore,
-        shouldHideArcSegmentVerticalEdgesForRestore
-      );
+      let wireframe: THREE.Object3D | null = null;
+      if (meshId !== undefined) {
+        const surfaceObjectData: BuildingObject | undefined = this._objects.get(meshId);
+        if (surfaceObjectData !== undefined && surfaceObjectData.category === 'slab') {
+          wireframe = this._createSurfaceEdgeWireframe(mesh.geometry, 0x555555);
+        } else if (surfaceObjectData !== undefined && surfaceObjectData.category === 'ceiling') {
+          wireframe = this._createSurfaceEdgeWireframe(mesh.geometry, 0x888888);
+        }
+      }
+
+      if (wireframe === null) {
+        wireframe = this._createFilteredEdges(
+          mesh.geometry,
+          excludeGroupsForRestore,
+          shouldHideArcSegmentVerticalEdgesForRestore
+        );
+      }
       if (wireframe !== null) {
         wireframe.position.set(0, 0.001, 0);
         wireframe.renderOrder = 1;
@@ -3372,6 +4094,46 @@ export class BuildingObjectManager {
         endInwardDir: { x: -dirX, z: -dirZ },
       };
     };
+  }
+
+  /**
+   * 计算弧形墙圆心指向弦中心点的单位方向。
+   * 关键流程：使用 bulge 反推圆心位置，再用“圆心 -> 弦中心点”作为弧墙整体拖拽约束线方向。
+   * @param data - 弧形墙数据
+   * @returns 圆心到弦中心点方向；弧线或弦长退化时返回 null
+   */
+  private _computeArcWallCenterToChordMidDirection(data: ArcWallData): Point2D | null {
+    if (Math.abs(data.bulge) < 0.001) {
+      return null;
+    }
+
+    const chordX: number = data.end.x - data.start.x;
+    const chordZ: number = data.end.z - data.start.z;
+    const chordLength: number = Math.sqrt(chordX * chordX + chordZ * chordZ);
+    if (chordLength < 0.001) {
+      return null;
+    }
+
+    const sagitta: number = (data.bulge * chordLength) / 2;
+    if (Math.abs(sagitta) < 0.001) {
+      return null;
+    }
+
+    const radius: number = (chordLength * chordLength / 4 + sagitta * sagitta) / (2 * Math.abs(sagitta));
+    const midX: number = (data.start.x + data.end.x) / 2;
+    const midZ: number = (data.start.z + data.end.z) / 2;
+    const perpendicularX: number = -chordZ / chordLength;
+    const perpendicularZ: number = chordX / chordLength;
+    const centerOffset: number = radius - Math.abs(sagitta);
+    const centerSign: number = data.bulge > 0 ? 1 : -1;
+    const centerX: number = midX + perpendicularX * centerOffset * centerSign;
+    const centerZ: number = midZ + perpendicularZ * centerOffset * centerSign;
+
+    /* 方向约束流程：拖拽只允许沿圆心与弦中心点连线移动，避免弧墙被任意方向平移。 */
+    return this._normalizePoint2D({
+      x: midX - centerX,
+      z: midZ - centerZ,
+    });
   }
 
   /**
@@ -3506,7 +4268,7 @@ export class BuildingObjectManager {
       ceilingThickness: ceilingThickness,
       bottomOffset: bottomOffset,
       /** 关联的墙体 ID 列表 */
-      wallIds: wallIds,
+      wallIds: wallIds.slice(),
       boundingBox: {
         min: { x: Number.MAX_SAFE_INTEGER, z: Number.MAX_SAFE_INTEGER },
         max: { x: Number.MIN_SAFE_INTEGER, z: Number.MIN_SAFE_INTEGER },
@@ -3554,9 +4316,11 @@ export class BuildingObjectManager {
       if (wallData.subType !== 'straight') {
         continue;
       }
-      /* 直接修改数据，不走 updateObject 避免递归 */
+      /* 直接修改数据，不走 updateObject 避免递归；共享墙需要保留多个最小封闭空间的天花板绑定。 */
       const straightWall: StraightWallData = wallData as StraightWallData;
-      straightWall.ceilingId = ceilingId;
+      const nextCeilingIds: string[] = this._appendUniqueId(straightWall.ceilingIds, ceilingId);
+      straightWall.ceilingIds = nextCeilingIds;
+      straightWall.ceilingId = nextCeilingIds.length > 0 ? nextCeilingIds[0]! : null;
       straightWall.height = newHeight;
       /* 重建 Mesh（高度变化需要重建几何体） */
       this._removeMeshFromScene(wallId);
@@ -3587,18 +4351,13 @@ export class BuildingObjectManager {
      */
     mesh.position.set(0, data.topOffset - data.slabThickness, 0);
 
-    /* 创建边缘线框（WebGPU 兼容方案，线宽由浏览器固定为 1px） */
-    const slabEdgesGeom: THREE.EdgesGeometry = new THREE.EdgesGeometry(geometry, 15);
-    const slabWireframeMat: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-      color: 0x555555,
-      depthTest: true,
-      depthWrite: false,
-    });
-    const slabWireframe: THREE.LineSegments = new THREE.LineSegments(slabEdgesGeom, slabWireframeMat);
-    slabWireframe.userData['isWireframe'] = true;
-    slabWireframe.position.set(0, 0.001, 0);
-    slabWireframe.renderOrder = 1;
-    mesh.add(slabWireframe);
+    /* 创建楼板边缘线框：优先使用屏幕空间固定像素线段，保证远近缩放时轮廓线宽稳定。 */
+    const slabWireframe: THREE.Object3D | null = this._createSurfaceEdgeWireframe(geometry, 0x555555);
+    if (slabWireframe !== null) {
+      slabWireframe.position.set(0, 0.001, 0);
+      slabWireframe.renderOrder = 1;
+      mesh.add(slabWireframe);
+    }
 
     /* 加入场景 */
     this._sceneManager.add(mesh);
@@ -3634,18 +4393,13 @@ export class BuildingObjectManager {
      */
     mesh.position.set(0, data.bottomOffset, 0);
 
-    /* 创建边缘线框（WebGPU 兼容方案，线宽由浏览器固定为 1px） */
-    const ceilEdgesGeom: THREE.EdgesGeometry = new THREE.EdgesGeometry(geometry, 15);
-    const ceilWireframeMat: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-      color: 0x888888,
-      depthTest: true,
-      depthWrite: false,
-    });
-    const ceilWireframe: THREE.LineSegments = new THREE.LineSegments(ceilEdgesGeom, ceilWireframeMat);
-    ceilWireframe.userData['isWireframe'] = true;
-    ceilWireframe.position.set(0, 0.001, 0);
-    ceilWireframe.renderOrder = 1;
-    mesh.add(ceilWireframe);
+    /* 创建天花板边缘线框：优先使用屏幕空间固定像素线段，保证远近缩放时轮廓线宽稳定。 */
+    const ceilWireframe: THREE.Object3D | null = this._createSurfaceEdgeWireframe(geometry, 0x888888);
+    if (ceilWireframe !== null) {
+      ceilWireframe.position.set(0, 0.001, 0);
+      ceilWireframe.renderOrder = 1;
+      mesh.add(ceilWireframe);
+    }
 
     /* 加入场景 */
     this._sceneManager.add(mesh);
@@ -3748,6 +4502,7 @@ export class BuildingObjectManager {
       if (slabObject !== undefined && slabObject.category === 'slab') {
         const slabData: SlabData = slabObject as SlabData;
         slabData.outline = innerOutline;
+        slabData.wallIds = wallIds.slice();
         slabData.boundaryDimensionSegments = boundaryDimensionSegments;
         this._removeMeshFromScene(existingSlabId);
         this._createSlabMesh(slabData);
@@ -3759,6 +4514,9 @@ export class BuildingObjectManager {
       this._generatedSlabSignatures.add(signature);
       this.createSlab(innerOutline, SLAB_DEFAULTS.slabThickness, wallIds, boundaryDimensionSegments);
     }
+
+    /* 同步父楼板内洞：当前封闭环作为父楼板洞口存在时，墙体移动后必须同步更新 innerOutlines。 */
+    this._refreshSlabInnerOutlinesForLoop(innerOutline, wallIds);
 
     /* 天花板分支：拖拽导致封闭轮廓变化时，复用既有天花板并保持原厚度/高度配置。 */
     const existingCeilingId: string | null = this._findExistingCeilingIdForWalls(wallIds);
@@ -3786,14 +4544,15 @@ export class BuildingObjectManager {
    * @returns 关联楼板 ID；没有有效关联时返回 null
    */
   private _findExistingSlabIdForWalls(wallIds: string[]): string | null {
-    for (const wallId of wallIds) {
-      const wallObject: BuildingObject | undefined = this._objects.get(wallId);
-      if (wallObject === undefined || wallObject.category !== 'wall' || (wallObject as WallData).subType !== 'straight') {
+    const wallIdSet: Set<string> = new Set<string>(wallIds);
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'slab') {
         continue;
       }
-      const straightWall: StraightWallData = wallObject as StraightWallData;
-      if (straightWall.slabId !== null && this._objects.get(straightWall.slabId)?.category === 'slab') {
-        return straightWall.slabId;
+
+      const slabData: SlabData = objectData as SlabData;
+      if (this._areWallIdSetsEqual(slabData.wallIds, wallIdSet)) {
+        return slabData.id;
       }
     }
     return null;
@@ -3805,29 +4564,37 @@ export class BuildingObjectManager {
    * @returns 关联天花板 ID；没有有效关联时返回 null
    */
   private _findExistingCeilingIdForWalls(wallIds: string[]): string | null {
-    for (const wallId of wallIds) {
-      const wallObject: BuildingObject | undefined = this._objects.get(wallId);
-      if (wallObject === undefined || wallObject.category !== 'wall' || (wallObject as WallData).subType !== 'straight') {
-        continue;
-      }
-      const straightWall: StraightWallData = wallObject as StraightWallData;
-      if (straightWall.ceilingId !== null && this._objects.get(straightWall.ceilingId)?.category === 'ceiling') {
-        return straightWall.ceilingId;
-      }
-    }
-
     const wallIdSet: Set<string> = new Set<string>(wallIds);
     for (const objectData of this._objects.values()) {
       if (objectData.category !== 'ceiling') {
         continue;
       }
+
       const ceilingData: CeilingData = objectData as CeilingData;
-      const hasSharedWall: boolean = ceilingData.wallIds.some((wallId: string): boolean => wallIdSet.has(wallId));
-      if (hasSharedWall) {
+      if (this._areWallIdSetsEqual(ceilingData.wallIds, wallIdSet)) {
         return ceilingData.id;
       }
     }
     return null;
+  }
+
+  /**
+   * 判断对象记录的墙体 ID 列表是否与目标墙体集合完全一致。
+   * @param sourceWallIds - 对象记录的墙体 ID 列表
+   * @param targetWallIdSet - 当前封闭空间的墙体 ID 集合
+   * @returns 两个集合完全一致时返回 true
+   */
+  private _areWallIdSetsEqual(sourceWallIds: string[] | undefined, targetWallIdSet: Set<string>): boolean {
+    if (sourceWallIds === undefined || sourceWallIds.length !== targetWallIdSet.size) {
+      return false;
+    }
+
+    for (const sourceWallId of sourceWallIds) {
+      if (!targetWallIdSet.has(sourceWallId)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -3846,9 +4613,75 @@ export class BuildingObjectManager {
         continue;
       }
       const straightWall: StraightWallData = wallData as StraightWallData;
-      straightWall.slabId = slabId;
+      const nextSlabIds: string[] = this._appendUniqueId(straightWall.slabIds, slabId);
+      straightWall.slabIds = nextSlabIds;
+      straightWall.slabId = nextSlabIds.length > 0 ? nextSlabIds[0]! : null;
       this._notify(wallId, 'update');
     }
+  }
+
+  /**
+   * 从所有直墙中解除指定楼板绑定。
+   * 关键流程：恢复楼板快照或删除楼板前，需要同步清理墙体 slabIds/slabId，避免墙体继续引用已不存在的楼板。
+   * @param slabId - 需要解除绑定的楼板 ID
+   */
+  private _unlinkSlabFromWalls(slabId: string): void {
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'wall') {
+        continue;
+      }
+
+      const wallData: WallData = objectData as WallData;
+      if (wallData.subType !== 'straight') {
+        continue;
+      }
+
+      const straightWall: StraightWallData = wallData as StraightWallData;
+      const nextSlabIds: string[] = this._removeId(straightWall.slabIds, slabId);
+      const legacySlabMatched: boolean = straightWall.slabId === slabId;
+      if (!legacySlabMatched && nextSlabIds.length === (Array.isArray(straightWall.slabIds) ? straightWall.slabIds.length : 0)) {
+        continue;
+      }
+
+      /* 解绑流程：优先维护多楼板列表，再用首个 ID 回填兼容字段，保证共享墙仍保留其它房间楼板引用。 */
+      straightWall.slabIds = nextSlabIds;
+      straightWall.slabId = nextSlabIds.length > 0 ? nextSlabIds[0]! : null;
+      this._notify(straightWall.id, 'update');
+    }
+  }
+
+  /**
+   * 从可选 ID 列表中移除指定 ID。
+   * @param sourceIds - 原始 ID 列表
+   * @param removedId - 需要移除的 ID
+   * @returns 移除指定 ID 后的新列表
+   */
+  private _removeId(sourceIds: string[] | undefined, removedId: string): string[] {
+    if (!Array.isArray(sourceIds)) {
+      return [];
+    }
+
+    const resultIds: string[] = [];
+    for (const sourceId of sourceIds) {
+      if (sourceId !== removedId && !resultIds.includes(sourceId)) {
+        resultIds.push(sourceId);
+      }
+    }
+    return resultIds;
+  }
+
+  /**
+   * 向可选 ID 列表追加唯一 ID。
+   * @param sourceIds - 原始 ID 列表
+   * @param nextId - 需要追加的 ID
+   * @returns 已去重的新 ID 列表
+   */
+  private _appendUniqueId(sourceIds: string[] | undefined, nextId: string): string[] {
+    const resultIds: string[] = Array.isArray(sourceIds) ? sourceIds.slice() : [];
+    if (!resultIds.includes(nextId)) {
+      resultIds.push(nextId);
+    }
+    return resultIds;
   }
 
   /**
@@ -4051,6 +4884,36 @@ export class BuildingObjectManager {
       this._removeMeshFromScene(wallId);
       this._createWallMesh(wallData);
       this._syncAdaptiveDoorWindowThickness(wallData);
+      this._notify(wallId, 'update');
+    });
+  }
+
+  /**
+   * 按当前连接拓扑重建指定直墙/弧墙 Mesh。
+   * 关键流程：弧墙拖拽会先断开旧拓扑再重新注册新拓扑，因此旧相邻墙和新相邻墙都需要按当前节点关系重算端部裁剪。
+   * @param wallIds - 需要重建的墙体 ID 集合
+   */
+  private _rebuildWallMeshesForCurrentTopology(wallIds: Set<string>): void {
+    wallIds.forEach((wallId: string): void => {
+      const objectData: BuildingObject | undefined = this._objects.get(wallId);
+      if (objectData === undefined || objectData.category !== 'wall') {
+        return;
+      }
+
+      const wallData: WallData = objectData as WallData;
+      if (wallData.subType === 'rect') {
+        return;
+      }
+
+      /* 直墙重建前同步门窗洞口；弧墙当前不承载门窗洞口，仅按最新拓扑重建端部裁剪。 */
+      if (wallData.subType === 'straight') {
+        const straightWallData: StraightWallData = wallData as StraightWallData;
+        this._recomputeOpeningsFromAttachedDoorWindows(straightWallData);
+        this._syncAdaptiveDoorWindowThickness(straightWallData);
+      }
+
+      this._removeMeshFromScene(wallId);
+      this._createWallMesh(wallData);
       this._notify(wallId, 'update');
     });
   }

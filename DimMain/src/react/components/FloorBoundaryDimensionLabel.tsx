@@ -16,8 +16,10 @@ import { useBuildingContext } from '../context/BuildingContext';
 import type { BuildingObject } from '../../building/BuildingTypes';
 import type { Point2D } from '../../building/BuildingTypes';
 import type { SlabBoundaryDimensionSegment, SlabData } from '../../building/BuildingTypes';
-import { computePolygonArea, computePolygonCentroid } from '../../building/AreaCalculator';
+import { computePolygonCentroid } from '../../building/AreaCalculator';
+import { FloorAreaCalculator } from '../../building/FloorAreaCalculator';
 import type { Engine } from '../../core/Engine';
+import { applyFixedScreenSpriteSize } from '../../rendering/FixedScreenSpriteScaler';
 
 /** 单条楼板边界长度标注数据 */
 interface FloorBoundaryDimensionEntry {
@@ -85,6 +87,15 @@ const AREA_LABEL_HEIGHT_WORLD_METERS: number = 0.72;
 
 /** 面积标注的最小面积，低于该值不显示，避免退化楼板产生噪声 */
 const MIN_AREA_SQUARE_METERS: number = 0.000001;
+
+/** 点位几何判断容差，单位：米 */
+const POINT_GEOMETRY_EPSILON_METERS: number = 0.000001;
+
+/** 面积标注候选点插值比例集合，用于从无效质心向楼板实体区域搜索 */
+const AREA_LABEL_CANDIDATE_RATIOS: number[] = [0.2, 0.35, 0.5, 0.65, 0.8, 0.92];
+
+/** 面积标注包围盒采样最大分段数，避免复杂楼板导致过多候选点 */
+const AREA_LABEL_GRID_MAX_STEPS: number = 10;
 
 /**
  * 创建楼板边界长度文字纹理
@@ -158,6 +169,208 @@ function createFloorAreaLabelTexture(nameText: string, areaText: string): THREE.
 }
 
 /**
+ * 判断点是否位于线段上。
+ * @param point - 待判断点。
+ * @param start - 线段起点。
+ * @param end - 线段终点。
+ * @returns 位于线段容差范围内时返回 true。
+ */
+function isPointOnSegment(point: Point2D, start: Point2D, end: Point2D): boolean {
+  const segmentX: number = end.x - start.x;
+  const segmentZ: number = end.z - start.z;
+  const pointX: number = point.x - start.x;
+  const pointZ: number = point.z - start.z;
+  const cross: number = segmentX * pointZ - segmentZ * pointX;
+  if (Math.abs(cross) > POINT_GEOMETRY_EPSILON_METERS) {
+    return false;
+  }
+
+  const dot: number = pointX * segmentX + pointZ * segmentZ;
+  if (dot < -POINT_GEOMETRY_EPSILON_METERS) {
+    return false;
+  }
+
+  const segmentLengthSquared: number = segmentX * segmentX + segmentZ * segmentZ;
+  return dot <= segmentLengthSquared + POINT_GEOMETRY_EPSILON_METERS;
+}
+
+/**
+ * 判断点是否位于多边形边界上。
+ * @param point - 待判断点。
+ * @param polygon - 多边形顶点集合。
+ * @returns 点落在任意边界线段上时返回 true。
+ */
+function isPointOnPolygonBoundary(point: Point2D, polygon: Point2D[]): boolean {
+  const pointCount: number = polygon.length;
+  if (pointCount < 2) {
+    return false;
+  }
+
+  for (let pointIndex: number = 0; pointIndex < pointCount; pointIndex += 1) {
+    const start: Point2D = polygon[pointIndex] as Point2D;
+    const end: Point2D = polygon[(pointIndex + 1) % pointCount] as Point2D;
+    if (isPointOnSegment(point, start, end)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * 使用射线法判断点是否位于多边形内部，边界点视为内部。
+ * @param point - 待判断点。
+ * @param polygon - 多边形顶点集合。
+ * @returns 点在多边形内部或边界上时返回 true。
+ */
+function isPointInsidePolygon(point: Point2D, polygon: Point2D[]): boolean {
+  const pointCount: number = polygon.length;
+  if (pointCount < 3) {
+    return false;
+  }
+  if (isPointOnPolygonBoundary(point, polygon)) {
+    return true;
+  }
+
+  let inside: boolean = false;
+  for (let pointIndex: number = 0, previousIndex: number = pointCount - 1; pointIndex < pointCount; previousIndex = pointIndex, pointIndex += 1) {
+    const currentPoint: Point2D = polygon[pointIndex] as Point2D;
+    const previousPoint: Point2D = polygon[previousIndex] as Point2D;
+    const crossesRay: boolean = (currentPoint.z > point.z) !== (previousPoint.z > point.z);
+    if (!crossesRay) {
+      continue;
+    }
+
+    const intersectX: number =
+      ((previousPoint.x - currentPoint.x) * (point.z - currentPoint.z)) / (previousPoint.z - currentPoint.z) + currentPoint.x;
+    if (point.x < intersectX) {
+      inside = !inside;
+    }
+  }
+
+  return inside;
+}
+
+/**
+ * 判断点是否位于楼板实体区域内。
+ * @param point - 待判断点。
+ * @param slab - 楼板数据。
+ * @returns 点位于外轮廓内且不在任何内洞轮廓内时返回 true。
+ */
+function isPointOnSlabSolidArea(point: Point2D, slab: SlabData): boolean {
+  if (!isPointInsidePolygon(point, slab.outline)) {
+    return false;
+  }
+
+  const innerOutlines: Point2D[][] = Array.isArray(slab.innerOutlines) ? slab.innerOutlines : [];
+  for (let innerOutlineIndex: number = 0; innerOutlineIndex < innerOutlines.length; innerOutlineIndex += 1) {
+    const innerOutline: Point2D[] = innerOutlines[innerOutlineIndex] as Point2D[];
+    if (innerOutline.length < 3) {
+      continue;
+    }
+
+    /* 洞口内部和洞口边界都不属于楼板实体表面，避免面积标注落到挖空区域。 */
+    if (isPointInsidePolygon(point, innerOutline) || isPointOnPolygonBoundary(point, innerOutline)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * 根据两个点和插值比例创建候选点。
+ * @param start - 起始点。
+ * @param end - 目标点。
+ * @param ratio - 插值比例，0 表示 start，1 表示 end。
+ * @returns 插值后的候选点。
+ */
+function createInterpolatedPoint(start: Point2D, end: Point2D, ratio: number): Point2D {
+  return {
+    x: start.x + (end.x - start.x) * ratio,
+    z: start.z + (end.z - start.z) * ratio,
+  };
+}
+
+/**
+ * 计算楼板面积标注应放置的实体区域点位。
+ * @param slab - 楼板数据。
+ * @returns 面积标注 XZ 平面点位，优先避开内轮廓洞口。
+ */
+function computeFloorAreaLabelPoint(slab: SlabData): Point2D {
+  const outline: Point2D[] = slab.outline;
+  const centroid: Point2D = computePolygonCentroid(outline);
+  if (isPointOnSlabSolidArea(centroid, slab)) {
+    return centroid;
+  }
+
+  const candidateTargets: Point2D[] = [];
+  const pointCount: number = outline.length;
+  for (let pointIndex: number = 0; pointIndex < pointCount; pointIndex += 1) {
+    const currentPoint: Point2D = outline[pointIndex] as Point2D;
+    const nextPoint: Point2D = outline[(pointIndex + 1) % pointCount] as Point2D;
+    candidateTargets.push(currentPoint);
+    candidateTargets.push({
+      x: (currentPoint.x + nextPoint.x) * 0.5,
+      z: (currentPoint.z + nextPoint.z) * 0.5,
+    });
+  }
+
+  /* 候选点搜索：从外轮廓质心向顶点/边中点扩散，优先选择接近视觉中心且位于楼板实体面的点。 */
+  for (let targetIndex: number = 0; targetIndex < candidateTargets.length; targetIndex += 1) {
+    const targetPoint: Point2D = candidateTargets[targetIndex] as Point2D;
+    for (let ratioIndex: number = 0; ratioIndex < AREA_LABEL_CANDIDATE_RATIOS.length; ratioIndex += 1) {
+      const ratio: number = AREA_LABEL_CANDIDATE_RATIOS[ratioIndex] as number;
+      const candidatePoint: Point2D = createInterpolatedPoint(centroid, targetPoint, ratio);
+      if (isPointOnSlabSolidArea(candidatePoint, slab)) {
+        return candidatePoint;
+      }
+    }
+  }
+
+  let minX: number = Number.POSITIVE_INFINITY;
+  let maxX: number = Number.NEGATIVE_INFINITY;
+  let minZ: number = Number.POSITIVE_INFINITY;
+  let maxZ: number = Number.NEGATIVE_INFINITY;
+  for (const outlinePoint of outline) {
+    minX = Math.min(minX, outlinePoint.x);
+    maxX = Math.max(maxX, outlinePoint.x);
+    minZ = Math.min(minZ, outlinePoint.z);
+    maxZ = Math.max(maxZ, outlinePoint.z);
+  }
+
+  const width: number = maxX - minX;
+  const depth: number = maxZ - minZ;
+  if (width <= POINT_GEOMETRY_EPSILON_METERS || depth <= POINT_GEOMETRY_EPSILON_METERS) {
+    return centroid;
+  }
+
+  let bestPoint: Point2D | null = null;
+  let bestDistanceSquared: number = Number.POSITIVE_INFINITY;
+  for (let xIndex: number = 1; xIndex < AREA_LABEL_GRID_MAX_STEPS; xIndex += 1) {
+    for (let zIndex: number = 1; zIndex < AREA_LABEL_GRID_MAX_STEPS; zIndex += 1) {
+      const candidatePoint: Point2D = {
+        x: minX + (width * xIndex) / AREA_LABEL_GRID_MAX_STEPS,
+        z: minZ + (depth * zIndex) / AREA_LABEL_GRID_MAX_STEPS,
+      };
+      if (!isPointOnSlabSolidArea(candidatePoint, slab)) {
+        continue;
+      }
+
+      const deltaX: number = candidatePoint.x - centroid.x;
+      const deltaZ: number = candidatePoint.z - centroid.z;
+      const distanceSquared: number = deltaX * deltaX + deltaZ * deltaZ;
+      if (distanceSquared < bestDistanceSquared) {
+        bestPoint = candidatePoint;
+        bestDistanceSquared = distanceSquared;
+      }
+    }
+  }
+
+  return bestPoint !== null ? bestPoint : centroid;
+}
+
+/**
  * 创建单个楼板边界长度 Sprite
  * @param segment - 楼板边界段标注信息
  * @returns Sprite 实例
@@ -174,7 +387,7 @@ function createFloorBoundaryDimensionSprite(segment: FloorBoundarySegmentInfo): 
 
   const sprite: THREE.Sprite = new THREE.Sprite(material);
   sprite.position.copy(segment.position);
-  sprite.scale.set(LABEL_WIDTH_METERS, LABEL_HEIGHT_WORLD_METERS, 1.0);
+  applyFixedScreenSpriteSize(sprite, LABEL_WIDTH_METERS, LABEL_HEIGHT_WORLD_METERS);
   sprite.renderOrder = 1001;
   return sprite;
 }
@@ -195,7 +408,7 @@ function createFloorAreaLabelSprite(labelInfo: FloorAreaLabelInfo): THREE.Sprite
 
   const sprite: THREE.Sprite = new THREE.Sprite(material);
   sprite.position.copy(labelInfo.position);
-  sprite.scale.set(AREA_LABEL_WIDTH_METERS, AREA_LABEL_HEIGHT_WORLD_METERS, 1.0);
+  applyFixedScreenSpriteSize(sprite, AREA_LABEL_WIDTH_METERS, AREA_LABEL_HEIGHT_WORLD_METERS);
   sprite.renderOrder = 1002;
   return sprite;
 }
@@ -310,12 +523,13 @@ function computeFloorAreaLabel(slab: SlabData): FloorAreaLabelInfo | null {
     return null;
   }
 
-  const areaSquareMeters: number = computePolygonArea(outline);
+  /* 面积标注使用楼板净面积，避免父楼板的内轮廓洞口被重复计入。 */
+  const areaSquareMeters: number = FloorAreaCalculator.calculateSlabArea(slab);
   if (areaSquareMeters <= MIN_AREA_SQUARE_METERS) {
     return null;
   }
 
-  const centroid: Point2D = computePolygonCentroid(outline);
+  const labelPoint: Point2D = computeFloorAreaLabelPoint(slab);
   const rawNameText: string = slab.name.trim();
   const nameText: string = rawNameText.length > 0 ? rawNameText : '未命名';
   const areaText: string = `${areaSquareMeters.toFixed(2)}m²`;
@@ -324,7 +538,7 @@ function computeFloorAreaLabel(slab: SlabData): FloorAreaLabelInfo | null {
     key: `area:${slab.id}`,
     nameText: nameText,
     areaText: areaText,
-    position: new THREE.Vector3(centroid.x, AREA_LABEL_HEIGHT_METERS, centroid.z),
+    position: new THREE.Vector3(labelPoint.x, slab.topOffset + AREA_LABEL_HEIGHT_METERS, labelPoint.z),
   };
 }
 

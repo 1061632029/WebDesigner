@@ -6,6 +6,7 @@
 import * as THREE from 'three/webgpu';
 import type { Point2D } from './BuildingTypes';
 import type { SceneManager } from '../scene/SceneManager';
+import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
 /** 半径标注线颜色，保持与动态尺寸标注蓝色一致。 */
 const RADIUS_LINE_COLOR: number = 0x2f8df6;
@@ -378,7 +379,7 @@ function createLabelSprite(
     depthWrite: false,
   });
   const sprite: THREE.Sprite = new THREE.Sprite(material);
-  sprite.scale.set(LABEL_SPRITE_W, LABEL_SPRITE_H, 1.0);
+  applyFixedScreenSpriteSize(sprite, LABEL_SPRITE_W, LABEL_SPRITE_H);
   sprite.position.set(x, RADIUS_DIMENSION_Y, z);
   sprite.renderOrder = renderOrder;
 

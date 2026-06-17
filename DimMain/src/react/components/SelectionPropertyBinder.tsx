@@ -34,6 +34,8 @@ import type { WallSnapResult } from '../../building/WallSnapHelper';
 import { DoorWindowCollisionDetector } from '../../model/DoorWindowCollisionDetector';
 import { DoorOpeningDirectionHelper } from '../../model/DoorOpeningDirectionHelper';
 import type { DoorOpeningDirection } from '../../model/DoorOpeningDirectionHelper';
+import { DoorCombHelper } from '../../model/DoorCombHelper';
+import type { DoorComb } from '../../model/DoorCombHelper';
 import { StlRotationAngleHelper, STL_ROTATION_ANGLE_MAX_DEGREES, STL_ROTATION_ANGLE_MIN_DEGREES } from '../../model/StlRotationAngleHelper';
 
 /**
@@ -82,7 +84,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
 
       if (objectData.category === 'slab') {
         const slabData: SlabData = objectData as SlabData;
-        totalIndoorArea += FloorAreaCalculator.calculatePolygonArea(slabData.outline);
+        totalIndoorArea += FloorAreaCalculator.calculateSlabArea(slabData);
       }
     }
 
@@ -118,9 +120,9 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
       step: 0.01,
       value: Number(totalIndoorArea.toFixed(2)),
       readonly: true,
-      readonlyHint: '套内面积由所有楼板轮廓自动计算，不可手动编辑',
+      readonlyHint: '套内面积由所有楼板外轮廓扣除内轮廓洞口后自动计算，不可手动编辑',
       onChange: (_value: number): void => {
-        /* 只读派生属性：套内面积由楼板 outline 自动计算，此处保留空回调用于满足属性控件接口。 */
+        /* 只读派生属性：套内面积由楼板净面积自动计算，此处保留空回调用于满足属性控件接口。 */
       },
     };
 
@@ -734,6 +736,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           const currentSillHeight: number | undefined = mesh.userData['sillHeight'] as number | undefined;
           const currentDoorBottomHeight: number | undefined = mesh.userData['doorBottomHeight'] as number | undefined;
           const currentDoorOpeningDirection: string | undefined = mesh.userData['doorOpeningDirection'] as string | undefined;
+          const currentDoorComb: string | undefined = mesh.userData['comb'] as string | undefined;
 
           if (currentSillHeight !== undefined) {
             snapshot.sillHeight = currentSillHeight;
@@ -743,6 +746,9 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           }
           if (currentDoorOpeningDirection === '内开' || currentDoorOpeningDirection === '外开') {
             snapshot.doorOpeningDirection = currentDoorOpeningDirection;
+          }
+          if (currentDoorComb === '左开' || currentDoorComb === '右开') {
+            snapshot.comb = currentDoorComb;
           }
 
           return snapshot;
@@ -773,6 +779,9 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           }
           if (snapshot.doorOpeningDirection !== undefined) {
             mesh.userData['doorOpeningDirection'] = snapshot.doorOpeningDirection;
+          }
+          if (snapshot.comb !== undefined) {
+            mesh.userData['comb'] = snapshot.comb;
           }
         };
 
@@ -1038,15 +1047,18 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           const originalSizeZ: number = (mesh.userData['originalSizeZ'] as number) ?? 1;
           const isThicknessReadonly: boolean = StlAdaptiveThicknessHelper.isThicknessReadonly(mesh);
           const currentDoorOpeningDirection: DoorOpeningDirection = DoorOpeningDirectionHelper.ensureDirection(mesh);
+          const currentDoorComb: DoorComb = DoorCombHelper.ensureComb(mesh);
 
           /**
            * 构建门属性面板分组
            * @param doorBottomHeight - 当前门底高度（m）
            * @param doorOpeningDirection - 当前门开启方向
+           * @param doorComb - 当前门板左右位置
            */
           const buildDoorPropertyGroups = (
             doorBottomHeight: number,
-            doorOpeningDirection: DoorOpeningDirection
+            doorOpeningDirection: DoorOpeningDirection,
+            doorComb: DoorComb
           ): Array<PropertyGroup> => {
             /* 门窗尺寸固定按模型局部坐标轴计算：局部 X=宽度，局部 Y=高度，局部 Z=厚度。
              * originalSizeX/Y/Z 在放置时来自几何体局部包围盒，不随墙体方向或世界旋转变化。
@@ -1156,6 +1168,29 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
               },
             };
 
+            /**
+             * 门板位置属性项
+             * 修改时写入 comb 属性并刷新 2D 门图标；左开/右开仅影响平面符号门板和开启弧线的左右位置。
+             */
+            const doorCombItem: SelectPropertyItem = {
+              id: 'comb',
+              type: 'select',
+              label: '门板位置',
+              options: [
+                { label: '左开', value: '左开' },
+                { label: '右开', value: '右开' },
+              ],
+              value: doorComb,
+              onChange: (value: string): void => {
+                if (value !== '左开' && value !== '右开') {
+                  return;
+                }
+                const nextComb: DoorComb = value;
+                DoorCombHelper.setCombAndRefreshSymbol(mesh, nextComb, true);
+                propertyPanelController.refresh();
+              },
+            };
+
             return [
               {
                 title: `🚪 门: ${stlName}`,
@@ -1166,6 +1201,7 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
                   makeDoorSizeItem('z', '厚', currentSizeZmm, originalSizeZ),
                   doorBottomHeightItem,
                   doorOpeningDirectionItem,
+                  doorCombItem,
                 ],
               },
             ];
@@ -1174,10 +1210,11 @@ export function SelectionPropertyBinder(props: SelectionPropertyBinderProps): nu
           propertyPanelController.bindBuilder(
             (): Array<PropertyGroup> => buildDoorPropertyGroups(
               mesh.userData['doorBottomHeight'] as number,
-              DoorOpeningDirectionHelper.getDirection(mesh)
+              DoorOpeningDirectionHelper.getDirection(mesh),
+              DoorCombHelper.getComb(mesh)
             )
           );
-          propertyPanelController.show(buildDoorPropertyGroups(currentDoorBottomHeight, currentDoorOpeningDirection));
+          propertyPanelController.show(buildDoorPropertyGroups(currentDoorBottomHeight, currentDoorOpeningDirection, currentDoorComb));
           return;
         }
 

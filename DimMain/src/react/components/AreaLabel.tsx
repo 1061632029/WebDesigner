@@ -16,9 +16,10 @@ import { useBuildingContext } from '../context/BuildingContext';
 import type { BuildingObject } from '../../building/BuildingTypes';
 import type { SlabData } from '../../building/BuildingTypes';
 import type { Point2D } from '../../building/BuildingTypes';
-import { computePolygonArea } from '../../building/AreaCalculator';
 import { computePolygonCentroid } from '../../building/AreaCalculator';
+import { FloorAreaCalculator } from '../../building/FloorAreaCalculator';
 import type { Engine } from '../../core/Engine';
+import { applyFixedScreenSpriteSize } from '../../rendering/FixedScreenSpriteScaler';
 
 /**
  * 单个面积标注的内部数据结构
@@ -103,8 +104,8 @@ function createAreaSprite(text: string, centroid: Point2D): THREE.Sprite {
 
   const sprite: THREE.Sprite = new THREE.Sprite(material);
 
-  /* Sprite 世界尺寸（单位：米），宽高比与 Canvas 一致 256:80 = 3.2:1 */
-  sprite.scale.set(3.2, 1.0, 1.0);
+  /* 标注按参考世界尺寸换算为固定屏幕像素尺寸，滚轮缩放时不再跟随场景缩放。 */
+  applyFixedScreenSpriteSize(sprite, 3.2, 1.0);
 
   /* 放置在质心位置，Y 轴略高于地面（0.05m）避免 z-fighting */
   sprite.position.set(centroid.x, 0.05, centroid.z);
@@ -173,8 +174,8 @@ export function AreaLabel(): null {
         continue;
       }
 
-      /* 计算面积（平方米） */
-      const area: number = computePolygonArea(outline);
+      /* 计算楼板净面积（平方米）：父楼板需要扣除内轮廓洞口，避免洞口区域重复计入。 */
+      const area: number = FloorAreaCalculator.calculateSlabArea(slab);
       /* 计算质心 */
       const centroid: Point2D = computePolygonCentroid(outline);
 

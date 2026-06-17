@@ -139,10 +139,20 @@ export interface StraightWallData extends BuildingObjectBase {
    */
   ceilingId: string | null;
   /**
+   * 关联的天花板 ID 列表。
+   * 当一面直墙同时作为多个最小封闭空间的边界时，用该列表保留全部天花板绑定；ceilingId 保留为兼容旧逻辑的首个绑定。
+   */
+  ceilingIds?: string[];
+  /**
    * 关联的楼板 ID
    * null 表示未绑定楼板
    */
   slabId: string | null;
+  /**
+   * 关联的楼板 ID 列表。
+   * 当一面直墙同时作为多个最小封闭空间的边界时，用该列表保留全部楼板绑定；slabId 保留为兼容旧逻辑的首个绑定。
+   */
+  slabIds?: string[];
 }
 
 /**
@@ -220,6 +230,14 @@ export interface SlabBoundaryDimensionSegment {
   sourceType: 'straight' | 'arc' | 'fallback';
 }
 
+/** 楼板内轮廓洞口与子空间墙体的绑定关系。 */
+export interface SlabInnerOutlineBinding {
+  /** 洞口内轮廓（XZ 平面多边形顶点，单位：米）。 */
+  outline: Point2D[];
+  /** 吸附并围合该洞口的子空间墙体 ID 列表。 */
+  wallIds: string[];
+}
+
 /**
  * 楼板数据
  * 由封闭墙体围合的多边形轮廓向下挤压生成
@@ -228,8 +246,20 @@ export interface SlabData extends BuildingObjectBase {
   category: 'slab';
   /** 楼板轮廓（XZ 平面多边形顶点，按顺序闭合，单位：米） */
   outline: Point2D[];
+  /**
+   * 楼板内轮廓洞口列表。
+   * 当房间内创建完全被父楼板包含的子空间时，子空间净轮廓会作为楼板冲孔洞口参与几何构建。
+   */
+  innerOutlines?: Point2D[][];
+  /** 楼板内轮廓洞口与子空间墙体的绑定关系，用于父楼板与开洞墙体双向追踪。 */
+  innerOutlineBindings?: SlabInnerOutlineBinding[];
   /** 楼板边界长度标注段；弧形边界会合并为起点到终点的一条标注。 */
   boundaryDimensionSegments?: SlabBoundaryDimensionSegment[];
+  /**
+   * 关联的墙体 ID 列表（围合该楼板的墙体）。
+   * 用于精确区分相邻最小封闭空间，避免共享墙导致复用到其他房间的楼板。
+   */
+  wallIds: string[];
   /** 楼板厚度（米），默认 0.1（100mm），向下拉伸，修改厚度不影响顶面高度 */
   slabThickness: number;
   /**

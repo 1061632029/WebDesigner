@@ -7,7 +7,7 @@
 
 import * as THREE from 'three/webgpu';
 import type { SelectionManager } from './SelectionManager';
-import type { BuildingObjectManager, BeamDragSnapshot, BeamJointDragSnapshot, StraightWallDragSnapshot, WallJointDragSnapshot } from '../building/BuildingObjectManager';
+import type { ArcWallDragSnapshot, BuildingObjectManager, BeamDragSnapshot, BeamJointDragSnapshot, StraightWallDragSnapshot, WallJointDragSnapshot } from '../building/BuildingObjectManager';
 import { RaycastHelper } from './RaycastHelper';
 import type { MeshFaceHitResult } from './RaycastHelper';
 import type { SceneManager } from '../scene/SceneManager';
@@ -18,6 +18,7 @@ import type { BBoxSnapResult } from '../model/StlBBoxSnapHelper';
 import { StlSnapGuideLines } from '../model/StlSnapGuideLines';
 import { StlMoveCommand } from '../history/commands/StlMoveCommand';
 import { WallMoveCommand } from '../history/commands/WallMoveCommand';
+import { ArcWallMoveCommand } from '../history/commands/ArcWallMoveCommand';
 import { BeamMoveCommand } from '../history/commands/BeamMoveCommand';
 import { WallJointMoveCommand } from '../history/commands/WallJointMoveCommand';
 import { BeamJointMoveCommand } from '../history/commands/BeamJointMoveCommand';
@@ -206,6 +207,24 @@ export class SelectionTool {
 
   /** 墙体拖拽开始时的直墙与连接节点快照，用于按 P + L 方式实时预览。 */
   private _dragWallSnapshot: StraightWallDragSnapshot | null = null;
+
+  /** 是否正在拖拽 2D 弧形墙实体。 */
+  private _isDraggingArcWall: boolean = false;
+
+  /** 当前拖拽的弧形墙 ID。 */
+  private _dragArcWallId: string | null = null;
+
+  /** 弧形墙拖拽起始鼠标地面投影点。 */
+  private _dragArcWallStartGroundPoint: THREE.Vector3 = new THREE.Vector3();
+
+  /** 弧形墙允许拖拽的方向，即圆心到弦中心点所在直线方向。 */
+  private _dragArcWallDirection: THREE.Vector3 = new THREE.Vector3();
+
+  /** 弧形墙拖拽过程中已实时应用的累计偏移。 */
+  private _dragArcWallAppliedOffset: Point2D = { x: 0, z: 0 };
+
+  /** 弧形墙拖拽开始快照，用于实时预览与最终命令提交前回滚。 */
+  private _dragArcWallSnapshot: ArcWallDragSnapshot | null = null;
 
   /** 是否正在拖拽 2D 梁实体。 */
   private _isDraggingBeam: boolean = false;
@@ -626,6 +645,11 @@ export class SelectionTool {
         return;
       }
 
+      /* 2D 模式下：检测是否按下在已选中的弧形墙实体上，若是则启动沿圆心到弦中心点所在直线拖拽。 */
+      if (!this._isDraggingStl && this._tryStartArcWallDrag(event)) {
+        return;
+      }
+
       /* 2D 模式下：检测是否按下在已选中的梁实体上，若是则启动沿梁截面宽度法向拖拽。 */
       if (!this._isDraggingStl && this._tryStartBeamDrag(event)) {
         return;
@@ -666,6 +690,14 @@ export class SelectionTool {
     /* 若正在拖拽墙体，结束拖拽并提交墙体移动命令。 */
     if (this._isDraggingWall) {
       this._endWallDrag();
+      this._mouseDownPos = null;
+      this._skipNextClick = false;
+      return;
+    }
+
+    /* 若正在拖拽弧形墙，结束拖拽并提交弧形墙移动命令。 */
+    if (this._isDraggingArcWall) {
+      this._endArcWallDrag();
       this._mouseDownPos = null;
       this._skipNextClick = false;
       return;
@@ -824,7 +856,7 @@ export class SelectionTool {
       return;
     }
 
-    if (this._isDraggingStl || this._isDraggingWall || this._isDraggingBeam || this._isDraggingWallJoint || this._dimensionEditKind !== null) {
+    if (this._isDraggingStl || this._isDraggingWall || this._isDraggingArcWall || this._isDraggingBeam || this._isDraggingWallJoint || this._dimensionEditKind !== null) {
       this._clearHoverOutline();
       return;
     }
@@ -1675,6 +1707,156 @@ export class SelectionTool {
   }
 
   /**
+   * 尝试启动 2D 弧形墙实体拖拽。
+   * 仅允许单选弧形墙，并把拖拽方向锁定到圆心与弦中心点所在直线。
+   * @param event - 鼠标按下事件
+   * @returns 成功启动弧形墙拖拽时返回 true
+   */
+  private _tryStartArcWallDrag(event: MouseEvent): boolean {
+    if (this._camera === null || this._domElement === null) {
+      return false;
+    }
+
+    const selectedIds: string[] = Array.from(this._selectionManager.selectedIds);
+    if (selectedIds.length !== 1) {
+      return false;
+    }
+
+    const wallId: string = selectedIds[0]!;
+    const wallObject: BuildingObject | undefined = this._objectManager.getById(wallId);
+    if (wallObject === undefined || wallObject.category !== 'wall' || wallObject.subType !== 'arc') {
+      return false;
+    }
+
+    const wallMesh: THREE.Mesh | undefined = this._objectManager.getMeshById(wallId);
+    if (wallMesh === undefined || !wallMesh.visible) {
+      return false;
+    }
+
+    const rect: DOMRect = this._domElement.getBoundingClientRect();
+    const ndcX: number = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY: number = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    this._dragRaycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), this._camera);
+
+    const hits: Array<THREE.Intersection> = this._dragRaycaster.intersectObject(wallMesh, true);
+    if (hits.length === 0) {
+      return false;
+    }
+
+    const groundHit: THREE.Vector3 | null = this._dragRaycaster.ray.intersectPlane(
+      this._dragGroundPlane,
+      this._dragArcWallStartGroundPoint
+    );
+    if (groundHit === null) {
+      return false;
+    }
+
+    const dragSnapshot: ArcWallDragSnapshot | null = this._objectManager.createArcWallDragSnapshot(wallId);
+    if (dragSnapshot === null) {
+      return false;
+    }
+
+    /* 弧形墙拖拽启动流程：记录拖拽开始快照与径向方向，后续鼠标总位移只投影到该方向上。 */
+    this._dragArcWallDirection.set(dragSnapshot.dragDirection.x, 0, dragSnapshot.dragDirection.z);
+    this._dragArcWallAppliedOffset = { x: 0, z: 0 };
+    this._dragArcWallSnapshot = dragSnapshot;
+    this._dragArcWallId = wallId;
+    this._isDraggingArcWall = true;
+    this._skipNextClick = true;
+    this._clearHoverOutline();
+
+    this._domElement.addEventListener('mousemove', this._onArcWallDragMouseMove);
+    return true;
+  }
+
+  /**
+   * 弧形墙拖拽过程中的鼠标移动处理。
+   * @param event - 鼠标移动事件
+   */
+  private _onArcWallDragMouseMove = (event: MouseEvent): void => {
+    if (
+      !this._isDraggingArcWall ||
+      this._dragArcWallId === null ||
+      this._dragArcWallSnapshot === null ||
+      this._camera === null ||
+      this._domElement === null
+    ) {
+      return;
+    }
+
+    const groundPoint: THREE.Vector3 = new THREE.Vector3();
+    const groundHit: THREE.Vector3 | null = this._screenPointToGroundPoint(event.clientX, event.clientY, groundPoint);
+    if (groundHit === null) {
+      return;
+    }
+
+    /* 弧形墙移动跟随流程：鼠标地面总位移投影到圆心-弦中心线方向，避免沿切向误拖动。 */
+    const deltaX: number = groundPoint.x - this._dragArcWallStartGroundPoint.x;
+    const deltaZ: number = groundPoint.z - this._dragArcWallStartGroundPoint.z;
+    const radialDistance: number = deltaX * this._dragArcWallDirection.x + deltaZ * this._dragArcWallDirection.z;
+    const rawTargetOffset: Point2D = {
+      x: this._dragArcWallDirection.x * radialDistance,
+      z: this._dragArcWallDirection.z * radialDistance,
+    };
+    const targetOffset: Point2D = this._applyArcWallRadialDragSnap(rawTargetOffset);
+    if (
+      Math.abs(targetOffset.x - this._dragArcWallAppliedOffset.x) < 0.000001 &&
+      Math.abs(targetOffset.z - this._dragArcWallAppliedOffset.z) < 0.000001
+    ) {
+      return;
+    }
+
+    this._objectManager.moveArcWallFromSnapshot(this._dragArcWallSnapshot, targetOffset);
+    this._dragArcWallAppliedOffset = targetOffset;
+  };
+
+  /** 结束弧形墙拖拽并把最终径向位移写入历史命令。 */
+  private _endArcWallDrag(): void {
+    if (!this._isDraggingArcWall || this._dragArcWallId === null || this._dragArcWallSnapshot === null) {
+      return;
+    }
+
+    if (this._domElement !== null) {
+      this._domElement.removeEventListener('mousemove', this._onArcWallDragMouseMove);
+    }
+
+    const wallId: string = this._dragArcWallId;
+    const appliedOffset: Point2D = { x: this._dragArcWallAppliedOffset.x, z: this._dragArcWallAppliedOffset.z };
+    this._hidePlanarDragGuideLines();
+    if (
+      this._historyManager !== null &&
+      (Math.abs(appliedOffset.x) > 0.000001 || Math.abs(appliedOffset.z) > 0.000001)
+    ) {
+      /* 先回滚实时预览位移，再由命令栈执行同一位移，保证撤销/重做状态一致。 */
+      this._objectManager.moveArcWallFromSnapshot(this._dragArcWallSnapshot, { x: 0, z: 0 });
+      const command: ArcWallMoveCommand = new ArcWallMoveCommand(
+        this._objectManager,
+        this._dragArcWallSnapshot,
+        appliedOffset,
+        `2D 径向拖拽移动弧形墙 "${wallId}"`
+      );
+      this._historyManager.execute(command);
+    }
+
+    if (this._selectionManager.selectedIds.has(wallId)) {
+      this._selectionManager.refreshSelectionHighlight();
+    }
+
+    this._resetArcWallDragState();
+  }
+
+  /** 重置弧形墙拖拽运行时状态。 */
+  private _resetArcWallDragState(): void {
+    this._isDraggingArcWall = false;
+    this._dragArcWallId = null;
+    this._dragArcWallSnapshot = null;
+    this._dragArcWallStartGroundPoint.set(0, 0, 0);
+    this._dragArcWallDirection.set(0, 0, 0);
+    this._dragArcWallAppliedOffset = { x: 0, z: 0 };
+    this._hidePlanarDragGuideLines();
+  }
+
+  /**
    * 尝试启动 2D 梁实体方向拖拽。
    * 仅允许单选梁，并把拖拽方向锁定到梁中心线的截面宽度法向方向。
    * @param event - 鼠标按下事件
@@ -1908,6 +2090,23 @@ export class SelectionTool {
   }
 
   /**
+   * 对弧形墙径向拖拽偏移执行捕获检测。
+   * @param rawOffset - 弧形墙径向拖拽原始偏移
+   * @returns 捕获修正后的径向偏移
+   */
+  private _applyArcWallRadialDragSnap(rawOffset: Point2D): Point2D {
+    if (this._dragArcWallSnapshot === null) {
+      this._hidePlanarDragGuideLines();
+      return rawOffset;
+    }
+
+    const radialDirection: Point2D = { x: this._dragArcWallDirection.x, z: this._dragArcWallDirection.z };
+    const anchors: LinearDragSnapAnchor[] = this._buildArcWallRadialDragSnapAnchors(this._dragArcWallSnapshot);
+    const excludedObjectIds: Set<string> = new Set<string>([this._dragArcWallSnapshot.wallId]);
+    return this._applyLinearNormalDragSnap(rawOffset, radialDirection, anchors, excludedObjectIds);
+  }
+
+  /**
    * 对梁法向拖拽偏移执行捕获检测。
    * @param rawOffset - 梁法向拖拽原始偏移
    * @returns 捕获修正后的法向偏移
@@ -2003,6 +2202,17 @@ export class SelectionTool {
     for (const wallPosition of snapshot.wallPositions.values()) {
       this._appendLinearDragSnapAnchors(anchors, wallPosition.start, wallPosition.end);
     }
+    return anchors;
+  }
+
+  /**
+   * 构建弧形墙径向移动时参与捕获检测的锚点集合。
+   * @param snapshot - 弧形墙拖拽开始快照
+   * @returns 弧形墙起点、终点和弦中心点锚点
+   */
+  private _buildArcWallRadialDragSnapAnchors(snapshot: ArcWallDragSnapshot): LinearDragSnapAnchor[] {
+    const anchors: LinearDragSnapAnchor[] = [];
+    this._appendLinearDragSnapAnchors(anchors, snapshot.start, snapshot.end);
     return anchors;
   }
 
@@ -3475,6 +3685,12 @@ export class SelectionTool {
       this._dragWallId = null;
       this._dragWallAppliedOffset = { x: 0, z: 0 };
       this._dragWallSnapshot = null;
+    }
+    if (this._isDraggingArcWall) {
+      if (this._domElement !== null) {
+        this._domElement.removeEventListener('mousemove', this._onArcWallDragMouseMove);
+      }
+      this._resetArcWallDragState();
     }
     if (this._isDraggingBeam) {
       if (this._domElement !== null) {

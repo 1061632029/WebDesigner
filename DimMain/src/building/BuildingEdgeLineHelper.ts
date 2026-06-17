@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { FixedPixelLineSegmentsFactory } from '../rendering/FixedPixelLineSegmentsFactory';
 
 /**
  * 建筑边线创建配置
@@ -15,6 +16,10 @@ export interface BuildingEdgeLineOptions {
   color?: THREE.ColorRepresentation;
   /** 共面判断点积阈值，越接近 1 越严格，默认 0.999。 */
   coplanarDotThreshold?: number;
+  /** 是否使用 WebGPU 固定像素宽度线段强化线框，默认关闭以保持原行为。 */
+  fixedPixelLineWidthEnabled?: boolean;
+  /** 固定像素线宽，单位为 CSS 像素。 */
+  fixedPixelLineWidth?: number;
 }
 
 /**
@@ -122,7 +127,7 @@ export class BuildingEdgeLineHelper {
       return null;
     }
 
-    return BuildingEdgeLineHelper._createLineSegments(positionAttribute, visibleEdges, options.color);
+    return BuildingEdgeLineHelper._createLineSegments(positionAttribute, visibleEdges, options);
   }
 
   /**
@@ -130,6 +135,11 @@ export class BuildingEdgeLineHelper {
    * @param line - 需要释放的边线对象
    */
   public static disposeLineSegments(line: THREE.LineSegments): void {
+    if (FixedPixelLineSegmentsFactory.isFixedPixelLineSegments(line)) {
+      FixedPixelLineSegmentsFactory.dispose(line);
+      return;
+    }
+
     line.geometry.dispose();
     if (line.material instanceof THREE.Material) {
       const material: THREE.Material = line.material as THREE.Material;
@@ -329,7 +339,7 @@ export class BuildingEdgeLineHelper {
   private static _createLineSegments(
     positionAttribute: THREE.BufferAttribute | THREE.InterleavedBufferAttribute,
     visibleEdges: Array<[number, number]>,
-    color: THREE.ColorRepresentation | undefined
+    options: BuildingEdgeLineOptions
   ): THREE.LineSegments {
     const vertices: Float32Array = new Float32Array(visibleEdges.length * 6);
     for (let edgeIndex: number = 0; edgeIndex < visibleEdges.length; edgeIndex++) {
@@ -347,7 +357,20 @@ export class BuildingEdgeLineHelper {
     const lineGeometry: THREE.BufferGeometry = new THREE.BufferGeometry();
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
 
-    const colorValue: THREE.ColorRepresentation = color ?? BuildingEdgeLineHelper.DEFAULT_COLOR;
+    const colorValue: THREE.ColorRepresentation = options.color ?? BuildingEdgeLineHelper.DEFAULT_COLOR;
+    if (options.fixedPixelLineWidthEnabled === true) {
+      const fixedPixelLines = FixedPixelLineSegmentsFactory.create(vertices, {
+        color: colorValue,
+        lineWidthPixels: options.fixedPixelLineWidth ?? FixedPixelLineSegmentsFactory.DEFAULT_LINE_WIDTH_PIXELS,
+        depthTest: true,
+        depthWrite: false,
+        opacity: 1,
+      });
+      fixedPixelLines.userData['isWireframe'] = true;
+      fixedPixelLines.userData['isEnhancedWireframe'] = true;
+      return FixedPixelLineSegmentsFactory.asLineSegments(fixedPixelLines);
+    }
+
     const lineMaterial: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
       color: colorValue,
       depthTest: true,

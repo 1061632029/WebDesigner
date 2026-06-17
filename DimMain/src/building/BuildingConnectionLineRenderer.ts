@@ -4,8 +4,19 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { FixedPixelLineSegmentsFactory } from '../rendering/FixedPixelLineSegmentsFactory';
 import type { SceneManager } from '../scene/SceneManager';
 import type { BuildingConnectionLineSegment } from './BuildingConnectionLineTypes';
+
+/**
+ * 建筑衔接线渲染配置。
+ */
+export interface BuildingConnectionLineRendererOptions {
+  /** 是否使用 WebGPU 固定像素宽度线段强化衔接线，默认关闭以保持原行为。 */
+  fixedPixelLineWidthEnabled?: boolean;
+  /** 固定像素线宽，单位为 CSS 像素。 */
+  fixedPixelLineWidth?: number;
+}
 
 /**
  * 建筑衔接线渲染器
@@ -27,11 +38,19 @@ export class BuildingConnectionLineRenderer {
     opacity: 1,
   });
 
+  /** 是否启用 WebGPU 固定像素线宽强化。 */
+  private readonly _fixedPixelLineWidthEnabled: boolean;
+
+  /** 固定像素线宽，单位为 CSS 像素。 */
+  private readonly _fixedPixelLineWidth: number;
+
   /**
    * @param sceneManager - 场景管理器
    */
-  public constructor(sceneManager: SceneManager) {
+  public constructor(sceneManager: SceneManager, options: BuildingConnectionLineRendererOptions = {}) {
     this._sceneManager = sceneManager;
+    this._fixedPixelLineWidthEnabled = options.fixedPixelLineWidthEnabled === true;
+    this._fixedPixelLineWidth = options.fixedPixelLineWidth ?? FixedPixelLineSegmentsFactory.DEFAULT_LINE_WIDTH_PIXELS;
     this._root.name = 'BuildingConnectionLines';
     this._root.renderOrder = 20;
     this._sceneManager.add(this._root);
@@ -64,7 +83,9 @@ export class BuildingConnectionLineRenderer {
       this._root.remove(child);
 
       /* 衔接线子对象均为 LineSegments，释放其独立几何体；材质为共享材质，不在此处释放。 */
-      if (child instanceof THREE.LineSegments) {
+      if (FixedPixelLineSegmentsFactory.isFixedPixelLineSegments(child)) {
+        FixedPixelLineSegmentsFactory.dispose(child);
+      } else if (child instanceof THREE.LineSegments) {
         const line: THREE.LineSegments = child as THREE.LineSegments;
         line.geometry.dispose();
       }
@@ -144,7 +165,19 @@ export class BuildingConnectionLineRenderer {
     const geometry: THREE.BufferGeometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
 
-    const line: THREE.LineSegments = new THREE.LineSegments(geometry, this._material);
+    const line: THREE.LineSegments = this._fixedPixelLineWidthEnabled
+      ? FixedPixelLineSegmentsFactory.asLineSegments(FixedPixelLineSegmentsFactory.create(vertices, {
+        color: 0x333333,
+        lineWidthPixels: this._fixedPixelLineWidth,
+        depthTest: true,
+        depthWrite: false,
+        opacity: 1,
+      }))
+      : new THREE.LineSegments(geometry, this._material);
+    if (this._fixedPixelLineWidthEnabled) {
+      geometry.dispose();
+      line.userData['isEnhancedConnectionLine'] = true;
+    }
     line.name = segment.id;
     line.userData['isBuildingConnectionLine'] = true;
     line.userData['sourceObjectId'] = segment.sourceObjectId;

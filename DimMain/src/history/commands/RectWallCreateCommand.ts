@@ -5,7 +5,7 @@
 
 import * as THREE from 'three/webgpu';
 import type { ICommand } from '../ICommand';
-import type { BuildingObject, RectWallData, StraightWallData } from '../../building/BuildingTypes';
+import type { BuildingObject, RectWallData, SlabData, StraightWallData } from '../../building/BuildingTypes';
 import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
 import type { GeneratedSurfaceSignatureSnapshot } from '../../building/BuildingObjectManager';
 import { WallCascadeDeleteCommand } from './WallCascadeDeleteCommand';
@@ -42,6 +42,12 @@ export class RectWallCreateCommand implements ICommand {
   /** 首次执行后的楼板/天花板自动生成签名缓存快照 */
   private _afterSignatureSnapshot: GeneratedSurfaceSignatureSnapshot | null = null;
 
+  /** 首次执行前的楼板完整数据快照，用于恢复被子空间冲孔改写的原楼板轮廓。 */
+  private _beforeSlabSnapshot: SlabData[] | null = null;
+
+  /** 首次执行后的楼板完整数据快照，用于重做时恢复冲孔后的楼板轮廓。 */
+  private _afterSlabSnapshot: SlabData[] | null = null;
+
   /** 本命令创建的完整对象快照，包含子墙、父级矩形墙以及自动楼板/天花板 */
   private _createdObjectSnapshots: BuildingObject[] | null = null;
 
@@ -77,17 +83,25 @@ export class RectWallCreateCommand implements ICommand {
       if (this._afterSignatureSnapshot !== null) {
         this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._afterSignatureSnapshot);
       }
+      if (this._afterSlabSnapshot !== null) {
+        /* 重做矩形子空间时恢复执行后的楼板冲孔结果，避免只恢复墙体导致原楼板轮廓丢失冲孔状态。 */
+        this._manager.restoreSlabDataSnapshot(this._afterSlabSnapshot);
+      }
       this._cascadeDeleteCommand = null;
       return;
     }
 
     if (this._createdObjectSnapshots !== null && this._afterSignatureSnapshot !== null) {
       this._restoreCreatedObjectsFromSnapshots();
+      if (this._afterSlabSnapshot !== null) {
+        this._manager.restoreSlabDataSnapshot(this._afterSlabSnapshot);
+      }
       return;
     }
 
     this._beforeObjectIds = this._captureCurrentObjectIds();
     this._beforeSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+    this._beforeSlabSnapshot = this._manager.getSlabDataSnapshot();
 
     const childrenData: RectWallChildren = RectWallCreateCommand._cloneChildrenData(this._childrenData);
     for (const childData of childrenData) {
@@ -96,6 +110,7 @@ export class RectWallCreateCommand implements ICommand {
     this._manager.addObject(RectWallCreateCommand._cloneRectWallData(this._rectData));
 
     this._afterSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+    this._afterSlabSnapshot = this._manager.getSlabDataSnapshot();
     this._createdObjectSnapshots = this._captureCreatedObjectSnapshots(this._beforeObjectIds);
   }
 
@@ -131,6 +146,10 @@ export class RectWallCreateCommand implements ICommand {
 
     if (this._beforeSignatureSnapshot !== null) {
       this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._beforeSignatureSnapshot);
+    }
+    if (this._beforeSlabSnapshot !== null) {
+      /* 撤销矩形子空间时必须恢复原楼板完整快照，覆盖完全包含冲孔和部分相交裁剪产生的轮廓变化。 */
+      this._manager.restoreSlabDataSnapshot(this._beforeSlabSnapshot);
     }
   }
 

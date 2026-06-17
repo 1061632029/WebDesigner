@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
 /** XZ 平面包围盒数据，单位为米。 */
 interface StlPlacementFlatBox {
@@ -739,8 +740,7 @@ export class StlPlacementDimensionRenderer {
       depthWrite: false,
     });
     const sprite: THREE.Sprite = new THREE.Sprite(material);
-    sprite.renderOrder = 11003;
-    sprite.scale.set(LABEL_SPRITE_WIDTH, LABEL_SPRITE_HEIGHT, 1);
+    applyFixedScreenSpriteSize(sprite, LABEL_SPRITE_WIDTH, LABEL_SPRITE_HEIGHT);
     return {
       sprite: sprite,
       canvas: canvas,

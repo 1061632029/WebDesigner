@@ -6,6 +6,7 @@
 import * as THREE from 'three/webgpu';
 import { DoorOpeningDirectionHelper } from './DoorOpeningDirectionHelper';
 import type { DoorOpeningDirection } from './DoorOpeningDirectionHelper';
+import type { DoorComb } from './DoorCombHelper';
 
 /** 门窗 2D 符号 userData 标记字段 */
 export const DOOR_WINDOW_2D_SYMBOL_FLAG: string = 'isDoorWindow2DSymbol';
@@ -207,11 +208,13 @@ export class DoorWindow2DSymbolHelper {
     );
     const leafHalfThickness: number = (leafWorldThickness / scaleXAbs) * 0.5;
     const openingDirection: DoorOpeningDirection = DoorOpeningDirectionHelper.getDirection(owner);
+    const doorComb: DoorComb = DoorWindow2DSymbolHelper.getDoorComb(owner);
     const directionSign: number = openingDirection === '内开' ? 1 : -1;
-    const hingeX: number = openingMinX;
+    const combSign: number = doorComb === '左开' ? 1 : -1;
+    const hingeX: number = doorComb === '左开' ? openingMinX : openingMaxX;
     const hingeZ: number = openingDirection === '内开' ? openingMaxZ : openingMinZ;
-    const leafMinX: number = hingeX;
-    const leafMaxX: number = hingeX + leafHalfThickness * 2;
+    const leafMinX: number = doorComb === '左开' ? hingeX : hingeX - leafHalfThickness * 2;
+    const leafMaxX: number = doorComb === '左开' ? hingeX + leafHalfThickness * 2 : hingeX;
     const leafMinZ: number = directionSign > 0 ? hingeZ : hingeZ - doorLeafLocalLength;
     const leafMaxZ: number = directionSign > 0 ? hingeZ + doorLeafLocalLength : hingeZ;
 
@@ -241,6 +244,7 @@ export class DoorWindow2DSymbolHelper {
       hingeZ,
       radiusXLocal,
       radiusZLocal,
+      combSign,
       directionSign,
       config.y + 0.004,
       owner
@@ -252,6 +256,7 @@ export class DoorWindow2DSymbolHelper {
       hingeZ,
       radiusXLocal,
       radiusZLocal,
+      combSign,
       directionSign,
       config.y + 0.011,
       owner
@@ -261,7 +266,7 @@ export class DoorWindow2DSymbolHelper {
     const arcBoundaryLines: THREE.LineSegments = DoorWindow2DSymbolHelper.createLineSegments(
       [
         new THREE.Vector3(hingeX, config.y + 0.012, hingeZ),
-        new THREE.Vector3(hingeX + radiusXLocal, config.y + 0.012, hingeZ),
+        new THREE.Vector3(hingeX + radiusXLocal * combSign, config.y + 0.012, hingeZ),
         new THREE.Vector3(hingeX, config.y + 0.012, hingeZ),
         new THREE.Vector3(hingeX, config.y + 0.012, hingeZ + radiusZLocal * directionSign),
       ],
@@ -322,6 +327,19 @@ export class DoorWindow2DSymbolHelper {
       owner
     );
     group.add(lineSegments);
+  }
+
+  /**
+   * 读取门左右开属性。
+   * @param owner - 所属 STL Mesh
+   * @returns 门左右开属性；非法或缺失时返回左开以兼容历史图标
+   */
+  private static getDoorComb(owner: THREE.Mesh): DoorComb {
+    const rawComb: unknown = owner.userData['comb'];
+    if (rawComb === '左开' || rawComb === '右开') {
+      return rawComb;
+    }
+    return '左开';
   }
 
   /**
@@ -401,6 +419,7 @@ export class DoorWindow2DSymbolHelper {
    * @param hingeZ - 合页局部 Z
    * @param radiusX - 局部 X 方向开启半径
    * @param radiusZ - 局部 Z 方向开启半径
+   * @param combSign - 左右开符号，1 表示从左侧向局部 +X 绘制，-1 表示从右侧向局部 -X 绘制
    * @param directionSign - 开启方向符号，1 表示向局部 +Z 绘制，-1 表示向局部 -Z 绘制
    * @param y - 局部 Y 高度
    * @param owner - 所属 STL Mesh
@@ -411,6 +430,7 @@ export class DoorWindow2DSymbolHelper {
     hingeZ: number,
     radiusX: number,
     radiusZ: number,
+    combSign: number,
     directionSign: number,
     y: number,
     owner: THREE.Mesh
@@ -421,8 +441,8 @@ export class DoorWindow2DSymbolHelper {
 
     for (let index: number = 0; index <= segmentCount; index += 1) {
       const angle: number = (Math.PI * 0.5 * index) / segmentCount;
-      /* 扇形点击区域需与门开启方向一致，内开绘制到局部 +Z，外开绘制到局部 -Z。 */
-      positions.push(hingeX + Math.cos(angle) * radiusX, y, hingeZ + Math.sin(angle) * radiusZ * directionSign);
+      /* 扇形点击区域需同时跟随左右开与内外开，右开时沿局部 -X 镜像绘制。 */
+      positions.push(hingeX + Math.cos(angle) * radiusX * combSign, y, hingeZ + Math.sin(angle) * radiusZ * directionSign);
       if (index > 0) {
         indices.push(0, index, index + 1);
       }
@@ -447,6 +467,7 @@ export class DoorWindow2DSymbolHelper {
    * @param hingeZ - 合页局部 Z
    * @param radiusX - 局部 X 方向开启半径
    * @param radiusZ - 局部 Z 方向开启半径
+   * @param combSign - 左右开符号，1 表示从左侧向局部 +X 绘制，-1 表示从右侧向局部 -X 绘制
    * @param directionSign - 开启方向符号，1 表示向局部 +Z 绘制，-1 表示向局部 -Z 绘制
    * @param y - 局部 Y 高度
    * @param owner - 所属 STL Mesh
@@ -457,6 +478,7 @@ export class DoorWindow2DSymbolHelper {
     hingeZ: number,
     radiusX: number,
     radiusZ: number,
+    combSign: number,
     directionSign: number,
     y: number,
     owner: THREE.Mesh
@@ -465,8 +487,8 @@ export class DoorWindow2DSymbolHelper {
     const segmentCount: number = 32;
     for (let index: number = 0; index <= segmentCount; index += 1) {
       const angle: number = (Math.PI * 0.5 * index) / segmentCount;
-      /* 弧线方向跟随开启方向，避免只切换门扇而弧线仍固定向外侧显示。 */
-      points.push(new THREE.Vector3(hingeX + Math.cos(angle) * radiusX, y, hingeZ + Math.sin(angle) * radiusZ * directionSign));
+      /* 弧线方向跟随左右开与开启方向，避免门扇和弧线分离。 */
+      points.push(new THREE.Vector3(hingeX + Math.cos(angle) * radiusX * combSign, y, hingeZ + Math.sin(angle) * radiusZ * directionSign));
     }
 
     const geometry: THREE.BufferGeometry = new THREE.BufferGeometry().setFromPoints(points);

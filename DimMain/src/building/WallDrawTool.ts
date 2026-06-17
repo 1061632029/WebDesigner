@@ -28,6 +28,7 @@ import { ClosedStraightWallLoopCreateCommand } from '../history/commands/ClosedS
 import type { ClosedLoopStraightWallUpdate } from '../history/commands/ClosedStraightWallLoopCreateCommand';
 import { RectWallCreateCommand } from '../history/commands/RectWallCreateCommand';
 import { BeamCreateCommand } from '../history/commands/BeamCreateCommand';
+import { ArcWallCreateCommand } from '../history/commands/ArcWallCreateCommand';
 
 /**
  * 绘制工具状态变更回调
@@ -1173,15 +1174,16 @@ export class WallDrawTool {
   }
 
   /**
-   * 按当前预览参数创建弧形墙并清理预览状态。
+   * 按当前弧形墙预览完成创建或编辑确认。
+   * 关键流程：编辑已有弧墙时直接更新对象；新建弧墙时通过历史命令执行，确保支持撤销和重做。
    */
   private _confirmArcWallPreview(): void {
-    if (this._startPoint === null || this._endPoint === null || Math.abs(this._bulge) < 0.000001) {
+    if (this._startPoint === null || this._endPoint === null || Math.abs(this._bulge) < 0.001) {
       return;
     }
 
     if (this._editingArcWallId !== null) {
-      /* 已有弧墙编辑确认：复用布置阶段的半径/角度计算结果，直接更新中心弧数据并刷新常驻标注。 */
+      /* 弧墙编辑确认：更新当前弧墙几何，并同步刷新常驻半径/角度标注。 */
       const editingWallId: string = this._editingArcWallId;
       this._objectManager.updateObject(editingWallId, {
         start: { x: this._startPoint.x, z: this._startPoint.z },
@@ -1197,24 +1199,30 @@ export class WallDrawTool {
         null,
         null
       );
-      console.log(`[WallDrawTool] 弧形墙已更新, id=${editingWallId}, bulge=${this._bulge.toFixed(3)}`);
     } else {
-      const id: string = this._objectManager.createArcWall(
-        this._startPoint, this._endPoint, this._bulge, this._thickness, this._height
+      /* 弧墙创建确认：先构造完整数据快照，再交给历史命令统一执行，确保支持撤销/重做。 */
+      const createdArcWall: ArcWallData = this._objectManager.createArcWallData(
+        this._startPoint,
+        this._endPoint,
+        this._bulge
       );
-      const createdArcWall: ArcWallData | null = this._findArcWallById(id);
-      if (createdArcWall !== null) {
-        this._arcRadiusDimRenderer.updatePersistent(
-          createdArcWall.id,
-          createdArcWall.start,
-          createdArcWall.end,
-          createdArcWall.bulge,
-          null,
-          null,
-          null
-        );
+
+      if (this._historyManager !== null) {
+        this._historyManager.execute(new ArcWallCreateCommand(
+          this._objectManager,
+          this._sceneManager.getScene(),
+          createdArcWall,
+          {
+            onCreated: (wallData: ArcWallData): void => this._updateArcWallPersistentDimension(wallData),
+            onRemoved: (wallId: string): void => this._arcRadiusDimRenderer.clearPersistent(wallId),
+          }
+        ));
+      } else {
+        /* 未注入历史管理器时保留直接创建路径，避免影响无历史栈的调用场景。 */
+        this._objectManager.addObject(createdArcWall);
+        this._updateArcWallPersistentDimension(createdArcWall);
       }
-      console.log(`[WallDrawTool] 弧形墙已创建, id=${id}, bulge=${this._bulge.toFixed(3)}`);
+      console.log(`[WallDrawTool] 弧墙已创建, id=${createdArcWall.id}, bulge=${createdArcWall.bulge.toFixed(3)}`);
     }
 
     this._arcRadiusDimRenderer.clearPreview();
@@ -1244,6 +1252,22 @@ export class WallDrawTool {
     }
     this._updatePreview();
     this._notify();
+  }
+
+  /**
+   * 更新弧形墙常驻半径标注
+   * @param wallData - 需要显示标注的弧形墙数据
+   */
+  private _updateArcWallPersistentDimension(wallData: ArcWallData): void {
+    this._arcRadiusDimRenderer.updatePersistent(
+      wallData.id,
+      wallData.start,
+      wallData.end,
+      wallData.bulge,
+      null,
+      null,
+      null
+    );
   }
 
   /** 清空弧形墙当前编辑标注的输入缓冲。 */

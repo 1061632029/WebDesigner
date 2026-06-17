@@ -20,7 +20,8 @@ export class SlabGeometryBuilder {
    * @returns Three.js BufferGeometry
    */
   public build(data: SlabData): THREE.BufferGeometry {
-    return this._buildFromOutline(data.outline, data.slabThickness);
+    const innerOutlines: Point2D[][] = Array.isArray(data.innerOutlines) ? data.innerOutlines : [];
+    return this._buildFromOutline(data.outline, data.slabThickness, innerOutlines);
   }
 
   /**
@@ -31,7 +32,7 @@ export class SlabGeometryBuilder {
    * @returns Three.js BufferGeometry；轮廓点不足时返回空几何体
    */
   public buildFromOutline(outline: Point2D[], slabThickness: number): THREE.BufferGeometry {
-    return this._buildFromOutline(outline, slabThickness);
+    return this._buildFromOutline(outline, slabThickness, []);
   }
 
   /**
@@ -50,9 +51,14 @@ export class SlabGeometryBuilder {
    *
    * @param outline - 多边形顶点（XZ 坐标）
    * @param slabThickness - 挤压厚度（米）
+   * @param innerOutlines - 楼板内轮廓洞口数组，完全位于外轮廓内时会作为 Shape.holes 挖空
    * @returns BufferGeometry
    */
-  private _buildFromOutline(outline: Point2D[], slabThickness: number): THREE.BufferGeometry {
+  private _buildFromOutline(
+    outline: Point2D[],
+    slabThickness: number,
+    innerOutlines: Point2D[][]
+  ): THREE.BufferGeometry {
     /* 轮廓点不足时返回空几何体 */
     if (outline.length < 3) {
       return new THREE.BufferGeometry();
@@ -70,6 +76,23 @@ export class SlabGeometryBuilder {
 
     /* 闭合轮廓 */
     shape.closePath();
+
+    /* 将子空间完全包含时产生的内轮廓转换为 Shape.holes，实现楼板冲孔。 */
+    for (const innerOutline of innerOutlines) {
+      if (innerOutline.length < 3) {
+        continue;
+      }
+
+      const holePath: THREE.Path = new THREE.Path();
+      const firstInnerPoint: Point2D = innerOutline[0]!;
+      holePath.moveTo(firstInnerPoint.x, -firstInnerPoint.z);
+      for (let innerIndex: number = 1; innerIndex < innerOutline.length; innerIndex += 1) {
+        const innerPoint: Point2D = innerOutline[innerIndex]!;
+        holePath.lineTo(innerPoint.x, -innerPoint.z);
+      }
+      holePath.closePath();
+      shape.holes.push(holePath);
+    }
 
     /* 挤压参数：沿 Z 轴（Shape 的法线方向）挤压 slabThickness */
     const extrudeSettings: THREE.ExtrudeGeometryOptions = {

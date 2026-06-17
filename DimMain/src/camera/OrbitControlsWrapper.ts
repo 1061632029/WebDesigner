@@ -5,9 +5,9 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
  * 轨道控制器配置选项接口
  */
 export interface OrbitControlsOptions {
-  /** 是否启用阻尼（惯性），默认 true */
+  /** 是否启用阻尼（惯性），默认 false */
   enableDamping?: boolean;
-  /** 阻尼系数，默认 0.05 */
+  /** 阻尼系数，默认 0 */
   dampingFactor?: number;
   /** 最小缩放距离，默认 1 */
   minDistance?: number;
@@ -123,8 +123,8 @@ export class OrbitControlsWrapper {
     this._controls = new OrbitControls(camera, domElement);
 
     /* 配置默认参数 */
-    this._controls.enableDamping = true;
-    this._controls.dampingFactor = 0.05;
+    this._controls.enableDamping = false;
+    this._controls.dampingFactor = 0;
     this._controls.minDistance = 1;
     this._controls.maxDistance = 100;
     this._controls.enablePan = true;

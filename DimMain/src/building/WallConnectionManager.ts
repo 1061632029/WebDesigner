@@ -645,14 +645,17 @@ export class WallConnectionManager {
     const pathWalls: string[] = [];
     /* 已访问节点集合（防止无限循环） */
     const visited: Set<string> = new Set<string>();
+    /* 已收集闭环签名集合：同一闭环可能从不同方向被遍历到，需去重后再比较面积。 */
+    const collectedSignatures: Set<string> = new Set<string>();
+    const candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> = [];
 
     /**
      * DFS 递归函数
      * @param currentJointId - 当前节点 ID
      * @param fromWallId - 来自哪条墙体（避免原路返回）
-     * @returns 找到封闭环时返回 true
+     * @returns 无返回值；遍历过程中持续更新当前最小闭环
      */
-    const dfs = (currentJointId: string, fromWallId: string | null): boolean => {
+    const dfs = (currentJointId: string, fromWallId: string | null): void => {
       path.push(currentJointId);
       visited.add(currentJointId);
 
@@ -660,7 +663,7 @@ export class WallConnectionManager {
       if (currentJoint === undefined) {
         path.pop();
         visited.delete(currentJointId);
-        return false;
+        return;
       }
 
       for (const conn of currentJoint.connections) {
@@ -668,35 +671,26 @@ export class WallConnectionManager {
           continue;
         }
 
-        const wallMapping = this._wallToJoints.get(conn.wallId);
-        if (wallMapping === undefined) {
-          continue;
-        }
-
-        let otherJointId: string | null;
-        if (conn.endpoint === 'start') {
-          otherJointId = wallMapping.end;
-        } else {
-          otherJointId = wallMapping.start;
-        }
-
+        const otherJointId: string | null = this._getOtherJointId(conn.wallId, conn.endpoint);
         if (otherJointId === null) {
           continue;
         }
 
-        /* 找到回到起始节点的路径 → 封闭环检测成功 */
+        /* 找到回到起始节点的路径 → 收集候选闭环，并通过面积比较保留最小空间范围。 */
         if (otherJointId === startJointId && path.length >= 3) {
-          /* 记录最后一段墙体（回到起点的那段） */
-          pathWalls.push(conn.wallId);
-          return true;
+          const candidateWallIds: string[] = pathWalls.concat([conn.wallId]);
+          const candidateResult: { outline: Point2D[]; wallIds: string[]; area: number } | null =
+            this._buildClosedLoopCandidate(path, candidateWallIds, collectedSignatures);
+          if (candidateResult !== null) {
+            candidates.push(candidateResult);
+          }
+          continue;
         }
 
         if (!visited.has(otherJointId)) {
-          /* 记录这段墙体 */
+          /* 记录这段墙体，继续向外搜索所有简单闭环，而不是命中第一条闭环就停止。 */
           pathWalls.push(conn.wallId);
-          if (dfs(otherJointId, conn.wallId)) {
-            return true;
-          }
+          dfs(otherJointId, conn.wallId);
           /* 回溯时移除这段墙体 */
           pathWalls.pop();
         }
@@ -704,22 +698,17 @@ export class WallConnectionManager {
 
       path.pop();
       visited.delete(currentJointId);
-      return false;
     };
 
-    const found: boolean = dfs(startJointId, null);
+    dfs(startJointId, null);
 
-    if (!found) {
+    const bestLoop: { outline: Point2D[]; wallIds: string[]; area: number } | null =
+      this._selectSmallestClosedLoopCandidate(candidates);
+    if (bestLoop === null) {
       return null;
     }
 
-    /* 将路径上的节点 ID 转换为坐标数组 */
-    const outline: Point2D[] = path.map((jointId: string): Point2D => {
-      const joint: WallJoint = this._joints.get(jointId)!;
-      return { x: joint.position.x, z: joint.position.z };
-    });
-
-    return { outline, wallIds: pathWalls };
+    return { outline: bestLoop.outline, wallIds: bestLoop.wallIds };
   }
 
   /**
@@ -732,96 +721,146 @@ export class WallConnectionManager {
    *          未找到封闭环时返回 null
    */
   public detectClosedLoop(startJointId: string): Point2D[] | null {
-    /* 起始节点不存在时直接返回 */
-    const startJoint: WallJoint | undefined = this._joints.get(startJointId);
-    if (startJoint === undefined) {
+    const loopResult: { outline: Point2D[]; wallIds: string[] } | null = this.detectClosedLoopWithWalls(startJointId);
+    if (loopResult === null) {
+      return null;
+    }
+    return loopResult.outline;
+  }
+
+  /**
+   * 根据当前端点角色获取墙体另一端节点 ID。
+   * @param wallId - 墙体 ID
+   * @param endpoint - 当前节点在墙体上的端点角色
+   * @returns 墙体另一端节点 ID；映射缺失或另一端未连接时返回 null
+   */
+  private _getOtherJointId(wallId: string, endpoint: WallEndpoint): string | null {
+    const wallMapping: { start: string | null; end: string | null } | undefined = this._wallToJoints.get(wallId);
+    if (wallMapping === undefined) {
       return null;
     }
 
-    /* DFS 路径：记录当前遍历路径上的节点 ID 序列 */
-    const path: string[] = [];
-    /* 已访问节点集合（防止无限循环） */
-    const visited: Set<string> = new Set<string>();
+    if (endpoint === 'start') {
+      return wallMapping.end;
+    }
+    return wallMapping.start;
+  }
 
-    /**
-     * DFS 递归函数
-     * @param currentJointId - 当前节点 ID
-     * @param fromWallId - 来自哪条墙体（避免原路返回）
-     * @returns 找到封闭环时返回 true
-     */
-    const dfs = (currentJointId: string, fromWallId: string | null): boolean => {
-      /* 将当前节点加入路径 */
-      path.push(currentJointId);
-      visited.add(currentJointId);
+  /**
+   * 从节点路径和墙体路径构建候选闭环结果。
+   * 关键流程：先按节点坐标计算闭环面积，过滤退化闭环，再用规范签名去除重复闭环。
+   * @param jointPath - 闭环节点路径，首尾不重复
+   * @param wallPath - 闭环墙体路径，wallPath[i] 对应 jointPath[i] 到下一个节点
+   * @param collectedSignatures - 已收集的闭环规范签名集合
+   * @returns 候选闭环结果；退化或重复闭环返回 null
+   */
+  private _buildClosedLoopCandidate(
+    jointPath: string[],
+    wallPath: string[],
+    collectedSignatures: Set<string>
+  ): { outline: Point2D[]; wallIds: string[]; area: number } | null {
+    if (jointPath.length < 3 || wallPath.length !== jointPath.length) {
+      return null;
+    }
 
-      /* 获取当前节点上的所有墙体连接 */
-      const currentJoint: WallJoint | undefined = this._joints.get(currentJointId);
-      if (currentJoint === undefined) {
-        path.pop();
-        visited.delete(currentJointId);
-        return false;
+    const signature: string = this._computeJointLoopSignature(jointPath);
+    if (collectedSignatures.has(signature)) {
+      return null;
+    }
+
+    const outline: Point2D[] = [];
+    for (const jointId of jointPath) {
+      const joint: WallJoint | undefined = this._joints.get(jointId);
+      if (joint === undefined) {
+        return null;
       }
+      outline.push({ x: joint.position.x, z: joint.position.z });
+    }
 
-      /* 遍历当前节点上的每条墙体连接 */
-      for (const conn of currentJoint.connections) {
-        /* 跳过来时的那条墙体（避免原路返回） */
-        if (conn.wallId === fromWallId) {
-          continue;
-        }
+    const area: number = this._computePolygonArea(outline);
+    if (area <= 0.000001) {
+      return null;
+    }
 
-        /* 获取该墙体另一端的节点 ID */
-        const wallMapping = this._wallToJoints.get(conn.wallId);
-        if (wallMapping === undefined) {
-          continue;
-        }
-
-        /* 根据当前节点是该墙体的 start 还是 end，找到另一端节点 */
-        let otherJointId: string | null;
-        if (conn.endpoint === 'start') {
-          /* 当前节点是该墙体的 start，另一端是 end */
-          otherJointId = wallMapping.end;
-        } else {
-          /* 当前节点是该墙体的 end，另一端是 start */
-          otherJointId = wallMapping.start;
-        }
-
-        if (otherJointId === null) {
-          continue;
-        }
-
-        /* 找到回到起始节点的路径 → 封闭环检测成功 */
-        if (otherJointId === startJointId && path.length >= 3) {
-          return true;
-        }
-
-        /* 未访问过的节点继续 DFS */
-        if (!visited.has(otherJointId)) {
-          if (dfs(otherJointId, conn.wallId)) {
-            return true;
-          }
-        }
-      }
-
-      /* 当前路径无法形成封闭环，回溯 */
-      path.pop();
-      visited.delete(currentJointId);
-      return false;
+    collectedSignatures.add(signature);
+    return {
+      outline: outline,
+      wallIds: wallPath.slice(),
+      area: area,
     };
+  }
 
-    /* 从起始节点开始 DFS */
-    const found: boolean = dfs(startJointId, null);
+  /**
+   * 从候选闭环中选择面积最小的闭环。
+   * @param candidates - 已去重且通过退化过滤的候选闭环列表
+   * @returns 最小闭环；没有候选时返回 null
+   */
+  private _selectSmallestClosedLoopCandidate(
+    candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }>
+  ): { outline: Point2D[]; wallIds: string[]; area: number } | null {
+    let bestLoop: { outline: Point2D[]; wallIds: string[]; area: number } | null = null;
 
-    if (!found) {
-      return null;
+    for (const candidate of candidates) {
+      if (bestLoop === null || candidate.area < bestLoop.area) {
+        bestLoop = candidate;
+      }
     }
 
-    /* 将路径上的节点 ID 转换为坐标数组 */
-    const outline: Point2D[] = path.map((jointId: string): Point2D => {
-      const joint: WallJoint = this._joints.get(jointId)!;
-      return { x: joint.position.x, z: joint.position.z };
-    });
+    return bestLoop;
+  }
 
-    return outline;
+  /**
+   * 计算节点闭环的规范签名。
+   * 关键流程：同时比较正向与反向路径，并取字典序最小旋转序列，消除起点和方向差异。
+   * @param jointPath - 闭环节点路径，首尾不重复
+   * @returns 可用于闭环去重的签名
+   */
+  private _computeJointLoopSignature(jointPath: string[]): string {
+    const forwardSignature: string = this._computeMinimalRotationSignature(jointPath);
+    const reversedPath: string[] = jointPath.slice().reverse();
+    const backwardSignature: string = this._computeMinimalRotationSignature(reversedPath);
+    return forwardSignature < backwardSignature ? forwardSignature : backwardSignature;
+  }
+
+  /**
+   * 计算指定节点序列在所有循环旋转中的最小字典序签名。
+   * @param jointPath - 节点 ID 序列
+   * @returns 最小旋转签名
+   */
+  private _computeMinimalRotationSignature(jointPath: string[]): string {
+    const count: number = jointPath.length;
+    let bestSignature: string = '';
+
+    for (let startIndex: number = 0; startIndex < count; startIndex += 1) {
+      const rotatedParts: string[] = [];
+      for (let offset: number = 0; offset < count; offset += 1) {
+        rotatedParts.push(jointPath[(startIndex + offset) % count]!);
+      }
+      const currentSignature: string = rotatedParts.join('>');
+      if (startIndex === 0 || currentSignature < bestSignature) {
+        bestSignature = currentSignature;
+      }
+    }
+
+    return bestSignature;
+  }
+
+  /**
+   * 计算 XZ 平面多边形面积。
+   * @param outline - 多边形顶点数组，首尾不重复
+   * @returns 多边形绝对面积
+   */
+  private _computePolygonArea(outline: Point2D[]): number {
+    const count: number = outline.length;
+    let signedArea: number = 0;
+
+    for (let index: number = 0; index < count; index += 1) {
+      const current: Point2D = outline[index]!;
+      const next: Point2D = outline[(index + 1) % count]!;
+      signedArea += current.x * next.z - next.x * current.z;
+    }
+
+    return Math.abs(signedArea) * 0.5;
   }
 
   /* ========== 差集检测 ========== */

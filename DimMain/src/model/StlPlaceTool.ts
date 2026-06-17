@@ -1355,7 +1355,7 @@ export class StlPlaceTool {
 
     if (this._activeModel.category === 'model') {
       /* 底部高度：模型底部距地面的 Y 轴偏移，默认 0.05m（5cm 离地） */
-      const defaultFloorHeight: number = 0.05;
+      const defaultFloorHeight: number = 0;
       placedMesh.userData['floorHeight'] = defaultFloorHeight;
       /* 将底部高度应用到模型 Y 轴位置 */
       placedMesh.position.setY(defaultFloorHeight);

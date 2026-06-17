@@ -105,10 +105,13 @@ export class RaycastHelper {
     /* 设置射线 */
     this._raycaster.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
 
+    /* 业务拾取流程：先剔除固定像素边界线、增强线框等视觉辅助对象，避免辅助显示层抢占实体 Mesh 命中。 */
+    const pickableObjects: Array<THREE.Object3D> = this._collectPickableRaycastObjects(sceneObjects);
+
     /* 执行射线投射 */
     const intersections: Array<THREE.Intersection> = this._raycaster.intersectObjects(
-      sceneObjects,
-      true
+      pickableObjects,
+      false
     );
 
     /* 查找第一个有效的 Mesh 命中 */
@@ -157,6 +160,64 @@ export class RaycastHelper {
     }
 
     return null;
+  }
+
+  /**
+   * 收集允许参与业务射线拾取的对象。
+   * 关键逻辑：显示辅助对象只负责渲染，不参与墙体、门窗、STL 等业务对象筛选。
+   * @param sceneObjects - 原始场景对象数组
+   * @returns 可参与 Raycaster 检测的对象数组
+   */
+  private _collectPickableRaycastObjects(sceneObjects: Array<THREE.Object3D>): Array<THREE.Object3D> {
+    const pickableObjects: Array<THREE.Object3D> = [];
+
+    for (const sceneObject of sceneObjects) {
+      this._appendPickableRaycastObject(sceneObject, pickableObjects);
+    }
+
+    return pickableObjects;
+  }
+
+  /**
+   * 递归追加可拾取对象。
+   * @param object3D - 当前检测对象
+   * @param pickableObjects - 可拾取对象输出数组
+   */
+  private _appendPickableRaycastObject(object3D: THREE.Object3D, pickableObjects: Array<THREE.Object3D>): void {
+    if (!this._isPickableRaycastObject(object3D)) {
+      return;
+    }
+
+    pickableObjects.push(object3D);
+
+    for (const child of object3D.children) {
+      this._appendPickableRaycastObject(child, pickableObjects);
+    }
+  }
+
+  /**
+   * 判断对象是否允许进入业务射线拾取。
+   * @param object3D - 待判断的三维对象
+   * @returns 允许拾取时返回 true
+   */
+  private _isPickableRaycastObject(object3D: THREE.Object3D): boolean {
+    if (object3D.userData['isPickable'] === false) {
+      return false;
+    }
+
+    if (object3D.userData['isVisualHelper'] === true) {
+      return false;
+    }
+
+    if (object3D.userData['isFixedPixelLineSegments'] === true) {
+      return false;
+    }
+
+    if (object3D.userData['isEnhancedWireframe'] === true) {
+      return false;
+    }
+
+    return true;
   }
 
   /**

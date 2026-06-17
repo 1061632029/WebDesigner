@@ -19,6 +19,7 @@
 import * as THREE from 'three/webgpu';
 import type { Point2D } from './BuildingTypes';
 import type { SceneManager } from '../scene/SceneManager';
+import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
 /* ========== 样式常量 ========== */
 
@@ -180,7 +181,7 @@ function createPreviewDistanceLabelSprite(
     depthWrite: false,
   });
   const sprite: THREE.Sprite = new THREE.Sprite(material);
-  sprite.scale.set(PREVIEW_LABEL_SPRITE_W, PREVIEW_LABEL_SPRITE_H, 1.0);
+  applyFixedScreenSpriteSize(sprite, PREVIEW_LABEL_SPRITE_W, PREVIEW_LABEL_SPRITE_H);
   sprite.position.set(x, PREVIEW_DIMENSION_Y, z);
   sprite.renderOrder = PREVIEW_LABEL_RENDER_ORDER;
 
@@ -232,7 +233,7 @@ function createPreviewAreaSprite(areaText: string, x: number, z: number): THREE.
   });
 
   const sprite: THREE.Sprite = new THREE.Sprite(material);
-  sprite.scale.set(PREVIEW_AREA_SPRITE_W, PREVIEW_AREA_SPRITE_H, 1.0);
+  applyFixedScreenSpriteSize(sprite, PREVIEW_AREA_SPRITE_W, PREVIEW_AREA_SPRITE_H);
   sprite.position.set(x, 0.08, z);
   sprite.renderOrder = 1002;
 
@@ -283,9 +284,9 @@ function createTextSprite(
   const sprite: THREE.Sprite = new THREE.Sprite(material);
 
   if (isArea) {
-    sprite.scale.set(AREA_SPRITE_W, AREA_SPRITE_H, 1.0);
+    applyFixedScreenSpriteSize(sprite, AREA_SPRITE_W, AREA_SPRITE_H);
   } else {
-    sprite.scale.set(TEXT_SPRITE_W, TEXT_SPRITE_H, 1.0);
+    applyFixedScreenSpriteSize(sprite, TEXT_SPRITE_W, TEXT_SPRITE_H);
   }
 
   sprite.position.set(x, 0.05, z);

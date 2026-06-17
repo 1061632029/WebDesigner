@@ -20,6 +20,8 @@ export interface StlOpeningUserDataSnapshot {
   doorBottomHeight?: number;
   /** 门开启方向，仅门使用 */
   doorOpeningDirection?: string;
+  /** 门左右开属性，仅门使用 */
+  comb?: string;
 }
 
 /**
@@ -178,6 +180,9 @@ export class StlTransformWithOpeningCommand implements ICommand {
     }
     if (snapshot.doorOpeningDirection !== undefined) {
       mesh.userData['doorOpeningDirection'] = snapshot.doorOpeningDirection;
+    }
+    if (snapshot.comb !== undefined) {
+      mesh.userData['comb'] = snapshot.comb;
     }
   }
 }

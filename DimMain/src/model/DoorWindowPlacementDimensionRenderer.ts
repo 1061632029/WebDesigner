@@ -4,6 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
+import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 import type { StraightWallData } from '../building/BuildingTypes';
 import type { WallSnapResult } from '../building/WallSnapHelper';
 
@@ -1032,7 +1033,7 @@ export class DoorWindowPlacementDimensionRenderer {
     });
     const sprite: THREE.Sprite = new THREE.Sprite(material);
     sprite.renderOrder = 11003;
-    sprite.scale.set(LABEL_SPRITE_WIDTH, LABEL_SPRITE_HEIGHT, 1);
+    applyFixedScreenSpriteSize(sprite, LABEL_SPRITE_WIDTH, LABEL_SPRITE_HEIGHT);
     return {
       sprite: sprite,
       canvas: canvas,
