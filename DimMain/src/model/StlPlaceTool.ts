@@ -34,6 +34,8 @@ import { DoorWindowPlacementDimensionRenderer } from './DoorWindowPlacementDimen
 import { DoorOpeningDirectionHelper } from './DoorOpeningDirectionHelper';
 import { StlPlacementDimensionRenderer } from './StlPlacementDimensionRenderer';
 import { StlObbHelper } from './StlObbHelper';
+import { DoorWindowWallBoundsValidator } from './DoorWindowWallBoundsValidator';
+import type { DoorWindowWallBoundsValidationResult } from './DoorWindowWallBoundsValidator';
 
 /** 门窗类别集合，用于判断是否启用墙体吸附模式 */
 const DOOR_WINDOW_CATEGORIES: Set<string> = new Set<string>(['door', 'window']);
@@ -156,6 +158,9 @@ export class StlPlaceTool {
 
   /** 门窗布置时键盘输入的距离文本，单位为毫米。 */
   private _doorWindowDimensionInputText: string = '';
+
+  /** 当前门窗预览是否完整位于吸附墙体范围内，超出墙体时禁止正式布置。 */
+  private _isCurrentDoorWindowWithinWallBounds: boolean = false;
 
   // OPENING_PREVIEW_THRESHOLD 已随 _showOpeningPreview 方法一同停用
   // private static readonly OPENING_PREVIEW_THRESHOLD: number = 0.02;
@@ -634,6 +639,7 @@ export class StlPlaceTool {
       this._transparentWallId = null;
     }
     this._currentSnapResult = null;
+    this._isCurrentDoorWindowWithinWallBounds = false;
     this._previewSymbolWallThickness = null;
     this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
     this._stlPlacementDimensionRenderer.clear(this._engine.sceneManager.getScene());
@@ -971,24 +977,44 @@ export class StlPlaceTool {
     );
     this._alignPreviewToWall(this._previewMesh, snapResult);
     this._syncPreviewDoorWindowThicknessWithWall(snapResult);
+    this._previewMesh.updateMatrixWorld(true);
+
+    const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(snapResult.wallId);
+    if (wallObj === undefined || wallObj.category !== 'wall' || (wallObj as WallData).subType !== 'straight') {
+      this._isCurrentDoorWindowWithinWallBounds = false;
+      this._previewMesh.visible = false;
+      this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+      return;
+    }
+
+    const wallData: StraightWallData = wallObj as StraightWallData;
+    const boundsResult: DoorWindowWallBoundsValidationResult = DoorWindowWallBoundsValidator.validate(
+      this._previewMesh,
+      wallData,
+      snapResult
+    );
+    this._isCurrentDoorWindowWithinWallBounds = boundsResult.isWithinBounds;
+
+    if (!boundsResult.isWithinBounds) {
+      /* 超墙预览处理：只要门窗 OBB 沿墙方向任一侧超出墙体，就隐藏预览并禁止后续点击布置。 */
+      this._previewMesh.visible = false;
+      this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
+      BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
+      return;
+    }
+
     this._previewMesh.visible = true;
 
     /* 门窗预览已使用 2D 平面符号表达，不再显示模型本体包围盒。 */
     BoundingBoxHelper.detach(this._previewMesh, this._engine.sceneManager.getScene());
 
-    const wallObj: ReturnType<BuildingObjectManager['getById']> = this._buildingManager.getById(snapResult.wallId);
-    if (wallObj !== undefined && wallObj.category === 'wall' && (wallObj as WallData).subType === 'straight') {
-      const wallData: StraightWallData = wallObj as StraightWallData;
-      this._doorWindowDimensionRenderer.update(
-        this._previewMesh,
-        wallData,
-        snapResult,
-        this._engine.sceneManager.getScene(),
-        this._doorWindowDimensionEditSide
-      );
-    } else {
-      this._doorWindowDimensionRenderer.clear(this._engine.sceneManager.getScene());
-    }
+    this._doorWindowDimensionRenderer.update(
+      this._previewMesh,
+      wallData,
+      snapResult,
+      this._engine.sceneManager.getScene(),
+      this._doorWindowDimensionEditSide
+    );
 
     /* 吸附到新墙体时：恢复旧墙体透明度，将新墙体设为半透明。 */
     if (this._transparentWallId !== snapResult.wallId) {
@@ -1233,6 +1259,11 @@ export class StlPlaceTool {
       return;
     }
 
+    if (this._isDoorWindowModel() && !this._isCurrentDoorWindowWithinWallBounds) {
+      console.warn(`❌ 门窗超出墙体范围，已取消布置: "${this._activeModel.name}"`);
+      return;
+    }
+
     /* 门窗放置强依赖墙体吸附。
      * 触发条件：当前模型属于门/窗，但没有有效墙体吸附结果或建筑对象管理器未注入。
      * 处理逻辑：直接取消本次放置，避免门窗作为普通 STL 模型落在地面上。
@@ -1353,6 +1384,21 @@ export class StlPlaceTool {
         /* 门窗吸附墙体且启用自适应厚度时，先读取墙体厚度并同步局部 Z 轴，再计算洞口。 */
         if (StlAdaptiveThicknessHelper.isEnabledForMesh(placedMesh)) {
           StlAdaptiveThicknessHelper.applyWallThickness(placedMesh, wallData.thickness);
+        }
+
+        placedMesh.updateMatrixWorld(true);
+        const boundsResult: DoorWindowWallBoundsValidationResult = DoorWindowWallBoundsValidator.validate(
+          placedMesh,
+          wallData,
+          snapResult
+        );
+        if (!boundsResult.isWithinBounds) {
+          /* 正式放置兜底校验：防止鼠标边界吸附、尺寸变化或状态延迟导致门窗洞口超出墙体。 */
+          console.warn(
+            `❌ 门窗超出墙体范围，已取消布置: "${this._activeModel.name}" ` +
+            `左超出=${boundsResult.leftOverflow.toFixed(3)}m, 右超出=${boundsResult.rightOverflow.toFixed(3)}m`
+          );
+          return;
         }
 
         /* 门窗吸附到墙体并同步最终厚度后挂载 2D 平面符号，确保符号尺寸基于正式门窗实际尺寸。 */
