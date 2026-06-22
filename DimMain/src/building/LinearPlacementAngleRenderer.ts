@@ -4,7 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
-import type { Point2D } from './BuildingTypes';
+import type { Point2D, StraightWallData } from './BuildingTypes';
 import type { SceneManager } from '../scene/SceneManager';
 import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
@@ -17,12 +17,6 @@ const INACTIVE_DIM_LINE_COLOR: number = 0x8f8f8f;
 /** 动态角度标注所在高度，避免与地面和预览构件闪烁。 */
 const PREVIEW_ANGLE_Y: number = 0.16;
 
-/** 水平参考线长度，单位：米。 */
-const HORIZONTAL_REFERENCE_LENGTH: number = 1.05;
-
-/** 角度圆弧半径，单位：米。 */
-const ANGLE_ARC_RADIUS: number = 0.56;
-
 /** 角度圆弧分段数。 */
 const ANGLE_ARC_SEGMENTS: number = 36;
 
@@ -34,9 +28,6 @@ const DASH_GAP: number = 0.05;
 
 /** 圆弧末端刻度长度，单位：米。 */
 const END_TICK_LENGTH: number = 0.12;
-
-/** 标签相对圆弧半径的外扩距离，单位：米。 */
-const LABEL_RADIUS_OFFSET: number = 0.3;
 
 /** 标签画布尺寸，沿用项目动态标注比例。 */
 const LABEL_CANVAS_W: number = 240;
@@ -228,15 +219,15 @@ function appendLineSegment(
  * @param active - 是否为当前 Tab 选中的编辑标注
  * @returns LineSegments
  */
-function createAngleLines(start: Point2D, angleInfo: LinearPlacementAngleInfo, active: boolean = false): THREE.LineSegments {
+function createAngleLines(start: Point2D, angleInfo: LinearPlacementAngleInfo, length: number, active: boolean = false): THREE.LineSegments {
   const positions: number[] = [];
   let cursor: number = 0;
   const referenceDirectionX: number = Math.cos(angleInfo.referenceAngle);
   const referenceDirectionZ: number = Math.sin(angleInfo.referenceAngle);
 
   /* 水平参考线绘制流程：根据末端所在半平面选择 +X 或 -X 方向，作为墙/梁方向夹角的基准。 */
-  while (cursor < HORIZONTAL_REFERENCE_LENGTH) {
-    const segmentEnd: number = Math.min(cursor + DASH_LENGTH, HORIZONTAL_REFERENCE_LENGTH);
+  while (cursor < length) {
+    const segmentEnd: number = Math.min(cursor + DASH_LENGTH, length);
     appendLineSegment(
       positions,
       start.x + referenceDirectionX * cursor,
@@ -258,16 +249,16 @@ function createAngleLines(start: Point2D, angleInfo: LinearPlacementAngleInfo, a
     const angleB: number = angleInfo.referenceAngle + signedSafeDeltaAngle * ((index + 1) / segmentCount);
     appendLineSegment(
       positions,
-      start.x + Math.cos(angleA) * ANGLE_ARC_RADIUS,
-      start.z + Math.sin(angleA) * ANGLE_ARC_RADIUS,
-      start.x + Math.cos(angleB) * ANGLE_ARC_RADIUS,
-      start.z + Math.sin(angleB) * ANGLE_ARC_RADIUS
+      start.x + Math.cos(angleA) * length,
+      start.z + Math.sin(angleA) * length,
+      start.x + Math.cos(angleB) * length,
+      start.z + Math.sin(angleB) * length
     );
   }
 
   const endAngle: number = angleInfo.referenceAngle + signedSafeDeltaAngle;
-  const endX: number = start.x + Math.cos(endAngle) * ANGLE_ARC_RADIUS;
-  const endZ: number = start.z + Math.sin(endAngle) * ANGLE_ARC_RADIUS;
+  const endX: number = start.x + Math.cos(endAngle) * length;
+  const endZ: number = start.z + Math.sin(endAngle) * length;
   const tangentX: number = -Math.sin(endAngle);
   const tangentZ: number = Math.cos(endAngle);
   const halfTickLength: number = END_TICK_LENGTH / 2;
@@ -326,6 +317,9 @@ export class LinearPlacementAngleRenderer {
   /** 当前预览角度标注。 */
   private _previewAnnotation: LinearPlacementAngleAnnotation | null = null;
 
+  /** 当前选中直墙的常驻角度标注集合。 */
+  private _persistentAnnotations: Map<string, LinearPlacementAngleAnnotation> = new Map<string, LinearPlacementAngleAnnotation>();
+
   /** 当前可见性。 */
   private _visible: boolean = true;
 
@@ -347,29 +341,64 @@ export class LinearPlacementAngleRenderer {
   public updatePreview(start: Point2D, end: Point2D, inputText: string | null = null, active: boolean = false): void {
     this.clearPreview();
 
+    const annotation: LinearPlacementAngleAnnotation | null = this._createAnnotation(start, end, inputText, active);
+    if (annotation === null) {
+      return;
+    }
+
+    this._previewAnnotation = annotation;
+  }
+
+  /**
+   * 更新选中直墙的常驻角度标注。
+   * 关键流程：先清除旧常驻角度标注，再以每面直墙起点为圆心绘制相对水平轴的夹角。
+   * @param walls - 当前选中的直墙数据列表
+   */
+  public updatePersistentForWalls(walls: StraightWallData[]): void {
+    this.clearPersistent();
+
+    for (const wall of walls) {
+      const annotation: LinearPlacementAngleAnnotation | null = this._createAnnotation(wall.start, wall.end, null, true);
+      if (annotation === null) {
+        continue;
+      }
+
+      this._persistentAnnotations.set(wall.id, annotation);
+    }
+  }
+
+  /**
+   * 创建一组线性角度标注对象并加入场景。
+   * @param start - 线性对象起点
+   * @param end - 线性对象终点
+   * @param inputText - 角度键盘输入文本；为空时显示真实角度
+   * @param active - 是否按选中/当前编辑样式显示
+   * @returns 创建成功的标注句柄；长度过短时返回 null
+   */
+  private _createAnnotation(start: Point2D, end: Point2D, inputText: string | null, active: boolean): LinearPlacementAngleAnnotation | null {
     const dx: number = end.x - start.x;
     const dz: number = end.z - start.z;
     const length: number = Math.sqrt(dx * dx + dz * dz);
     if (length < MIN_VALID_LENGTH) {
-      return;
+      return null;
     }
 
     const angleInfo: LinearPlacementAngleInfo = computeLinearPlacementAngleInfo(dx, dz);
     const angleDegrees: number = angleInfo.absoluteAngleDegrees;
     const labelText: string = inputText !== null ? `${inputText}°` : `${angleDegrees.toFixed(1)}°`;
     const labelAngle: number = angleInfo.referenceAngle + angleInfo.signedDeltaAngle / 2;
-    const labelRadius: number = ANGLE_ARC_RADIUS + LABEL_RADIUS_OFFSET;
-    const labelX: number = start.x + Math.cos(labelAngle) * labelRadius;
-    const labelZ: number = start.z + Math.sin(labelAngle) * labelRadius;
+    // const labelRadius: number = ANGLE_ARC_RADIUS + LABEL_RADIUS_OFFSET;
+    const labelX: number = start.x + Math.cos(labelAngle) * length;
+    const labelZ: number = start.z + Math.sin(labelAngle) * length;
 
     /* 标注创建流程：先创建水平虚线/圆弧，再创建角度标签，二者作为同一预览句柄管理。 */
-    const lines: THREE.LineSegments = createAngleLines(start, angleInfo, active);
+    const lines: THREE.LineSegments = createAngleLines(start, angleInfo,length, active);
     const sprite: THREE.Sprite = createAngleLabelSprite(labelText, labelX, labelZ, active);
     lines.visible = this._visible;
     sprite.visible = this._visible;
     this._sceneManager.add(lines);
     this._sceneManager.add(sprite);
-    this._previewAnnotation = { sprite: sprite, lines: lines };
+    return { sprite: sprite, lines: lines };
   }
 
   /**
@@ -389,6 +418,20 @@ export class LinearPlacementAngleRenderer {
   }
 
   /**
+   * 清除所有选中直墙的常驻角度标注。
+   */
+  public clearPersistent(): void {
+    const scene: THREE.Scene = this._sceneManager.getScene();
+    this._persistentAnnotations.forEach((annotation: LinearPlacementAngleAnnotation): void => {
+      scene.remove(annotation.sprite);
+      scene.remove(annotation.lines);
+      disposeSprite(annotation.sprite);
+      disposeLines(annotation.lines);
+    });
+    this._persistentAnnotations.clear();
+  }
+
+  /**
    * 设置动态角度标注可见性。
    * @param visible - true 显示，false 隐藏
    */
@@ -398,6 +441,10 @@ export class LinearPlacementAngleRenderer {
       this._previewAnnotation.sprite.visible = visible;
       this._previewAnnotation.lines.visible = visible;
     }
+    this._persistentAnnotations.forEach((annotation: LinearPlacementAngleAnnotation): void => {
+      annotation.sprite.visible = visible;
+      annotation.lines.visible = visible;
+    });
   }
 
   /**
@@ -405,5 +452,6 @@ export class LinearPlacementAngleRenderer {
    */
   public dispose(): void {
     this.clearPreview();
+    this.clearPersistent();
   }
 }

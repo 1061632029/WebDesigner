@@ -4,7 +4,7 @@
  */
 
 import * as THREE from 'three/webgpu';
-import type { Point2D } from './BuildingTypes';
+import type { Point2D, StraightWallData } from './BuildingTypes';
 import type { SceneManager } from '../scene/SceneManager';
 import { applyFixedScreenSpriteSize } from '../rendering/FixedScreenSpriteScaler';
 
@@ -209,6 +209,9 @@ export class StraightWallDimensionRenderer {
   /** 当前预览标注。 */
   private _previewAnnotation: StraightWallPreviewAnnotation | null = null;
 
+  /** 当前选中直墙的常驻尺寸标注集合。 */
+  private _persistentAnnotations: Map<string, StraightWallPreviewAnnotation> = new Map<string, StraightWallPreviewAnnotation>();
+
   /** 当前可见性。 */
   private _visible: boolean = true;
 
@@ -230,11 +233,47 @@ export class StraightWallDimensionRenderer {
   public updatePreview(start: Point2D, end: Point2D, inputText: string | null = null, active: boolean = true): void {
     this.clearPreview();
 
+    const annotation: StraightWallPreviewAnnotation | null = this._createAnnotation(start, end, inputText, active);
+    if (annotation === null) {
+      return;
+    }
+
+    this._previewAnnotation = annotation;
+  }
+
+  /**
+   * 更新选中直墙的常驻尺寸标注。
+   * 关键流程：先释放旧的选中标注，再按当前选中直墙中心线批量创建尺寸线与长度文本。
+   * @param walls - 当前选中的直墙数据列表
+   */
+  public updatePersistentForWalls(walls: StraightWallData[]): void {
+    this.clearPersistent();
+
+    for (const wall of walls) {
+      const annotation: StraightWallPreviewAnnotation | null = this._createAnnotation(wall.start, wall.end, null, true);
+      if (annotation === null) {
+        continue;
+      }
+
+      this._persistentAnnotations.set(wall.id, annotation);
+    }
+  }
+
+  /**
+   * 创建一组直墙尺寸标注对象并加入场景。
+   * @param start - 直墙中心线或预览线起点
+   * @param end - 直墙中心线或预览线终点
+   * @param inputText - 键盘输入文本；为空时显示真实长度毫米值
+   * @param active - 是否按选中/当前编辑样式显示
+   * @returns 创建成功的标注句柄；长度过短时返回 null
+   */
+  private _createAnnotation(start: Point2D, end: Point2D, inputText: string | null, active: boolean): StraightWallPreviewAnnotation | null {
+
     const dx: number = end.x - start.x;
     const dz: number = end.z - start.z;
     const length: number = Math.sqrt(dx * dx + dz * dz);
     if (length < 0.1) {
-      return;
+      return null;
     }
 
     const dirX: number = dx / length;
@@ -257,7 +296,7 @@ export class StraightWallDimensionRenderer {
     sprite.visible = this._visible;
     this._sceneManager.add(lines);
     this._sceneManager.add(sprite);
-    this._previewAnnotation = { sprite: sprite, lines: lines };
+    return { sprite: sprite, lines: lines };
   }
 
   /**
@@ -277,6 +316,20 @@ export class StraightWallDimensionRenderer {
   }
 
   /**
+   * 清除所有选中直墙的常驻尺寸标注。
+   */
+  public clearPersistent(): void {
+    const scene: THREE.Scene = this._sceneManager.getScene();
+    this._persistentAnnotations.forEach((annotation: StraightWallPreviewAnnotation): void => {
+      scene.remove(annotation.sprite);
+      scene.remove(annotation.lines);
+      disposeSprite(annotation.sprite);
+      disposeLines(annotation.lines);
+    });
+    this._persistentAnnotations.clear();
+  }
+
+  /**
    * 设置动态标注可见性。
    * @param visible - true 显示，false 隐藏
    */
@@ -286,6 +339,10 @@ export class StraightWallDimensionRenderer {
       this._previewAnnotation.sprite.visible = visible;
       this._previewAnnotation.lines.visible = visible;
     }
+    this._persistentAnnotations.forEach((annotation: StraightWallPreviewAnnotation): void => {
+      annotation.sprite.visible = visible;
+      annotation.lines.visible = visible;
+    });
   }
 
   /**
@@ -293,5 +350,6 @@ export class StraightWallDimensionRenderer {
    */
   public dispose(): void {
     this.clearPreview();
+    this.clearPersistent();
   }
 }

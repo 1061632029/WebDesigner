@@ -2197,6 +2197,23 @@ export class WallDrawTool {
    * @param selectedWallIds - 当前选中的建筑对象 ID 只读集合
    */
   public setSelectedWallIds(selectedWallIds: ReadonlySet<string>): void {
+    const selectedStraightWalls: StraightWallData[] = [];
+
+    /* 选中直墙标注同步流程：根据选中 ID 查找直墙数据，只对直线墙显示长度尺寸与水平夹角。 */
+    selectedWallIds.forEach((selectedWallId: string): void => {
+      const selectedObject: BuildingObject | undefined = this._objectManager.getById(selectedWallId);
+      if (selectedObject === undefined) {
+        return;
+      }
+      if (selectedObject.category !== 'wall' || selectedObject.subType !== 'straight') {
+        return;
+      }
+
+      selectedStraightWalls.push(selectedObject);
+    });
+
+    this._straightDimRenderer.updatePersistentForWalls(selectedStraightWalls);
+    this._linearAngleRenderer.updatePersistentForWalls(selectedStraightWalls);
     this._arcRadiusDimRenderer.setSelectedWallIds(selectedWallIds);
   }
 
