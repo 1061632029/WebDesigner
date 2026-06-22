@@ -46,7 +46,12 @@ import type { WallSnapResult } from './WallSnapHelper';
 import { WallJointNodeRenderer } from './WallJointNodeRenderer';
 import { LineElementDragGeometryHelper } from '../interaction/LineElementDragGeometryHelper';
 import type { LineElementDirectionConstraint } from '../interaction/LineElementDragGeometryHelper';
-import { FixedPixelLineSegmentsFactory, type FixedPixelLineSegments } from '../rendering/FixedPixelLineSegmentsFactory';
+import { FixedPixelLineSegmentsFactory } from '../rendering/FixedPixelLineSegmentsFactory';
+import { BuildingMaterialFactory } from './manager/BuildingMaterialFactory';
+import { BuildingMeshFactory } from './manager/BuildingMeshFactory';
+import { BuildingWireframeFactory } from './manager/BuildingWireframeFactory';
+import type { BuildingWireframeFactoryOptions } from './manager/BuildingWireframeFactory';
+import { Geometry2DUtils } from './manager/Geometry2DUtils';
 
 /**
  * 建筑对象变更事件回调
@@ -363,32 +368,12 @@ export class BuildingObjectManager {
   /* ========== 材质工厂方法 ========== */
 
   /**
-   * 根据 MaterialProperties 创建独立的 Three.js Material 实例
-   * 每个渲染对象拥有独立材质，支持个性化颜色和属性
-   * @param props - 材质属性
-   * @returns Three.js Material 实例
+   * 根据 MaterialProperties 创建独立的 Three.js Material 实例。
+   * @param props - 材质属性。
+   * @returns Three.js Material 实例。
    */
   private _createMaterialFromProperties(props: MaterialProperties): THREE.Material {
-    const isTransparent: boolean = props.opacity < 1.0;
-
-    if (props.materialType === 'basic') {
-      return new THREE.MeshBasicMaterial({
-        color: props.color,
-        opacity: props.opacity,
-        transparent: isTransparent,
-        side: THREE.DoubleSide,
-      });
-    }
-
-    /* standard 和 physical 都使用 MeshStandardMaterial */
-    return new THREE.MeshStandardMaterial({
-      color: props.color,
-      metalness: props.metalness,
-      roughness: props.roughness,
-      opacity: props.opacity,
-      transparent: isTransparent,
-      side: THREE.DoubleSide,
-    });
+    return BuildingMaterialFactory.createMaterialFromProperties(props);
   }
 
   /* ========== 增删改 ========== */
@@ -470,368 +455,60 @@ export class BuildingObjectManager {
   private static readonly WALL_FACE_COUNT_WITH_OPENING: number = 7;
 
   /**
-   * 创建过滤后的边界线段（排除共面边）
-   *
-   * 算法说明：
-   * CSG 开洞后，同一大面被切割成多个三角形，这些三角形之间的边虽然共面，
-   * 但由于顶点重复（坐标相同但索引不同），基于索引的共享边检测会失败。
-   *
-   * 本方法采用"逻辑顶点ID"方案：
-   * 1. 预建坐标→逻辑ID映射，将坐标相同的顶点归为同一逻辑顶点
-   * 2. 建立逻辑边→共享面法向量列表的映射（O(n) 查表，替代 O(n²) 遍历）
-   * 3. 过滤掉所有共面边（法向量夹角余弦 > threshold），保留折角边和边界边
-   *
-   * @param geometry - 几何体（需有 index）
-   * @param excludeGroupIndices - 需要排除的 materialIndex 列表（这些面的边不参与计算，不出现在线框中）
-   *   用于排除洞口内壁面（materialIndex=2），避免内壁边产生竖线
-   * @param hideArcSegmentVerticalEdges - 是否隐藏弧形墙相邻折线段之间的竖向分割边
-   * @returns LineSegments 或 null（无有效边时）
+   * 获取当前线框工厂配置。
+   * @returns 固定像素线框开关、线宽和深度偏移配置。
+   */
+  private _getWireframeFactoryOptions(): BuildingWireframeFactoryOptions {
+    return {
+      fixedPixelWireframeEnabled: this._fixedPixelWireframeEnabled,
+      fixedPixelWireframeWidth: this._fixedPixelWireframeWidth,
+      wireframeDepthOffsetNdc: BuildingObjectManager.WIREFRAME_DEPTH_OFFSET_NDC,
+    };
+  }
+
+  /**
+   * 创建过滤后的边界线段（排除共面边）。
+   * @param geometry - 几何体。
+   * @param excludeGroupIndices - 需要排除的 materialIndex 列表。
+   * @param hideArcSegmentVerticalEdges - 是否隐藏弧形墙相邻折线段之间的竖向分割边。
+   * @returns LineSegments 或 null。
    */
   private _createFilteredEdges(
     geometry: THREE.BufferGeometry,
     excludeGroupIndices: number[] = [],
     hideArcSegmentVerticalEdges: boolean = false
   ): THREE.LineSegments | null {
-    /* 获取顶点位置属性（强制转换为 BufferAttribute，InterleavedBufferAttribute 同样支持 getX/Y/Z） */
-    const positionAttribute: THREE.BufferAttribute = geometry.getAttribute('position') as THREE.BufferAttribute;
-    if (positionAttribute === undefined || positionAttribute === null) {
-      return null;
-    }
-
-    const indices: THREE.BufferAttribute | null = geometry.getIndex();
-    if (indices === null) {
-      return null;
-    }
-
-    /* 共面判断阈值：法向量点积 > 0.999 视为共面（夹角 < 约 2.6°） */
-    const threshold: number = 0.999;
-    const totalVertices: number = positionAttribute.count;
-    const count: number = indices.count;
-
-    /* ── 第一步：建立物理顶点索引 → 逻辑顶点ID 的映射 ──
-     * 坐标相同的顶点归为同一逻辑顶点，解决 CSG 重复顶点问题
-     */
-    const coordToLogicalId: Map<string, number> = new Map<string, number>();
-    const physicalToLogical: number[] = new Array<number>(totalVertices);
-    let logicalVertexCount: number = 0;
-
-    for (let i: number = 0; i < totalVertices; i++) {
-      /* 用 6 位小数精度作为坐标 key，容忍浮点误差 */
-      const coordKey: string =
-        `${positionAttribute.getX(i).toFixed(6)},` +
-        `${positionAttribute.getY(i).toFixed(6)},` +
-        `${positionAttribute.getZ(i).toFixed(6)}`;
-
-      let logicalId: number | undefined = coordToLogicalId.get(coordKey);
-      if (logicalId === undefined) {
-        logicalId = logicalVertexCount;
-        coordToLogicalId.set(coordKey, logicalId);
-        logicalVertexCount++;
-      }
-      physicalToLogical[i] = logicalId;
-    }
-
-    /* ── 第二步：预计算所有面的法向量，并建立逻辑边 → 面法向量列表的映射 ──
-     * 逻辑边 key = "min(logA,logB)-max(logA,logB)"
-     * 值 = 所有共享该逻辑边的面的法向量数组
-     */
-    const edgeToNormals: Map<string, THREE.Vector3[]> = new Map<string, THREE.Vector3[]>();
-
-    /* 同时记录每条逻辑边对应的一个物理顶点对（用于最终输出坐标） */
-    const edgeToPhysical: Map<string, [number, number]> = new Map<string, [number, number]>();
-
-    /* 预建三角形索引 → materialIndex 的映射（用于排除指定面的边）
-     * 遍历 geometry.groups，每个 group 覆盖 [start, start+count) 范围内的索引
-     * 三角形 i 对应的索引范围为 [i, i+2]，取 i 所在的 group 即可
-     */
-    const triangleToMaterialIndex: Map<number, number> = new Map<number, number>();
-    if (excludeGroupIndices.length > 0) {
-      for (const group of geometry.groups) {
-        /* group.start 和 group.count 是索引数量（每个三角形 3 个索引） */
-        const groupEnd: number = group.start + group.count;
-        for (let idx: number = group.start; idx < groupEnd; idx += 3) {
-          triangleToMaterialIndex.set(idx, group.materialIndex ?? 0);
-        }
-      }
-    }
-
-    for (let i: number = 0; i < count; i += 3) {
-      /* 若当前三角形属于需要排除的 materialIndex，跳过（不参与边计算） */
-      if (excludeGroupIndices.length > 0) {
-        const matIdx: number | undefined = triangleToMaterialIndex.get(i);
-        if (matIdx !== undefined && excludeGroupIndices.includes(matIdx)) {
-          continue;
-        }
-      }
-
-      const physA: number = indices.getX(i);
-      const physB: number = indices.getX(i + 1);
-      const physC: number = indices.getX(i + 2);
-
-      /* 计算面法向量 */
-      const vA: THREE.Vector3 = new THREE.Vector3(
-        positionAttribute.getX(physA),
-        positionAttribute.getY(physA),
-        positionAttribute.getZ(physA)
-      );
-      const vB: THREE.Vector3 = new THREE.Vector3(
-        positionAttribute.getX(physB),
-        positionAttribute.getY(physB),
-        positionAttribute.getZ(physB)
-      );
-      const vC: THREE.Vector3 = new THREE.Vector3(
-        positionAttribute.getX(physC),
-        positionAttribute.getY(physC),
-        positionAttribute.getZ(physC)
-      );
-      const normal: THREE.Vector3 = new THREE.Vector3()
-        .crossVectors(
-          new THREE.Vector3().subVectors(vB, vA),
-          new THREE.Vector3().subVectors(vC, vA)
-        )
-        .normalize();
-
-      /* 转换为逻辑顶点ID */
-      const logA: number = physicalToLogical[physA]!;
-      const logB: number = physicalToLogical[physB]!;
-      const logC: number = physicalToLogical[physC]!;
-
-      /* 遍历该面的三条逻辑边，将法向量注册到映射表 */
-      const faceLogEdges: Array<[number, number]> = [[logA, logB], [logB, logC], [logC, logA]];
-      const facePhysEdges: Array<[number, number]> = [[physA, physB], [physB, physC], [physC, physA]];
-
-      for (let e: number = 0; e < 3; e++) {
-        const [la, lb]: [number, number] = faceLogEdges[e]!;
-        /* 无向边 key：小ID在前，确保同一条边两个方向映射到同一个 key */
-        const eKey: string = la < lb ? `${la}-${lb}` : `${lb}-${la}`;
-
-        /* 注册法向量 */
-        let normals: THREE.Vector3[] | undefined = edgeToNormals.get(eKey);
-        if (normals === undefined) {
-          normals = [];
-          edgeToNormals.set(eKey, normals);
-          /* 记录物理顶点对（只需记录第一次出现的，用于输出坐标） */
-          edgeToPhysical.set(eKey, facePhysEdges[e]!);
-        }
-        normals.push(normal);
-      }
-    }
-
-    /* ── 第三步：过滤共面边，收集需要显示的边 ──
-     * 边界边（只有 1 个面共享）：一定显示
-     * 内部边（≥2 个面共享）：若所有相邻面对均共面则隐藏，否则显示
-     */
-    const visibleEdges: Array<[number, number]> = [];
-
-    edgeToNormals.forEach((normals: THREE.Vector3[], eKey: string): void => {
-      const physPair: [number, number] | undefined = edgeToPhysical.get(eKey);
-      if (physPair === undefined) {
-        return;
-      }
-
-      /* 弧形墙外/内侧由多段折面近似，隐藏相邻折面之间的竖向分割边，避免视觉上出现大量竖线。 */
-      if (
-        hideArcSegmentVerticalEdges &&
-        this._isArcSegmentVerticalDivider(positionAttribute, physPair, normals)
-      ) {
-        return;
-      }
-
-      /* 边界边：只有一个面，直接显示 */
-      if (normals.length === 1) {
-        visibleEdges.push(physPair);
-        return;
-      }
-
-      /* 内部边：检查所有相邻面对是否共面 */
-      let isCoplanar: boolean = false;
-      outer: for (let m: number = 0; m < normals.length - 1; m++) {
-        for (let n: number = m + 1; n < normals.length; n++) {
-          const cosAngle: number = Math.abs(normals[m]!.dot(normals[n]!));
-          if (cosAngle > threshold) {
-            /* 找到一对共面的相邻面，标记为共面边 */
-            isCoplanar = true;
-            break outer;
-          }
-        }
-      }
-
-      /* 非共面边（折角边）：显示 */
-      if (!isCoplanar) {
-        visibleEdges.push(physPair);
-      }
-    });
-
-    if (visibleEdges.length === 0) {
-      return null;
-    }
-
-    /* ── 第四步：构建 LineSegments 几何体 ── */
-    const vertices: Float32Array = new Float32Array(visibleEdges.length * 6);
-    for (let i: number = 0; i < visibleEdges.length; i++) {
-      const [startIdx, endIdx]: [number, number] = visibleEdges[i]!;
-      vertices[i * 6]     = positionAttribute.getX(startIdx);
-      vertices[i * 6 + 1] = positionAttribute.getY(startIdx);
-      vertices[i * 6 + 2] = positionAttribute.getZ(startIdx);
-      vertices[i * 6 + 3] = positionAttribute.getX(endIdx);
-      vertices[i * 6 + 4] = positionAttribute.getY(endIdx);
-      vertices[i * 6 + 5] = positionAttribute.getZ(endIdx);
-    }
-
-    /* 使用 WebGPU 固定像素线段强化线框：基于屏幕空间切线偏移生成矩形线带，线宽不受透视远近影响。 */
-    if (this._fixedPixelWireframeEnabled) {
-      const fixedPixelLines: FixedPixelLineSegments = FixedPixelLineSegmentsFactory.create(vertices, {
-        color: 0x333333,
-        lineWidthPixels: this._fixedPixelWireframeWidth,
-        depthTest: true,
-        depthWrite: false,
-        opacity: 1,
-        depthOffsetNdc: BuildingObjectManager.WIREFRAME_DEPTH_OFFSET_NDC,
-      });
-      fixedPixelLines.userData['isWireframe'] = true;
-      fixedPixelLines.userData['isEnhancedWireframe'] = true;
-      return FixedPixelLineSegmentsFactory.asLineSegments(fixedPixelLines);
-    }
-
-    /* 回退路径：使用 WebGPU 兼容的原生 LineSegments 创建 1px 线框。 */
-    const lineSegGeom: THREE.BufferGeometry = new THREE.BufferGeometry();
-    lineSegGeom.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
-
-    const wireframeMaterial: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-      color: 0x333333,
-      depthTest: true,
-      depthWrite: false,
-    });
-
-    const lines: THREE.LineSegments = new THREE.LineSegments(lineSegGeom, wireframeMaterial);
-    /* 标记为线框对象，供 hideAllWireframes / restoreAllWireframes 识别 */
-    lines.userData['isWireframe'] = true;
-    return lines;
+    return BuildingWireframeFactory.createFilteredEdges(
+      geometry,
+      this._getWireframeFactoryOptions(),
+      excludeGroupIndices,
+      hideArcSegmentVerticalEdges
+    );
   }
 
   /**
    * 为楼板、天花板等面状构件创建固定像素边线。
-   * 关键流程：先用 EdgesGeometry 提取真实几何棱边，再复用屏幕空间线段 Mesh，保证远近缩放时轮廓线仍保持稳定像素宽度。
-   * @param geometry - 需要提取棱边的几何体
-   * @param color - 边线颜色
-   * @returns 可作为子对象挂载到构件 Mesh 的边线对象；无边线时返回 null
+   * @param geometry - 需要提取棱边的几何体。
+   * @param color - 边线颜色。
+   * @returns 可作为子对象挂载到构件 Mesh 的边线对象；无边线时返回 null。
    */
   private _createSurfaceEdgeWireframe(
     geometry: THREE.BufferGeometry,
     color: THREE.ColorRepresentation
   ): THREE.Object3D | null {
-    const edgeGeometry: THREE.EdgesGeometry = new THREE.EdgesGeometry(geometry, 15);
-    const positionAttribute: THREE.BufferAttribute = edgeGeometry.getAttribute('position') as THREE.BufferAttribute;
-    if (positionAttribute === undefined || positionAttribute === null || positionAttribute.count === 0) {
-      edgeGeometry.dispose();
-      return null;
-    }
-
-    /* 固定像素线段流程：将 EdgesGeometry 的端点复制为稳定数组，交给屏幕空间线段工厂生成可控宽度轮廓。 */
-    if (this._fixedPixelWireframeEnabled) {
-      const vertices: Float32Array = new Float32Array(positionAttribute.count * 3);
-      for (let vertexIndex: number = 0; vertexIndex < positionAttribute.count; vertexIndex++) {
-        const offset: number = vertexIndex * 3;
-        vertices[offset] = positionAttribute.getX(vertexIndex);
-        vertices[offset + 1] = positionAttribute.getY(vertexIndex);
-        vertices[offset + 2] = positionAttribute.getZ(vertexIndex);
-      }
-
-      const fixedPixelLines: FixedPixelLineSegments = FixedPixelLineSegmentsFactory.create(vertices, {
-        color: color,
-        lineWidthPixels: this._fixedPixelWireframeWidth,
-        depthTest: true,
-        depthWrite: false,
-        opacity: 1,
-        depthOffsetNdc: BuildingObjectManager.WIREFRAME_DEPTH_OFFSET_NDC,
-      });
-      fixedPixelLines.userData['isWireframe'] = true;
-      fixedPixelLines.userData['isEnhancedWireframe'] = true;
-      fixedPixelLines.userData['isSurfaceEdgeWireframe'] = true;
-      edgeGeometry.dispose();
-      return FixedPixelLineSegmentsFactory.asObject3D(fixedPixelLines);
-    }
-
-    /* 兼容分支：关闭固定像素增强时仍保留原生 LineSegments，便于排查 WebGPU 线段 Mesh 问题。 */
-    const wireframeMaterial: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-      color: color,
-      depthTest: true,
-      depthWrite: false,
-    });
-    const wireframe: THREE.LineSegments = new THREE.LineSegments(edgeGeometry, wireframeMaterial);
-    wireframe.userData['isWireframe'] = true;
-    wireframe.userData['isSurfaceEdgeWireframe'] = true;
-    return wireframe;
+    return BuildingWireframeFactory.createSurfaceEdgeWireframe(
+      geometry,
+      color,
+      this._getWireframeFactoryOptions()
+    );
   }
 
   /**
    * 释放线框辅助对象占用的 GPU 资源。
-   * 关键流程：优先交给固定像素线段工厂释放屏幕空间 Mesh；回退分支兼容原生 LineSegments。
-   * @param wireframeObject - 需要释放的线框辅助对象
+   * @param wireframeObject - 需要释放的线框辅助对象。
    */
   private _disposeWireframeObject(wireframeObject: THREE.Object3D): void {
-    if (FixedPixelLineSegmentsFactory.isFixedPixelLineSegments(wireframeObject)) {
-      FixedPixelLineSegmentsFactory.dispose(wireframeObject);
-      return;
-    }
-
-    if (!(wireframeObject instanceof THREE.LineSegments)) {
-      return;
-    }
-
-    const lineSegments: THREE.LineSegments = wireframeObject as THREE.LineSegments;
-    lineSegments.geometry.dispose();
-    if (Array.isArray(lineSegments.material)) {
-      for (let materialIndex: number = 0; materialIndex < lineSegments.material.length; materialIndex++) {
-        const material: THREE.Material = lineSegments.material[materialIndex]!;
-        material.dispose();
-      }
-      return;
-    }
-
-    lineSegments.material.dispose();
-  }
-
-  /**
-   * 判断当前边是否为弧形墙相邻采样段之间的竖向分割边。
-   * 关键流程：仅匹配 X/Z 坐标相同、Y 方向有高度、且相邻两个面法线均为水平侧面法线的边；
-   * 起点/终点端面竖线与侧面近似垂直，不会被此规则隐藏，从而保留墙体端部轮廓。
-   * @param positionAttribute - 几何体顶点位置属性
-   * @param edgePair - 物理顶点索引对
-   * @param normals - 共享当前逻辑边的面法线集合
-   * @returns 若为弧段内部竖向分割边则返回 true，否则返回 false
-   */
-  private _isArcSegmentVerticalDivider(
-    positionAttribute: THREE.BufferAttribute,
-    edgePair: [number, number],
-    normals: THREE.Vector3[]
-  ): boolean {
-    const startIndex: number = edgePair[0];
-    const endIndex: number = edgePair[1];
-    const coordinateEpsilon: number = 0.000001;
-
-    const dx: number = Math.abs(positionAttribute.getX(startIndex) - positionAttribute.getX(endIndex));
-    const dy: number = Math.abs(positionAttribute.getY(startIndex) - positionAttribute.getY(endIndex));
-    const dz: number = Math.abs(positionAttribute.getZ(startIndex) - positionAttribute.getZ(endIndex));
-    if (dy <= coordinateEpsilon || dx > coordinateEpsilon || dz > coordinateEpsilon) {
-      return false;
-    }
-
-    /* 内部分割竖线只由相邻两个侧面共享；边界端部竖线通常由端面与侧面共享，法线夹角接近 90 度。 */
-    if (normals.length !== 2) {
-      return false;
-    }
-
-    const firstNormal: THREE.Vector3 = normals[0]!;
-    const secondNormal: THREE.Vector3 = normals[1]!;
-    const horizontalNormalYLimit: number = 0.01;
-    if (Math.abs(firstNormal.y) > horizontalNormalYLimit || Math.abs(secondNormal.y) > horizontalNormalYLimit) {
-      return false;
-    }
-
-    const adjacentSideFaceCosine: number = Math.abs(firstNormal.dot(secondNormal));
-    const minAdjacentArcSegmentCosine: number = 0.5;
-    return adjacentSideFaceCosine > minAdjacentArcSegmentCosine;
+    BuildingWireframeFactory.disposeWireframeObject(wireframeObject);
   }
 
   /**
@@ -2000,28 +1677,20 @@ export class BuildingObjectManager {
 
   /**
    * 计算 XZ 平面二维向量的单位向量。
-   * @param vector - 原始二维向量
-   * @returns 单位向量；长度过小时返回 null
+   * @param vector - 原始二维向量。
+   * @returns 单位向量；长度过小时返回 null。
    */
   private _normalizePoint2D(vector: Point2D): Point2D | null {
-    const length: number = Math.sqrt(vector.x * vector.x + vector.z * vector.z);
-    if (length < BuildingObjectManager.WALL_DRAG_EPSILON) {
-      return null;
-    }
-    return {
-      x: vector.x / length,
-      z: vector.z / length,
-    };
+    return Geometry2DUtils.normalizePoint2D(vector, BuildingObjectManager.WALL_DRAG_EPSILON);
   }
 
   /**
    * 计算两条 XZ 平面无限直线的交点。
-   * 直线 A = pointA + t * directionA，直线 B = pointB + s * directionB。
-   * @param pointA - 第一条直线上的点
-   * @param directionA - 第一条直线方向
-   * @param pointB - 第二条直线上的点
-   * @param directionB - 第二条直线方向
-   * @returns 交点；平行或近似平行时返回 null
+   * @param pointA - 第一条直线上的点。
+   * @param directionA - 第一条直线方向。
+   * @param pointB - 第二条直线上的点。
+   * @param directionB - 第二条直线方向。
+   * @returns 交点；平行或近似平行时返回 null。
    */
   private _intersectInfiniteLines(
     pointA: Point2D,
@@ -2029,32 +1698,29 @@ export class BuildingObjectManager {
     pointB: Point2D,
     directionB: Point2D
   ): Point2D | null {
-    const denominator: number = directionA.x * directionB.z - directionA.z * directionB.x;
-    if (Math.abs(denominator) < BuildingObjectManager.WALL_DRAG_EPSILON) {
-      return null;
-    }
-
-    const diffX: number = pointB.x - pointA.x;
-    const diffZ: number = pointB.z - pointA.z;
-    const t: number = (diffX * directionB.z - diffZ * directionB.x) / denominator;
-    return {
-      x: pointA.x + t * directionA.x,
-      z: pointA.z + t * directionA.z,
-    };
+    return Geometry2DUtils.intersectInfiniteLines(
+      pointA,
+      directionA,
+      pointB,
+      directionB,
+      BuildingObjectManager.WALL_DRAG_EPSILON
+    );
   }
 
   /**
    * 判断点是否落在指定 XZ 平面无限直线上。
-   * @param point - 待检测点
-   * @param linePoint - 直线上的已知点
-   * @param lineDirection - 直线方向单位向量
-   * @returns 点到直线距离在容差内返回 true
+   * @param point - 待检测点。
+   * @param linePoint - 直线上的已知点。
+   * @param lineDirection - 直线方向单位向量。
+   * @returns 点到直线距离在容差内返回 true。
    */
   private _isPointOnLine(point: Point2D, linePoint: Point2D, lineDirection: Point2D): boolean {
-    const diffX: number = point.x - linePoint.x;
-    const diffZ: number = point.z - linePoint.z;
-    const crossDistance: number = Math.abs(diffX * lineDirection.z - diffZ * lineDirection.x);
-    return crossDistance < BuildingObjectManager.WALL_DRAG_EPSILON;
+    return Geometry2DUtils.isPointOnLine(
+      point,
+      linePoint,
+      lineDirection,
+      BuildingObjectManager.WALL_DRAG_EPSILON
+    );
   }
 
   /**
@@ -3231,139 +2897,52 @@ export class BuildingObjectManager {
   }
 
   /**
-   * 创建墙体的 Three.js Mesh 并加入场景
-   *
-   * 流程：
-   * 1. 计算 miter 偏移（端面截断到对方侧面）
-   * 2. 检测差集区域（T 形连接时，次墙端点处需要从主墙中开洞）
-   * 3. 若有差集则调用 buildWithSubtraction，否则调用 buildWithMiter
-   * 4. 创建材质数组（每面独立材质）并加入场景
-   *
-   * 使用材质数组，每个面独立材质实例，支持面级别纹理应用
+   * 创建墙体的 Three.js Mesh 并加入场景。
+   * 关键流程：委托 BuildingMeshFactory 按墙体类型创建 Mesh，本管理器仅负责场景登记与包围盒同步。
+   * @param data - 墙体数据。
    */
   private _createWallMesh(data: WallData): void {
-    /* 矩形墙不直接生成 Mesh（由子墙体生成） */
-    if (data.subType === 'rect') {
+    const mesh: THREE.Mesh | null = BuildingMeshFactory.createWallMesh(data, {
+      wallBuilder: this._wallBuilder,
+      connectionManager: this._connectionManager,
+      getWallEndpoints: this._getWallEndpointsCallback(),
+      getWallEndpointDirection: this._getWallEndpointDirectionCallback(),
+      createMaterial: (props: MaterialProperties): THREE.Material => this._createMaterialFromProperties(props),
+      createFilteredEdges: (
+        geometry: THREE.BufferGeometry,
+        excludeGroupIndices?: number[],
+        hideArcSegmentVerticalEdges?: boolean
+      ): THREE.LineSegments | null => this._createFilteredEdges(geometry, excludeGroupIndices, hideArcSegmentVerticalEdges),
+      wallFaceCount: BuildingObjectManager.WALL_FACE_COUNT,
+      wallFaceCountWithOpening: BuildingObjectManager.WALL_FACE_COUNT_WITH_OPENING,
+    });
+
+    if (mesh === null) {
       return;
     }
 
-    let geometry: THREE.BufferGeometry;
-    /* 直墙/弧墙：计算 miter 偏移后构建几何，让端部与相邻墙衔接裁剪。 */
-    if (data.subType === 'straight') {
-      /* 计算 miter 偏移：直墙使用轴线方向。 */
-      const miter: MiterParams = this._connectionManager.computeMiterForWall(
-        data.id,
-        data.start,
-        data.end,
-        data.thickness,
-        this._getWallEndpointsCallback(),
-        this._getWallEndpointDirectionCallback()
-      );
-      geometry = this._wallBuilder.buildWithMiter(data, miter);
-    } else {
-      /* 计算 miter 偏移：弧墙使用端点中心弧线切向方向。 */
-      const arcData: ArcWallData = data;
-      const miter: MiterParams = this._connectionManager.computeMiterForWall(
-        arcData.id,
-        arcData.start,
-        arcData.end,
-        arcData.thickness,
-        this._getWallEndpointsCallback(),
-        this._getWallEndpointDirectionCallback()
-      );
-      geometry = this._wallBuilder.buildArcWithMiter(arcData, miter);
-    }
-
-    /* 为每个面创建独立的材质实例
-     * 普通直墙：6 面（前/后/起点端/终点端/顶/底）
-     * 带洞口直墙：7 面（前/后/洞口内壁/起点端/终点端/顶/底）
-     */
-    const hasStraightOpenings: boolean =
-      data.subType === 'straight' &&
-      (data as import('./BuildingTypes').StraightWallData).openings !== undefined &&
-      ((data as import('./BuildingTypes').StraightWallData).openings?.length ?? 0) > 0;
-    const faceCount: number = hasStraightOpenings
-      ? BuildingObjectManager.WALL_FACE_COUNT_WITH_OPENING
-      : BuildingObjectManager.WALL_FACE_COUNT;
-    const materials: Array<THREE.Material> = [];
-    for (let i: number = 0; i < faceCount; i++) {
-      const faceMaterial: THREE.Material = this._createMaterialFromProperties(data.material);
-      materials.push(faceMaterial);
-    }
-
-    const mesh: THREE.Mesh = new THREE.Mesh(geometry, materials);
-
-    /* 将全局 ID 存入 Mesh 的 userData，方便射线拾取时反查 */
-    mesh.userData['buildingObjectId'] = data.id;
-    mesh.name = data.name;
-
-    // /* 创建边界线框（EdgesGeometry 只提取实体轮廓边） */
-    // const edgesGeometry: THREE.EdgesGeometry = new THREE.EdgesGeometry(geometry, 15);
-    // const wireframeMaterial: THREE.LineBasicMaterial = new THREE.LineBasicMaterial({
-    //   color: 0x333333,
-    //   linewidth: 1,
-    //   depthTest: true,
-    //   depthWrite: false,
-    // });
-    // const wireframe: THREE.LineSegments = new THREE.LineSegments(edgesGeometry, wireframeMaterial);
-
-    // /* 线框稍微向外偏移，避免 Z-fighting */
-    // wireframe.position.set(0, 0.001, 0);
-    // wireframe.renderOrder = 1;
-
-    // /* 将线框作为子对象添加到 Mesh，随实体一起移动/删除 */
-    // mesh.add(wireframe);
-
-    /* 创建边界线框（排除 180° 共面边）
-     * 带洞口的直墙需排除 materialIndex=2（洞口内壁面），避免内壁左右端面产生竖线
-     */
-    const excludeGroups: number[] = hasStraightOpenings ? [2] : [];
-    const shouldHideArcSegmentVerticalEdges: boolean = data.subType === 'arc';
-    const wireframe: THREE.LineSegments | null = this._createFilteredEdges(
-      mesh.geometry,
-      excludeGroups,
-      shouldHideArcSegmentVerticalEdges
-    );
-    if (wireframe !== null) {
-      /* 线框稍微向外偏移，避免 Z-fighting */
-      wireframe.position.set(0, 0.001, 0);
-      wireframe.renderOrder = 1;
-      /* 将线框作为子对象添加到 Mesh，随实体一起移动/删除 */
-      mesh.add(wireframe);
-    }
-
-    /* 加入场景 */
     this._sceneManager.add(mesh);
     this._meshes.set(data.id, mesh);
-    /* 计算并存储包围盒 */
     this._computeAndStoreBoundingBox(data, mesh);
   }
 
   /**
-   * 创建梁的 Three.js Mesh 并加入场景
-   * 关键流程：使用梁专属几何构建器生成矩形梁实体，创建实体材质与边界线框后登记到 Mesh 映射。
-   * @param data - 梁构件数据
+   * 创建梁的 Three.js Mesh 并加入场景。
+   * 关键流程：委托 BuildingMeshFactory 创建梁实体，本管理器仅负责场景登记与包围盒同步。
+   * @param data - 梁构件数据。
    */
   private _createBeamMesh(data: BeamData): void {
-    data.length = BeamGeometryBuilder.computeLength(data.start, data.end);
-    data.elevation = BeamGeometryBuilder.computeBottomY(data);
-
-    /* 计算梁端点斜接：梁只与梁端点重合关系联动，不写入墙体连接拓扑。 */
-    const beamMiter: MiterParams = this._beamMiterCalculator.computeMiterForBeam(data, this._getAllBeamData());
-    const geometry: THREE.BufferGeometry = this._beamBuilder.buildWithMiter(data, beamMiter);
-    const material: THREE.Material = this._createMaterialFromProperties(data.material);
-    const mesh: THREE.Mesh = new THREE.Mesh(geometry, material);
-
-    mesh.userData['buildingObjectId'] = data.id;
-    mesh.name = data.name;
-
-    /* 梁为规则六面体，直接显示折角边即可辅助用户识别宽高和长度。 */
-    const wireframe: THREE.LineSegments | null = this._createFilteredEdges(mesh.geometry);
-    if (wireframe !== null) {
-      wireframe.position.set(0, 0.001, 0);
-      wireframe.renderOrder = 1;
-      mesh.add(wireframe);
-    }
+    const mesh: THREE.Mesh = BuildingMeshFactory.createBeamMesh(data, {
+      beamBuilder: this._beamBuilder,
+      beamMiterCalculator: this._beamMiterCalculator,
+      getAllBeamData: (): BeamData[] => this._getAllBeamData(),
+      createMaterial: (props: MaterialProperties): THREE.Material => this._createMaterialFromProperties(props),
+      createFilteredEdges: (
+        geometry: THREE.BufferGeometry,
+        excludeGroupIndices?: number[],
+        hideArcSegmentVerticalEdges?: boolean
+      ): THREE.LineSegments | null => this._createFilteredEdges(geometry, excludeGroupIndices, hideArcSegmentVerticalEdges),
+    });
 
     this._sceneManager.add(mesh);
     this._meshes.set(data.id, mesh);
@@ -4336,80 +3915,38 @@ export class BuildingObjectManager {
   }
 
   /**
-   * 创建楼板的 Three.js Mesh 并加入场景
-   * 使用 SlabGeometryBuilder 生成挤压几何体，附带边缘线框
-   * @param data - 楼板数据
+   * 创建楼板的 Three.js Mesh 并加入场景。
+   * 关键流程：委托 BuildingMeshFactory 创建楼板实体，本管理器仅负责场景登记与包围盒同步。
+   * @param data - 楼板数据。
    */
   private _createSlabMesh(data: SlabData): void {
-    const geometry: THREE.BufferGeometry = this._slabBuilder.build(data);
+    const mesh: THREE.Mesh = BuildingMeshFactory.createSlabMesh(data, {
+      slabBuilder: this._slabBuilder,
+      createMaterial: (props: MaterialProperties): THREE.Material => this._createMaterialFromProperties(props),
+      createSurfaceEdgeWireframe: (geometry: THREE.BufferGeometry, color: THREE.ColorRepresentation): THREE.Object3D | null =>
+        this._createSurfaceEdgeWireframe(geometry, color),
+    });
 
-    /* 楼板使用单一材质（不需要面级别纹理） */
-    const material: THREE.Material = this._createMaterialFromProperties(data.material);
-    const mesh: THREE.Mesh = new THREE.Mesh(geometry, material);
-
-    /* 将全局 ID 存入 Mesh 的 userData，方便射线拾取时反查 */
-    mesh.userData['buildingObjectId'] = data.id;
-    mesh.name = data.name;
-
-    /* 设置楼板顶面高度：几何体从 Y=0 向下挤压，Mesh.position.y = topOffset 使顶面在 topOffset 高度
-     * 修改 topOffset 时只需更新 mesh.position.y，不需要重建几何体
-     */
-    mesh.position.set(0, data.topOffset - data.slabThickness, 0);
-
-    /* 创建楼板边缘线框：优先使用屏幕空间固定像素线段，保证远近缩放时轮廓线宽稳定。 */
-    const slabWireframe: THREE.Object3D | null = this._createSurfaceEdgeWireframe(geometry, 0x555555);
-    if (slabWireframe !== null) {
-      slabWireframe.position.set(0, 0.001, 0);
-      slabWireframe.renderOrder = 1;
-      mesh.add(slabWireframe);
-    }
-
-    /* 加入场景 */
     this._sceneManager.add(mesh);
     this._meshes.set(data.id, mesh);
-    /* 计算并存储包围盒 */
     this._computeAndStoreBoundingBox(data, mesh);
   }
 
   /**
-   * 创建天花板的 Three.js Mesh 并加入场景
-   * 使用 CeilingGeometryBuilder 生成挤压几何体，附带边缘线框
-   * 几何体从 Y=0 向下挤压（rotateX(-90°) 后 +Z → -Y），
-   * Mesh.position.y = bottomOffset + ceilingThickness 使底面在 bottomOffset 高度
-   * @param data - 天花板数据
+   * 创建天花板的 Three.js Mesh 并加入场景。
+   * 关键流程：委托 BuildingMeshFactory 创建天花板实体，本管理器仅负责场景登记与包围盒同步。
+   * @param data - 天花板数据。
    */
   private _createCeilingMesh(data: CeilingData): void {
-    const geometry: THREE.BufferGeometry = this._ceilingBuilder.build(data);
+    const mesh: THREE.Mesh = BuildingMeshFactory.createCeilingMesh(data, {
+      ceilingBuilder: this._ceilingBuilder,
+      createMaterial: (props: MaterialProperties): THREE.Material => this._createMaterialFromProperties(props),
+      createSurfaceEdgeWireframe: (geometry: THREE.BufferGeometry, color: THREE.ColorRepresentation): THREE.Object3D | null =>
+        this._createSurfaceEdgeWireframe(geometry, color),
+    });
 
-    /* 天花板使用单一材质（白色，不需要面级别纹理） */
-    const material: THREE.Material = this._createMaterialFromProperties(data.material);
-    const mesh: THREE.Mesh = new THREE.Mesh(geometry, material);
-
-    /* 将全局 ID 存入 Mesh 的 userData，方便射线拾取时反查 */
-    mesh.userData['buildingObjectId'] = data.id;
-    mesh.name = data.name;
-
-    /* 设置天花板位置：
-     * CeilingGeometryBuilder 使用 rotateX(-90°)，ExtrudeGeometry 挤压方向 +Z
-     * rotateX(-90°) 后：新 Y = 旧 Z，即几何体从 Y=0 向 +Y（向上）延伸 ceilingThickness
-     *   底面 = position.y + 0 = bottomOffset
-     *   顶面 = position.y + ceilingThickness = bottomOffset + ceilingThickness
-     * 因此 Mesh.position.y = bottomOffset 即可使底面贴合墙顶
-     */
-    mesh.position.set(0, data.bottomOffset, 0);
-
-    /* 创建天花板边缘线框：优先使用屏幕空间固定像素线段，保证远近缩放时轮廓线宽稳定。 */
-    const ceilWireframe: THREE.Object3D | null = this._createSurfaceEdgeWireframe(geometry, 0x888888);
-    if (ceilWireframe !== null) {
-      ceilWireframe.position.set(0, 0.001, 0);
-      ceilWireframe.renderOrder = 1;
-      mesh.add(ceilWireframe);
-    }
-
-    /* 加入场景 */
     this._sceneManager.add(mesh);
     this._meshes.set(data.id, mesh);
-    /* 计算并存储包围盒 */
     this._computeAndStoreBoundingBox(data, mesh);
   }
 
