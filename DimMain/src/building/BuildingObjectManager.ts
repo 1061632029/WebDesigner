@@ -14,6 +14,7 @@ import type {
   RectWallData,
   SlabBoundaryDimensionSegment,
   SlabData,
+  SlabInnerOutlineBinding,
   CeilingData,
   BeamData,
   Point2D,
@@ -229,6 +230,96 @@ export class BuildingObjectManager {
   }
 
   /**
+   * 收集绑定了指定墙体的楼板和天花板 ID。
+   * @param wallIds - 需要检查绑定关系的墙体 ID 列表。
+   * @returns 绑定任一指定墙体的楼板 ID 和天花板 ID 列表。
+   */
+  public collectSurfaceObjectIdsBoundToWalls(wallIds: string[]): { slabIds: string[]; ceilingIds: string[] } {
+    const wallIdSet: Set<string> = new Set<string>(wallIds);
+    const slabIdSet: Set<string> = new Set<string>();
+    const ceilingIdSet: Set<string> = new Set<string>();
+
+    if (wallIdSet.size === 0) {
+      return {
+        slabIds: [],
+        ceilingIds: [],
+      };
+    }
+
+    /* 收集流程：旧墙被打断删除后，仍绑定旧墙 ID 的表面必须先移除，再由新的最小闭合空间重建。 */
+    for (const objectData of this._objects.values()) {
+      if (objectData.category === 'slab') {
+        const slabData: SlabData = objectData as SlabData;
+        if (BuildingObjectManager._isSlabBoundToAnyWall(slabData, wallIdSet)) {
+          slabIdSet.add(slabData.id);
+        }
+        continue;
+      }
+
+      if (objectData.category === 'ceiling') {
+        const ceilingData: CeilingData = objectData as CeilingData;
+        if (BuildingObjectManager._hasAnyWallId(ceilingData.wallIds, wallIdSet)) {
+          ceilingIdSet.add(ceilingData.id);
+        }
+        continue;
+      }
+
+      if (objectData.category === 'wall' && wallIdSet.has(objectData.id)) {
+        const wallData: WallData = objectData as WallData;
+        if (wallData.subType !== 'straight') {
+          continue;
+        }
+        const straightWallData: StraightWallData = wallData as StraightWallData;
+        BuildingObjectManager._addOptionalIdToSet(straightWallData.slabId, slabIdSet);
+        BuildingObjectManager._addOptionalIdsToSet(straightWallData.slabIds, slabIdSet);
+        BuildingObjectManager._addOptionalIdToSet(straightWallData.ceilingId, ceilingIdSet);
+        BuildingObjectManager._addOptionalIdsToSet(straightWallData.ceilingIds, ceilingIdSet);
+      }
+    }
+
+    return {
+      slabIds: Array.from(slabIdSet.values()),
+      ceilingIds: Array.from(ceilingIdSet.values()),
+    };
+  }
+
+  /**
+   * 移除指定楼板和天花板对象，并同步解除墙体上的表面绑定。
+   * @param slabIds - 需要移除的楼板 ID 列表。
+   * @param ceilingIds - 需要移除的天花板 ID 列表。
+   * @param excludedWallIds - 删除表面前不需要清理绑定字段的墙体 ID 列表，通常为即将删除的旧墙。
+   */
+  public removeSurfaceObjectsByIds(slabIds: string[], ceilingIds: string[], excludedWallIds: string[] = []): void {
+    const excludedWallIdSet: ReadonlySet<string> | null = excludedWallIds.length > 0 ? new Set<string>(excludedWallIds) : null;
+
+    for (const slabId of slabIds) {
+      const slabObject: BuildingObject | undefined = this._objects.get(slabId);
+      if (slabObject === undefined || slabObject.category !== 'slab') {
+        continue;
+      }
+
+      /* 删除流程：先解除保留墙的反向绑定，再移除 Mesh 和数据；即将删除的旧墙无需清理字段。 */
+      this._surfaceService.unlinkSlabFromWalls(slabId, excludedWallIdSet);
+      this._removeMeshFromScene(slabId);
+      this._objects.delete(slabId);
+      this._notify(slabId, 'remove');
+    }
+
+    for (const ceilingId of ceilingIds) {
+      const ceilingObject: BuildingObject | undefined = this._objects.get(ceilingId);
+      if (ceilingObject === undefined || ceilingObject.category !== 'ceiling') {
+        continue;
+      }
+
+      /* 删除流程：天花板与墙体高度存在绑定关系，删除前必须解除保留墙记录中的天花板 ID。 */
+      this._surfaceService.unlinkCeilingFromWalls(ceilingId, excludedWallIdSet);
+      this._removeMeshFromScene(ceilingId);
+      this._objects.delete(ceilingId);
+      this._notify(ceilingId, 'remove');
+    }
+  }
+
+  /**
    * 获取当前全部楼板数据快照。
    * @returns 楼板数据深拷贝列表，用于房间内创建子空间时回滚冲孔、拆分后的楼板轮廓状态。
    */
@@ -265,6 +356,46 @@ export class BuildingObjectManager {
 
     for (const slabData of snapshot) {
       this.addObject(JSON.parse(JSON.stringify(slabData)) as SlabData);
+    }
+  }
+
+  /**
+   * 获取当前全部天花板数据快照。
+   * @returns 天花板数据深拷贝列表，用于封闭空间被墙体拆分时回滚天花板轮廓状态。
+   */
+  public getCeilingDataSnapshot(): CeilingData[] {
+    const ceilingDataList: CeilingData[] = [];
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'ceiling') {
+        continue;
+      }
+      ceilingDataList.push(JSON.parse(JSON.stringify(objectData)) as CeilingData);
+    }
+    return ceilingDataList;
+  }
+
+  /**
+   * 根据天花板快照恢复全部天花板状态。
+   * @param snapshot - 需要恢复的天花板数据快照。
+   */
+  public restoreCeilingDataSnapshot(snapshot: CeilingData[]): void {
+    const currentCeilingIds: string[] = [];
+    for (const objectData of this._objects.values()) {
+      if (objectData.category === 'ceiling') {
+        currentCeilingIds.push(objectData.id);
+      }
+    }
+
+    /* 恢复流程：先移除当前所有天花板及墙体绑定，再按快照重建天花板 Mesh，确保房间拆分结果可被撤销。 */
+    for (const ceilingId of currentCeilingIds) {
+      this._surfaceService.unlinkCeilingFromWalls(ceilingId);
+      this._removeMeshFromScene(ceilingId);
+      this._objects.delete(ceilingId);
+      this._notify(ceilingId, 'remove');
+    }
+
+    for (const ceilingData of snapshot) {
+      this.addObject(JSON.parse(JSON.stringify(ceilingData)) as CeilingData);
     }
   }
 
@@ -1688,6 +1819,80 @@ export class BuildingObjectManager {
     wallIds: string[] = []
   ): string {
     return this._surfaceService.createCeiling(outline, ceilingThickness, bottomOffset, wallIds);
+  }
+
+  /**
+   * 判断墙体绑定列表是否包含目标墙体集合中的任意 ID。
+   * @param sourceWallIds - 楼板或天花板记录的墙体绑定 ID 列表。
+   * @param targetWallIdSet - 需要匹配的墙体 ID 集合。
+   * @returns 命中任意墙体 ID 时返回 true，否则返回 false。
+   */
+  private static _hasAnyWallId(sourceWallIds: string[] | undefined, targetWallIdSet: Set<string>): boolean {
+    if (!Array.isArray(sourceWallIds)) {
+      return false;
+    }
+
+    /* 匹配流程：逐个检查表面绑定墙体，命中被打断旧墙集合即认为该表面需要重建。 */
+    for (const sourceWallId of sourceWallIds) {
+      if (targetWallIdSet.has(sourceWallId)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 判断楼板外轮廓或内洞绑定是否引用了目标墙体集合中的任意 ID。
+   * @param slabData - 待检查的楼板数据。
+   * @param targetWallIdSet - 需要匹配的墙体 ID 集合。
+   * @returns 命中任意墙体 ID 时返回 true，否则返回 false。
+   */
+  private static _isSlabBoundToAnyWall(slabData: SlabData, targetWallIdSet: Set<string>): boolean {
+    if (BuildingObjectManager._hasAnyWallId(slabData.wallIds, targetWallIdSet)) {
+      return true;
+    }
+
+    if (!Array.isArray(slabData.innerOutlineBindings)) {
+      return false;
+    }
+
+    /* 内洞检查流程：分割空间产生的楼板洞口也可能引用被打断旧墙，命中时需删除原楼板并整体重建。 */
+    for (let bindingIndex: number = 0; bindingIndex < slabData.innerOutlineBindings.length; bindingIndex += 1) {
+      const innerOutlineBinding: SlabInnerOutlineBinding = slabData.innerOutlineBindings[bindingIndex]!;
+      if (BuildingObjectManager._hasAnyWallId(innerOutlineBinding.wallIds, targetWallIdSet)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 将可空 ID 写入集合。
+   * @param sourceId - 需要写入的可空 ID。
+   * @param targetIdSet - 目标 ID 集合。
+   */
+  private static _addOptionalIdToSet(sourceId: string | null | undefined, targetIdSet: Set<string>): void {
+    if (typeof sourceId === 'string' && sourceId.length > 0) {
+      targetIdSet.add(sourceId);
+    }
+  }
+
+  /**
+   * 将可选 ID 列表写入集合。
+   * @param sourceIds - 需要写入的可选 ID 列表。
+   * @param targetIdSet - 目标 ID 集合。
+   */
+  private static _addOptionalIdsToSet(sourceIds: string[] | undefined, targetIdSet: Set<string>): void {
+    if (!Array.isArray(sourceIds)) {
+      return;
+    }
+
+    for (let sourceIndex: number = 0; sourceIndex < sourceIds.length; sourceIndex += 1) {
+      const sourceId: string = sourceIds[sourceIndex]!;
+      BuildingObjectManager._addOptionalIdToSet(sourceId, targetIdSet);
+    }
   }
 
   /**

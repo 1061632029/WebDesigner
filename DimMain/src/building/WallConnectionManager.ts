@@ -633,29 +633,81 @@ export class WallConnectionManager {
   public detectClosedLoopWithWalls(
     startJointId: string
   ): { outline: Point2D[]; wallIds: string[] } | null {
-    /* 起始节点不存在时直接返回 */
-    const startJoint: WallJoint | undefined = this._joints.get(startJointId);
-    if (startJoint === undefined) {
+    const candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> = this._collectClosedLoopCandidates(startJointId);
+    const bestLoop: { outline: Point2D[]; wallIds: string[]; area: number } | null =
+      this._selectSmallestClosedLoopCandidate(candidates);
+    if (bestLoop === null) {
       return null;
     }
 
-    /* DFS 路径：记录当前遍历路径上的节点 ID 序列 */
+    return { outline: bestLoop.outline, wallIds: bestLoop.wallIds };
+  }
+
+  /**
+   * 从指定节点出发，检测当前拓扑下全部最小封闭墙体环路。
+   * @param startJointId - 起始节点 ID。
+   * @returns 不包含外层大环的最小封闭区域列表，每项包含中心线轮廓和围合墙体 ID。
+   */
+  public detectMinimalClosedLoopsWithWalls(startJointId: string): Array<{ outline: Point2D[]; wallIds: string[] }> {
+    const candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> = this._collectClosedLoopCandidates(startJointId);
+    const minimalCandidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> =
+      this._selectMinimalClosedLoopCandidates(candidates);
+    const results: Array<{ outline: Point2D[]; wallIds: string[] }> = [];
+
+    for (const minimalCandidate of minimalCandidates) {
+      results.push({
+        outline: minimalCandidate.outline,
+        wallIds: minimalCandidate.wallIds,
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * 从指定节点出发，检测是否存在封闭的墙体环路
+   * 使用 DFS 图遍历，沿墙体连接边搜索回到起始节点的路径
+   * 每条墙体边连接两个节点（start joint ↔ end joint），遍历时沿边跳转
+   *
+   * @param startJointId - 起始节点 ID（通常为新建墙体的某个端点节点）
+   * @returns 封闭环路上所有节点的坐标数组（按顺序，可直接用作楼板轮廓）；
+   *          未找到封闭环时返回 null
+   */
+  public detectClosedLoop(startJointId: string): Point2D[] | null {
+    const loopResult: { outline: Point2D[]; wallIds: string[] } | null = this.detectClosedLoopWithWalls(startJointId);
+    if (loopResult === null) {
+      return null;
+    }
+    return loopResult.outline;
+  }
+
+  /**
+   * 从指定节点收集所有简单闭合环候选。
+   * 关键流程：完整遍历节点图中的简单环路，先做规范签名去重，再交给调用方按面积或包含关系筛选。
+   * @param startJointId - 起始节点 ID。
+   * @returns 已去重且包含面积信息的闭合环候选列表。
+   */
+  private _collectClosedLoopCandidates(startJointId: string): Array<{ outline: Point2D[]; wallIds: string[]; area: number }> {
+    const startJoint: WallJoint | undefined = this._joints.get(startJointId);
+    if (startJoint === undefined) {
+      return [];
+    }
+
     const path: string[] = [];
-    /* 路径上每段对应的墙体 ID（path[i] → path[i+1] 的墙体） */
     const pathWalls: string[] = [];
-    /* 已访问节点集合（防止无限循环） */
     const visited: Set<string> = new Set<string>();
-    /* 已收集闭环签名集合：同一闭环可能从不同方向被遍历到，需去重后再比较面积。 */
     const collectedSignatures: Set<string> = new Set<string>();
     const candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> = [];
 
     /**
-     * DFS 递归函数
-     * @param currentJointId - 当前节点 ID
-     * @param fromWallId - 来自哪条墙体（避免原路返回）
-     * @returns 无返回值；遍历过程中持续更新当前最小闭环
+     * 深度优先遍历当前节点连通图，收集所有能回到起点的简单闭合环。
+     * @param currentJointId - 当前遍历到的节点 ID。
+     * @param fromWallId - 进入当前节点时经过的墙体 ID，用于避免立即原路返回。
      */
-    const dfs = (currentJointId: string, fromWallId: string | null): void => {
+    const dfs: (currentJointId: string, fromWallId: string | null) => void = (
+      currentJointId: string,
+      fromWallId: string | null
+    ): void => {
       path.push(currentJointId);
       visited.add(currentJointId);
 
@@ -676,7 +728,7 @@ export class WallConnectionManager {
           continue;
         }
 
-        /* 找到回到起始节点的路径 → 收集候选闭环，并通过面积比较保留最小空间范围。 */
+        /* 找到回到起点的路径时收集候选，后续统一过滤退化环、重复环和外层大环。 */
         if (otherJointId === startJointId && path.length >= 3) {
           const candidateWallIds: string[] = pathWalls.concat([conn.wallId]);
           const candidateResult: { outline: Point2D[]; wallIds: string[]; area: number } | null =
@@ -688,10 +740,8 @@ export class WallConnectionManager {
         }
 
         if (!visited.has(otherJointId)) {
-          /* 记录这段墙体，继续向外搜索所有简单闭环，而不是命中第一条闭环就停止。 */
           pathWalls.push(conn.wallId);
           dfs(otherJointId, conn.wallId);
-          /* 回溯时移除这段墙体 */
           pathWalls.pop();
         }
       }
@@ -701,31 +751,7 @@ export class WallConnectionManager {
     };
 
     dfs(startJointId, null);
-
-    const bestLoop: { outline: Point2D[]; wallIds: string[]; area: number } | null =
-      this._selectSmallestClosedLoopCandidate(candidates);
-    if (bestLoop === null) {
-      return null;
-    }
-
-    return { outline: bestLoop.outline, wallIds: bestLoop.wallIds };
-  }
-
-  /**
-   * 从指定节点出发，检测是否存在封闭的墙体环路
-   * 使用 DFS 图遍历，沿墙体连接边搜索回到起始节点的路径
-   * 每条墙体边连接两个节点（start joint ↔ end joint），遍历时沿边跳转
-   *
-   * @param startJointId - 起始节点 ID（通常为新建墙体的某个端点节点）
-   * @returns 封闭环路上所有节点的坐标数组（按顺序，可直接用作楼板轮廓）；
-   *          未找到封闭环时返回 null
-   */
-  public detectClosedLoop(startJointId: string): Point2D[] | null {
-    const loopResult: { outline: Point2D[]; wallIds: string[] } | null = this.detectClosedLoopWithWalls(startJointId);
-    if (loopResult === null) {
-      return null;
-    }
-    return loopResult.outline;
+    return candidates;
   }
 
   /**
@@ -807,6 +833,109 @@ export class WallConnectionManager {
     }
 
     return bestLoop;
+  }
+
+  /**
+   * 从候选闭环中筛选最小封闭区域集合。
+   * 关键流程：如果某个候选环内部还包含面积更小的闭合环，则该候选属于外层大空间，需要排除。
+   * @param candidates - 已去重且通过退化过滤的候选闭环列表。
+   * @returns 仅保留当前墙拓扑下的最小闭合区域。
+   */
+  private _selectMinimalClosedLoopCandidates(
+    candidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }>
+  ): Array<{ outline: Point2D[]; wallIds: string[]; area: number }> {
+    const minimalCandidates: Array<{ outline: Point2D[]; wallIds: string[]; area: number }> = [];
+    const areaTolerance: number = 0.000001;
+
+    for (const candidate of candidates) {
+      let containsSmallerCandidate: boolean = false;
+      for (const otherCandidate of candidates) {
+        if (otherCandidate === candidate || otherCandidate.area >= candidate.area - areaTolerance) {
+          continue;
+        }
+
+        if (this._isOutlineInsideOrOnPolygon(otherCandidate.outline, candidate.outline)) {
+          containsSmallerCandidate = true;
+          break;
+        }
+      }
+
+      if (!containsSmallerCandidate) {
+        minimalCandidates.push(candidate);
+      }
+    }
+
+    return minimalCandidates;
+  }
+
+  /**
+   * 判断一个轮廓是否整体位于另一个多边形内部或边界上。
+   * @param outline - 待判断的轮廓点集。
+   * @param polygon - 作为容器的多边形点集。
+   * @returns 全部点都在容器多边形内部或边界上时返回 true。
+   */
+  private _isOutlineInsideOrOnPolygon(outline: Point2D[], polygon: Point2D[]): boolean {
+    for (const point of outline) {
+      if (!this._isPointInsideOrOnPolygon(point, polygon)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * 判断点是否位于多边形内部或边界上。
+   * @param point - 待判断点。
+   * @param polygon - 多边形轮廓。
+   * @returns 点在多边形内部或边界上时返回 true。
+   */
+  private _isPointInsideOrOnPolygon(point: Point2D, polygon: Point2D[]): boolean {
+    let isInside: boolean = false;
+    const count: number = polygon.length;
+
+    for (let index: number = 0, previousIndex: number = count - 1; index < count; previousIndex = index, index += 1) {
+      const current: Point2D = polygon[index]!;
+      const previous: Point2D = polygon[previousIndex]!;
+
+      if (this._isPointOnSegment(point, previous, current)) {
+        return true;
+      }
+
+      const crossesRay: boolean = (current.z > point.z) !== (previous.z > point.z);
+      if (!crossesRay) {
+        continue;
+      }
+
+      const intersectionX: number = ((previous.x - current.x) * (point.z - current.z)) / (previous.z - current.z) + current.x;
+      if (point.x < intersectionX) {
+        isInside = !isInside;
+      }
+    }
+
+    return isInside;
+  }
+
+  /**
+   * 判断点是否位于线段上。
+   * @param point - 待判断点。
+   * @param segmentStart - 线段起点。
+   * @param segmentEnd - 线段终点。
+   * @returns 点在线段容差范围内时返回 true。
+   */
+  private _isPointOnSegment(point: Point2D, segmentStart: Point2D, segmentEnd: Point2D): boolean {
+    const tolerance: number = 0.000001;
+    const cross: number =
+      (point.z - segmentStart.z) * (segmentEnd.x - segmentStart.x) -
+      (point.x - segmentStart.x) * (segmentEnd.z - segmentStart.z);
+    if (Math.abs(cross) > tolerance) {
+      return false;
+    }
+
+    const minX: number = Math.min(segmentStart.x, segmentEnd.x) - tolerance;
+    const maxX: number = Math.max(segmentStart.x, segmentEnd.x) + tolerance;
+    const minZ: number = Math.min(segmentStart.z, segmentEnd.z) - tolerance;
+    const maxZ: number = Math.max(segmentStart.z, segmentEnd.z) + tolerance;
+    return point.x >= minX && point.x <= maxX && point.z >= minZ && point.z <= maxZ;
   }
 
   /**

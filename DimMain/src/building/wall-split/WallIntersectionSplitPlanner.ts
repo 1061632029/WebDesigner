@@ -147,10 +147,8 @@ export class WallIntersectionSplitPlanner {
 
     const straightWall: StraightWallData = object as StraightWallData;
     const hasOpenings: boolean = Array.isArray(straightWall.openings) && straightWall.openings.length > 0;
-    const hasSlabBinding: boolean = straightWall.slabId !== null || (Array.isArray(straightWall.slabIds) && straightWall.slabIds.length > 0);
-    const hasCeilingBinding: boolean = straightWall.ceilingId !== null || (Array.isArray(straightWall.ceilingIds) && straightWall.ceilingIds.length > 0);
-    if (hasOpenings || hasSlabBinding || hasCeilingBinding) {
-      /* 第一阶段跳过带依赖墙体，避免打断时误删门窗、楼板或天花板绑定。 */
+    if (hasOpenings) {
+      /* 带门窗洞口的墙体暂不参与自动打断，避免洞口定位参数在拆分后丢失或落入错误墙段。 */
       return false;
     }
 

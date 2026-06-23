@@ -35,6 +35,18 @@ export interface GeneratedSurfaceSignatureSnapshot {
   ceilingSignatures: string[];
 }
 
+/** 待刷新水平面的封闭空间候选。 */
+interface SurfaceLoopCandidate {
+  /** 封闭环规范签名，用于跨节点去重。 */
+  signature: string;
+  /** 墙中心线围成的封闭轮廓。 */
+  outline: Point2D[];
+  /** 围合该封闭轮廓的墙体 ID 列表。 */
+  wallIds: string[];
+  /** XZ 平面轮廓面积，用于排除包含小空间的外层大空间。 */
+  area: number;
+}
+
 /** 水平面服务回调集合，用于隔离主管理器的通用场景与通知能力。 */
 export interface BuildingSurfaceServiceCallbacks {
   /** 根据材质属性创建 Three.js 材质。 */
@@ -308,26 +320,28 @@ export class BuildingSurfaceService {
         continue;
       }
 
-      const loopResult: { outline: Point2D[]; wallIds: string[] } | null = this._connectionManager.detectClosedLoopWithWalls(jointId);
-      if (loopResult === null || loopResult.outline.length < 3) {
-        continue;
+      const loopResults: Array<{ outline: Point2D[]; wallIds: string[] }> = this._connectionManager.detectMinimalClosedLoopsWithWalls(jointId);
+      for (const loopResult of loopResults) {
+        if (loopResult.outline.length < 3) {
+          continue;
+        }
+
+        const signature: string = this.computeOutlineSignature(loopResult.outline);
+        if (this._generatedSlabSignatures.has(signature)) {
+          continue;
+        }
+
+        /* 自动生成流程：按最小封闭区域生成独立空间，再同步创建楼板与天花板关系。 */
+        const innerOutline: Point2D[] = this.convertOutlineToInnerBoundary(loopResult.outline, loopResult.wallIds);
+        const boundaryDimensionSegments: SlabBoundaryDimensionSegment[] = this.createBoundaryDimensionSegments(
+          innerOutline,
+          loopResult.wallIds
+        );
+
+        this._generatedSlabSignatures.add(signature);
+        this.createSlab(innerOutline, SLAB_DEFAULTS.slabThickness, loopResult.wallIds, boundaryDimensionSegments);
+        this._tryAutoGenerateCeiling(signature, innerOutline, loopResult.wallIds);
       }
-
-      const signature: string = this.computeOutlineSignature(loopResult.outline);
-      if (this._generatedSlabSignatures.has(signature)) {
-        continue;
-      }
-
-      /* 自动生成流程：先由中心线轮廓计算室内净边界，再同步创建楼板与天花板。 */
-      const innerOutline: Point2D[] = this.convertOutlineToInnerBoundary(loopResult.outline, loopResult.wallIds);
-      const boundaryDimensionSegments: SlabBoundaryDimensionSegment[] = this.createBoundaryDimensionSegments(
-        innerOutline,
-        loopResult.wallIds
-      );
-
-      this._generatedSlabSignatures.add(signature);
-      this.createSlab(innerOutline, SLAB_DEFAULTS.slabThickness, loopResult.wallIds, boundaryDimensionSegments);
-      this._tryAutoGenerateCeiling(signature, innerOutline, loopResult.wallIds);
     }
   }
 
@@ -336,8 +350,9 @@ export class BuildingSurfaceService {
    * @param wallIds - 本次拖拽直接或间接受影响的墙体 ID 列表。
    */
   public refreshClosedSurfacesForWalls(wallIds: string[]): void {
-    const visitedSignatures: Set<string> = new Set<string>();
+    const candidateMap: Map<string, SurfaceLoopCandidate> = new Map<string, SurfaceLoopCandidate>();
 
+    /* 收集流程：先跨全部受影响墙体收集候选闭环，再做全局最小空间筛选，避免局部节点检测生成外层大楼板。 */
     for (const wallId of wallIds) {
       const joints: { start: string | null; end: string | null } = this._connectionManager.getWallJoints(wallId);
       const jointIds: Array<string | null> = [joints.start, joints.end];
@@ -347,19 +362,155 @@ export class BuildingSurfaceService {
           continue;
         }
 
-        const loopResult: { outline: Point2D[]; wallIds: string[] } | null = this._connectionManager.detectClosedLoopWithWalls(jointId);
-        if (loopResult === null || loopResult.outline.length < 3) {
+        const loopResults: Array<{ outline: Point2D[]; wallIds: string[] }> = this._connectionManager.detectMinimalClosedLoopsWithWalls(jointId);
+        for (const loopResult of loopResults) {
+          if (loopResult.outline.length < 3) {
+            continue;
+          }
+
+          const signature: string = this.computeOutlineSignature(loopResult.outline);
+          if (candidateMap.has(signature)) {
+            continue;
+          }
+
+          candidateMap.set(signature, {
+            signature: signature,
+            outline: loopResult.outline,
+            wallIds: loopResult.wallIds,
+            area: BuildingSurfaceService._computePolygonArea(loopResult.outline),
+          });
+        }
+      }
+    }
+
+    const allCandidates: SurfaceLoopCandidate[] = Array.from(candidateMap.values());
+    const minimalCandidates: SurfaceLoopCandidate[] = BuildingSurfaceService._selectMinimalSurfaceLoopCandidates(allCandidates);
+    for (const minimalCandidate of minimalCandidates) {
+      this._refreshClosedSurfaceFromLoop(minimalCandidate.signature, minimalCandidate.outline, minimalCandidate.wallIds);
+    }
+
+    this._rebindWallsToCurrentSurfaces();
+  }
+
+  /**
+   * 从全局候选闭环中筛选真正最小的封闭空间。
+   * @param candidates - 跨所有受影响节点收集到的候选闭环。
+   * @returns 排除外层大闭环后的最小封闭空间候选。
+   */
+  private static _selectMinimalSurfaceLoopCandidates(candidates: SurfaceLoopCandidate[]): SurfaceLoopCandidate[] {
+    const minimalCandidates: SurfaceLoopCandidate[] = [];
+    const areaTolerance: number = 0.000001;
+
+    for (const candidate of candidates) {
+      let containsSmallerCandidate: boolean = false;
+      for (const otherCandidate of candidates) {
+        if (otherCandidate === candidate || otherCandidate.area >= candidate.area - areaTolerance) {
           continue;
         }
 
-        const signature: string = this.computeOutlineSignature(loopResult.outline);
-        if (visitedSignatures.has(signature)) {
-          continue;
+        if (BuildingSurfaceService._isOutlineInsideOrOnPolygon(otherCandidate.outline, candidate.outline)) {
+          containsSmallerCandidate = true;
+          break;
         }
-        visitedSignatures.add(signature);
-        this._refreshClosedSurfaceFromLoop(signature, loopResult.outline, loopResult.wallIds);
+      }
+
+      if (!containsSmallerCandidate) {
+        minimalCandidates.push(candidate);
       }
     }
+
+    return minimalCandidates;
+  }
+
+  /**
+   * 判断一个轮廓是否整体位于另一个多边形内部或边界上。
+   * @param outline - 待判断的轮廓点集。
+   * @param polygon - 作为容器的多边形点集。
+   * @returns 全部点都在容器多边形内部或边界上时返回 true。
+   */
+  private static _isOutlineInsideOrOnPolygon(outline: Point2D[], polygon: Point2D[]): boolean {
+    for (const point of outline) {
+      if (!BuildingSurfaceService._isPointInsideOrOnPolygon(point, polygon)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * 判断点是否位于多边形内部或边界上。
+   * @param point - 待判断点。
+   * @param polygon - 多边形轮廓。
+   * @returns 点在多边形内部或边界上时返回 true。
+   */
+  private static _isPointInsideOrOnPolygon(point: Point2D, polygon: Point2D[]): boolean {
+    let isInside: boolean = false;
+    const count: number = polygon.length;
+
+    for (let index: number = 0, previousIndex: number = count - 1; index < count; previousIndex = index, index += 1) {
+      const current: Point2D = polygon[index]!;
+      const previous: Point2D = polygon[previousIndex]!;
+
+      if (BuildingSurfaceService._isPointOnSegment(point, previous, current)) {
+        return true;
+      }
+
+      const crossesRay: boolean = (current.z > point.z) !== (previous.z > point.z);
+      if (!crossesRay) {
+        continue;
+      }
+
+      const intersectionX: number = ((previous.x - current.x) * (point.z - current.z)) / (previous.z - current.z) + current.x;
+      if (point.x < intersectionX) {
+        isInside = !isInside;
+      }
+    }
+
+    return isInside;
+  }
+
+  /**
+   * 判断点是否位于指定线段上。
+   * @param point - 待判断点。
+   * @param segmentStart - 线段起点。
+   * @param segmentEnd - 线段终点。
+   * @returns 点在线段容差范围内时返回 true。
+   */
+  private static _isPointOnSegment(point: Point2D, segmentStart: Point2D, segmentEnd: Point2D): boolean {
+    const tolerance: number = 0.000001;
+    const cross: number =
+      (point.z - segmentStart.z) * (segmentEnd.x - segmentStart.x) -
+      (point.x - segmentStart.x) * (segmentEnd.z - segmentStart.z);
+    if (Math.abs(cross) > tolerance) {
+      return false;
+    }
+
+    const minX: number = Math.min(segmentStart.x, segmentEnd.x) - tolerance;
+    const maxX: number = Math.max(segmentStart.x, segmentEnd.x) + tolerance;
+    const minZ: number = Math.min(segmentStart.z, segmentEnd.z) - tolerance;
+    const maxZ: number = Math.max(segmentStart.z, segmentEnd.z) + tolerance;
+    return point.x >= minX && point.x <= maxX && point.z >= minZ && point.z <= maxZ;
+  }
+
+  /**
+   * 计算 XZ 平面多边形面积。
+   * @param outline - 多边形顶点数组，首尾不重复。
+   * @returns 多边形绝对面积。
+   */
+  private static _computePolygonArea(outline: Point2D[]): number {
+    if (outline.length < 3) {
+      return 0;
+    }
+
+    let signedArea: number = 0;
+    for (let index: number = 0; index < outline.length; index += 1) {
+      const current: Point2D = outline[index]!;
+      const next: Point2D = outline[(index + 1) % outline.length]!;
+      signedArea += current.x * next.z - next.x * current.z;
+    }
+
+    return Math.abs(signedArea) / 2;
   }
 
   /**
@@ -388,10 +539,16 @@ export class BuildingSurfaceService {
   /**
    * 从所有直墙中解除指定楼板绑定。
    * @param slabId - 需要解除绑定的楼板 ID。
+   * @param excludedWallIds - 需要跳过解绑的墙体 ID 集合；用于即将删除的旧墙，避免无意义字段更新。
    */
-  public unlinkSlabFromWalls(slabId: string): void {
+  public unlinkSlabFromWalls(slabId: string, excludedWallIds: ReadonlySet<string> | null = null): void {
     for (const objectData of this._objects.values()) {
       if (objectData.category !== 'wall') {
+        continue;
+      }
+
+      if (excludedWallIds !== null && excludedWallIds.has(objectData.id)) {
+        /* 跳过流程：旧墙随后会被删除，不需要再清理其楼板绑定字段。 */
         continue;
       }
 
@@ -439,6 +596,77 @@ export class BuildingSurfaceService {
       this._callbacks.removeMeshFromScene(wallId);
       this._callbacks.createWallMesh(straightWall);
       this._callbacks.notify(wallId, 'update');
+    }
+  }
+
+  /**
+   * 按当前楼板和天花板数据重建所有直墙的空间绑定关系。
+   * 关键流程：空间分割后旧墙可能残留已失效的 slabIds/ceilingIds，先清空再按现有空间重新写回。
+   */
+  private _rebindWallsToCurrentSurfaces(): void {
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'wall') {
+        continue;
+      }
+
+      const wallData: WallData = objectData as WallData;
+      if (wallData.subType !== 'straight') {
+        continue;
+      }
+
+      const straightWall: StraightWallData = wallData as StraightWallData;
+      straightWall.slabIds = [];
+      straightWall.slabId = null;
+      straightWall.ceilingIds = [];
+      straightWall.ceilingId = null;
+    }
+
+    for (const objectData of this._objects.values()) {
+      if (objectData.category === 'slab') {
+        const slabData: SlabData = objectData as SlabData;
+        this.syncWallsToSlab(slabData.id, slabData.wallIds);
+        continue;
+      }
+
+      if (objectData.category === 'ceiling') {
+        const ceilingData: CeilingData = objectData as CeilingData;
+        this.syncWallsToCeiling(ceilingData.id, ceilingData.wallIds, ceilingData.bottomOffset);
+      }
+    }
+  }
+
+  /**
+   * 从所有直墙中解除指定天花板绑定。
+   * @param ceilingId - 需要解除绑定的天花板 ID。
+   * @param excludedWallIds - 需要跳过解绑的墙体 ID 集合；用于即将删除的旧墙，避免无意义字段更新。
+   */
+  public unlinkCeilingFromWalls(ceilingId: string, excludedWallIds: ReadonlySet<string> | null = null): void {
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'wall') {
+        continue;
+      }
+
+      if (excludedWallIds !== null && excludedWallIds.has(objectData.id)) {
+        /* 跳过流程：旧墙随后会被删除，不需要再清理其天花板绑定字段。 */
+        continue;
+      }
+
+      const wallData: WallData = objectData as WallData;
+      if (wallData.subType !== 'straight') {
+        continue;
+      }
+
+      const straightWall: StraightWallData = wallData as StraightWallData;
+      const nextCeilingIds: string[] = this._removeId(straightWall.ceilingIds, ceilingId);
+      const legacyCeilingMatched: boolean = straightWall.ceilingId === ceilingId;
+      if (!legacyCeilingMatched && nextCeilingIds.length === (Array.isArray(straightWall.ceilingIds) ? straightWall.ceilingIds.length : 0)) {
+        continue;
+      }
+
+      /* 解绑流程：优先维护多天花板列表，再用首个 ID 回填兼容字段，保证共享墙仍保留其它房间天花板引用。 */
+      straightWall.ceilingIds = nextCeilingIds;
+      straightWall.ceilingId = nextCeilingIds.length > 0 ? nextCeilingIds[0]! : null;
+      this._callbacks.notify(straightWall.id, 'update');
     }
   }
 
@@ -570,7 +798,7 @@ export class BuildingSurfaceService {
       existingSlabs.push(slabData);
     });
 
-    /* 冲孔流程：完全包含生成内洞，部分相交则扣除相交区域后重绘。 */
+    /* 冲孔流程：完全包含时追加内洞，多边形相交时扣除相交区域并重绘。 */
     for (const slabData of existingSlabs) {
       const punchResult: SlabPunchResult = SlabContourPuncher.punch(slabData.outline, newOutline);
       if (punchResult.relation === 'none') {
@@ -578,12 +806,142 @@ export class BuildingSurfaceService {
       }
 
       if (punchResult.relation === 'contained' && punchResult.innerOutline !== null) {
+        if (this._doesOutlineShareBoundarySegment(slabData.outline, punchResult.innerOutline)) {
+          this._removeSurfacePairForBoundarySplit(slabData);
+          continue;
+        }
+
         this._appendSlabInnerOutline(slabData, punchResult.innerOutline, newWallIds);
         continue;
       }
 
       this._replaceSlabWithRemainingOutlines(slabData, punchResult.remainingOutlines);
     }
+  }
+
+  /**
+   * 移除被边界分割命中的原楼板及对应天花板，为后续最小闭环重新生成独立表面做准备。
+   * @param slabData - 被新封闭空间沿边界切分的原楼板。
+   */
+  private _removeSurfacePairForBoundarySplit(slabData: SlabData): void {
+    const relatedCeilingIds: string[] = this._collectCeilingIdsForSurfaceRebuild(slabData);
+
+    /* 重组流程：边界共线代表房间分割而不是楼板洞口，先删除父表面，后续闭环会重新创建子表面。 */
+    this.unlinkSlabFromWalls(slabData.id);
+    this._callbacks.removeMeshFromScene(slabData.id);
+    this._objects.delete(slabData.id);
+    this._callbacks.notify(slabData.id, 'remove');
+
+    for (const ceilingId of relatedCeilingIds) {
+      this.unlinkCeilingFromWalls(ceilingId);
+      this._callbacks.removeMeshFromScene(ceilingId);
+      this._objects.delete(ceilingId);
+      this._callbacks.notify(ceilingId, 'remove');
+    }
+  }
+
+  /**
+   * 收集与原楼板同属一个封闭空间的天花板 ID。
+   * @param slabData - 作为匹配依据的原楼板数据。
+   * @returns 需要随原楼板一起重组删除的天花板 ID 列表。
+   */
+  private _collectCeilingIdsForSurfaceRebuild(slabData: SlabData): string[] {
+    const ceilingIds: string[] = [];
+    const slabWallIdSet: Set<string> = new Set<string>(slabData.wallIds);
+
+    for (const objectData of this._objects.values()) {
+      if (objectData.category !== 'ceiling') {
+        continue;
+      }
+
+      const ceilingData: CeilingData = objectData as CeilingData;
+      const usesSameWalls: boolean = this._areWallIdSetsEqual(ceilingData.wallIds, slabWallIdSet);
+      const usesSameOutline: boolean = this._arePointOutlinesEqual(ceilingData.outline, slabData.outline);
+      if (usesSameWalls || usesSameOutline) {
+        ceilingIds.push(ceilingData.id);
+      }
+    }
+
+    return ceilingIds;
+  }
+
+  /**
+   * 判断内部轮廓是否与外部轮廓共享一段有效边界。
+   * @param outerOutline - 原楼板外轮廓。
+   * @param innerOutline - 新封闭空间净轮廓。
+   * @returns 存在共线且长度有效的重合边界时返回 true。
+   */
+  private _doesOutlineShareBoundarySegment(outerOutline: Point2D[], innerOutline: Point2D[]): boolean {
+    const tolerance: number = 0.000001;
+
+    for (let outerIndex: number = 0; outerIndex < outerOutline.length; outerIndex += 1) {
+      const outerStart: Point2D = outerOutline[outerIndex]!;
+      const outerEnd: Point2D = outerOutline[(outerIndex + 1) % outerOutline.length]!;
+
+      for (let innerIndex: number = 0; innerIndex < innerOutline.length; innerIndex += 1) {
+        const innerStart: Point2D = innerOutline[innerIndex]!;
+        const innerEnd: Point2D = innerOutline[(innerIndex + 1) % innerOutline.length]!;
+        const overlapLength: number = this._computeCollinearSegmentOverlapLength(outerStart, outerEnd, innerStart, innerEnd);
+        if (overlapLength > tolerance) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 计算两条共线线段的重合长度；非共线或仅端点接触时返回 0。
+   * @param firstStart - 第一条线段起点。
+   * @param firstEnd - 第一条线段终点。
+   * @param secondStart - 第二条线段起点。
+   * @param secondEnd - 第二条线段终点。
+   * @returns 两条线段在 XZ 平面上的重合长度。
+   */
+  private _computeCollinearSegmentOverlapLength(
+    firstStart: Point2D,
+    firstEnd: Point2D,
+    secondStart: Point2D,
+    secondEnd: Point2D
+  ): number {
+    const tolerance: number = 0.000001;
+    const firstVectorX: number = firstEnd.x - firstStart.x;
+    const firstVectorZ: number = firstEnd.z - firstStart.z;
+    const firstLength: number = Math.sqrt(firstVectorX * firstVectorX + firstVectorZ * firstVectorZ);
+    if (firstLength <= tolerance) {
+      return 0;
+    }
+
+    const secondStartOffsetX: number = secondStart.x - firstStart.x;
+    const secondStartOffsetZ: number = secondStart.z - firstStart.z;
+    const secondEndOffsetX: number = secondEnd.x - firstStart.x;
+    const secondEndOffsetZ: number = secondEnd.z - firstStart.z;
+    const firstToSecondStartCross: number = this._computeCross2D(firstVectorX, firstVectorZ, secondStartOffsetX, secondStartOffsetZ);
+    const firstToSecondEndCross: number = this._computeCross2D(firstVectorX, firstVectorZ, secondEndOffsetX, secondEndOffsetZ);
+    if (Math.abs(firstToSecondStartCross) > tolerance || Math.abs(firstToSecondEndCross) > tolerance) {
+      return 0;
+    }
+
+    const axisX: number = firstVectorX / firstLength;
+    const axisZ: number = firstVectorZ / firstLength;
+    const secondStartProjection: number = secondStartOffsetX * axisX + secondStartOffsetZ * axisZ;
+    const secondEndProjection: number = secondEndOffsetX * axisX + secondEndOffsetZ * axisZ;
+    const overlapStart: number = Math.max(0, Math.min(secondStartProjection, secondEndProjection));
+    const overlapEnd: number = Math.min(firstLength, Math.max(secondStartProjection, secondEndProjection));
+    return Math.max(0, overlapEnd - overlapStart);
+  }
+
+  /**
+   * 计算二维向量叉积。
+   * @param firstX - 第一向量 X 分量。
+   * @param firstZ - 第一向量 Z 分量。
+   * @param secondX - 第二向量 X 分量。
+   * @param secondZ - 第二向量 Z 分量。
+   * @returns XZ 平面叉积标量。
+   */
+  private _computeCross2D(firstX: number, firstZ: number, secondX: number, secondZ: number): number {
+    return firstX * secondZ - firstZ * secondX;
   }
 
   /**

@@ -5,8 +5,8 @@
 
 import * as THREE from 'three/webgpu';
 import type { ICommand } from '../ICommand';
-import type { BuildingObject, Point2D, StraightWallData } from '../../building/BuildingTypes';
-import type { BuildingObjectManager } from '../../building/BuildingObjectManager';
+import type { BuildingObject, CeilingData, Point2D, SlabData, StraightWallData } from '../../building/BuildingTypes';
+import type { BuildingObjectManager, GeneratedSurfaceSignatureSnapshot } from '../../building/BuildingObjectManager';
 import { Geometry2DUtils } from '../../building/manager/Geometry2DUtils';
 import {
   WallIntersectionSplitPlanner,
@@ -49,6 +49,24 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
   /** 连续绘制应继续衔接的最后一段墙体 ID。 */
   private _continuationWallId: string;
 
+  /** 首次执行前的楼板/天花板自动生成签名缓存快照。 */
+  private _beforeSignatureSnapshot: GeneratedSurfaceSignatureSnapshot | null = null;
+
+  /** 首次执行后的楼板/天花板自动生成签名缓存快照。 */
+  private _afterSignatureSnapshot: GeneratedSurfaceSignatureSnapshot | null = null;
+
+  /** 首次执行前的楼板完整数据快照，用于撤销封闭空间拆分。 */
+  private _beforeSlabSnapshot: SlabData[] | null = null;
+
+  /** 首次执行后的楼板完整数据快照，用于重做封闭空间拆分。 */
+  private _afterSlabSnapshot: SlabData[] | null = null;
+
+  /** 首次执行前的天花板完整数据快照，用于撤销封闭空间拆分。 */
+  private _beforeCeilingSnapshot: CeilingData[] | null = null;
+
+  /** 首次执行后的天花板完整数据快照，用于重做封闭空间拆分。 */
+  private _afterCeilingSnapshot: CeilingData[] | null = null;
+
   /**
    * @param manager - 建筑对象管理器。
    * @param scene - Three.js 场景。
@@ -81,6 +99,14 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
    * 关键流程：首次执行时生成并缓存拆分计划；重做时复用缓存计划，确保墙体 ID 和分段结果完全一致。
    */
   public execute(): void {
+    const isFirstExecute: boolean = this._beforeSignatureSnapshot === null;
+    if (isFirstExecute) {
+      /* 关键流程：打断墙体前捕获自动表面状态，便于撤销时恢复原始楼板与天花板轮廓。 */
+      this._beforeSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+      this._beforeSlabSnapshot = this._manager.getSlabDataSnapshot();
+      this._beforeCeilingSnapshot = this._manager.getCeilingDataSnapshot();
+    }
+
     if (this._cascadeDeleteCommand !== null) {
       /* 重做前先释放撤销阶段的级联删除快照引用，随后按缓存计划重新应用打断结果。 */
       this._cascadeDeleteCommand.dispose();
@@ -93,8 +119,34 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
       this._cachedPlan = this._createCachedPlan();
     }
 
+    const removedExistingWallIds: string[] = this._cachedPlan.removedExistingWalls.map((wall: StraightWallData): string => wall.id);
+    const surfacesBoundToRemovedWalls: { slabIds: string[]; ceilingIds: string[] } = isFirstExecute
+      ? this._manager.collectSurfaceObjectIdsBoundToWalls(removedExistingWallIds)
+      : { slabIds: [], ceilingIds: [] };
+
+    if (isFirstExecute) {
+      /* 关键流程：打断旧墙前先解除保留墙的旧表面绑定并删除旧表面；即将删除的旧墙不做无意义解绑。 */
+      this._manager.removeSurfaceObjectsByIds(
+        surfacesBoundToRemovedWalls.slabIds,
+        surfacesBoundToRemovedWalls.ceilingIds,
+        removedExistingWallIds
+      );
+    }
+
     this._removeExistingWalls(this._cachedPlan.removedExistingWalls);
     this._addCreatedWalls(this._cachedPlan.createdWalls);
+
+    if (isFirstExecute) {
+      /* 关键流程：墙体拓扑更新后重新检测最小封闭区域，让打断墙段与分割墙重新生成楼板和天花板绑定关系。 */
+      const affectedWallIds: string[] = this._collectAffectedWallIds(this._cachedPlan);
+      this._manager.refreshClosedSurfacesForWalls(affectedWallIds);
+      this._afterSignatureSnapshot = this._manager.getGeneratedSurfaceSignatureSnapshot();
+      this._afterSlabSnapshot = this._manager.getSlabDataSnapshot();
+      this._afterCeilingSnapshot = this._manager.getCeilingDataSnapshot();
+    } else {
+      /* 重做流程：墙体拓扑恢复后直接恢复首次执行后的表面快照，保证楼板和天花板拆分结果稳定一致。 */
+      this._restoreAfterSurfaceSnapshots();
+    }
   }
 
   /**
@@ -109,6 +161,7 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
     this._removeCreatedWallsByCascade(this._cachedPlan.createdWalls);
     this._restoreExistingWalls(this._cachedPlan.removedExistingWalls);
     this._applyPreviousWallUpdatePrevious();
+    this._restoreBeforeSurfaceSnapshots();
   }
 
   /** 释放撤销阶段级联删除命令持有的门窗资源。 */
@@ -233,6 +286,55 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
     }
   }
 
+  /**
+   * 收集本次打断后需要参与封闭表面刷新的墙体 ID。
+   * @param plan - 已缓存的墙体打断计划。
+   * @returns 去重后的受影响墙体 ID 列表。
+   */
+  private _collectAffectedWallIds(plan: CachedWallIntersectionSplitCommandPlan): string[] {
+    const affectedWallIds: string[] = [];
+    const visitedWallIds: Set<string> = new Set<string>();
+
+    /* 收集流程：新旧墙段都加入刷新集合，确保被分割的原封闭空间和新增分割墙都能触发最小房间检测。 */
+    for (const removedWall of plan.removedExistingWalls) {
+      StraightWallIntersectionSplitCreateCommand._appendUniqueWallId(affectedWallIds, visitedWallIds, removedWall.id);
+    }
+    for (const createdWall of plan.createdWalls) {
+      StraightWallIntersectionSplitCreateCommand._appendUniqueWallId(affectedWallIds, visitedWallIds, createdWall.id);
+    }
+    if (this._previousWallUpdate !== null) {
+      StraightWallIntersectionSplitCreateCommand._appendUniqueWallId(affectedWallIds, visitedWallIds, this._previousWallUpdate.wallId);
+    }
+
+    return affectedWallIds;
+  }
+
+  /** 恢复首次执行前的楼板、天花板与自动生成签名快照。 */
+  private _restoreBeforeSurfaceSnapshots(): void {
+    if (this._beforeSignatureSnapshot !== null) {
+      this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._beforeSignatureSnapshot);
+    }
+    if (this._beforeSlabSnapshot !== null) {
+      this._manager.restoreSlabDataSnapshot(this._beforeSlabSnapshot);
+    }
+    if (this._beforeCeilingSnapshot !== null) {
+      this._manager.restoreCeilingDataSnapshot(this._beforeCeilingSnapshot);
+    }
+  }
+
+  /** 恢复首次执行后的楼板、天花板与自动生成签名快照。 */
+  private _restoreAfterSurfaceSnapshots(): void {
+    if (this._afterSignatureSnapshot !== null) {
+      this._manager.restoreGeneratedSurfaceSignatureSnapshot(this._afterSignatureSnapshot);
+    }
+    if (this._afterSlabSnapshot !== null) {
+      this._manager.restoreSlabDataSnapshot(this._afterSlabSnapshot);
+    }
+    if (this._afterCeilingSnapshot !== null) {
+      this._manager.restoreCeilingDataSnapshot(this._afterCeilingSnapshot);
+    }
+  }
+
   /** 应用连续绘制上一段墙体的修正后端点。 */
   private _applyPreviousWallUpdateNext(): void {
     if (this._previousWallUpdate === null) {
@@ -281,5 +383,20 @@ export class StraightWallIntersectionSplitCreateCommand implements ICommand {
    */
   private static _clonePoint(point: Point2D): Point2D {
     return { x: point.x, z: point.z };
+  }
+
+  /**
+   * 将墙体 ID 追加到去重列表。
+   * @param wallIds - 目标墙体 ID 列表。
+   * @param visitedWallIds - 已收集墙体 ID 集合。
+   * @param wallId - 待追加墙体 ID。
+   */
+  private static _appendUniqueWallId(wallIds: string[], visitedWallIds: Set<string>, wallId: string): void {
+    if (visitedWallIds.has(wallId)) {
+      return;
+    }
+
+    visitedWallIds.add(wallId);
+    wallIds.push(wallId);
   }
 }
