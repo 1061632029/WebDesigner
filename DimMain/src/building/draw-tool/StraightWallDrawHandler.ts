@@ -7,11 +7,10 @@ import type { ArcWallData, BuildingObject, Point2D, StraightWallData } from '../
 import { SNAP_THRESHOLD } from '../BuildingTypes';
 import { WallPlacementLineConverter } from '../WallPlacementLineConverter';
 import type { WallCenterLine } from '../WallPlacementLineConverter';
-import { StraightWallCreateCommand } from '../../history/commands/StraightWallCreateCommand';
-import { ConnectedStraightWallCreateCommand } from '../../history/commands/ConnectedStraightWallCreateCommand';
 import type { PreviousStraightWallEndpointUpdate } from '../../history/commands/ConnectedStraightWallCreateCommand';
 import { ClosedStraightWallLoopCreateCommand } from '../../history/commands/ClosedStraightWallLoopCreateCommand';
 import type { ClosedLoopStraightWallUpdate } from '../../history/commands/ClosedStraightWallLoopCreateCommand';
+import { StraightWallIntersectionSplitCreateCommand } from '../../history/commands/StraightWallIntersectionSplitCreateCommand';
 import { WallDrawToolCore } from './WallDrawToolCore';
 
 export abstract class StraightWallDrawHandler extends WallDrawToolCore {
@@ -333,33 +332,25 @@ export abstract class StraightWallDrawHandler extends WallDrawToolCore {
     );
 
     if (this._historyManager !== null) {
-      if (previousWallUpdate !== null) {
-        this._historyManager.execute(new ConnectedStraightWallCreateCommand(
-          this._objectManager,
-          this._sceneManager.getScene(),
-          wallData,
-          previousWallUpdate
-        ));
-      } else {
-        this._historyManager.execute(new StraightWallCreateCommand(
-          this._objectManager,
-          this._sceneManager.getScene(),
-          wallData
-        ));
-      }
-      return wallData.id;
-    }
-
-    if (previousWallUpdate !== null) {
-      this._objectManager.updateObject(
-        previousWallUpdate.wallId,
-        { end: { x: previousWallUpdate.nextEnd.x, z: previousWallUpdate.nextEnd.z } } as Partial<StraightWallData>
+      const command: StraightWallIntersectionSplitCreateCommand = new StraightWallIntersectionSplitCreateCommand(
+        this._objectManager,
+        this._sceneManager.getScene(),
+        wallData,
+        previousWallUpdate
       );
+      this._historyManager.execute(command);
+      return command.getContinuationWallId();
     }
 
-    /* 未注入历史管理器的兼容路径：保持旧版直接创建行为。 */
-    this._objectManager.addObject(wallData);
-    return wallData.id;
+    /* 未注入历史管理器的兼容路径：复用相交打断命令的执行逻辑，保持直接创建场景与历史场景一致。 */
+    const directCommand: StraightWallIntersectionSplitCreateCommand = new StraightWallIntersectionSplitCreateCommand(
+      this._objectManager,
+      this._sceneManager.getScene(),
+      wallData,
+      previousWallUpdate
+    );
+    directCommand.execute();
+    return directCommand.getContinuationWallId();
   }
 
   /**
